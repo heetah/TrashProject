@@ -1,0 +1,114 @@
+import argparse
+from pathlib import Path
+
+import torch
+from ultralytics import RTDETR, YOLO
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+BBOX_MODEL = PROJECT_ROOT / "modules_weight" / "best-yolo-seg_v3.pt"
+TRASH_MODEL = PROJECT_ROOT / "modules_weight" / "best-rtdetr-seg.pt"
+
+
+def _device_index(device):
+    value = str(device).strip().lower()
+    if value.startswith("cuda:"):
+        value = value.split(":", 1)[1]
+    return int(value)
+
+
+def _check_cuda(device):
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available. TensorRT engine export must run on the target RTX 4090 host.")
+    index = _device_index(device)
+    if index >= torch.cuda.device_count():
+        raise RuntimeError(f"CUDA device {index} is unavailable; visible device count is {torch.cuda.device_count()}.")
+    name = torch.cuda.get_device_name(index)
+    if "4090" not in name:
+        print(f"Warning: exporting on {name}, not RTX 4090. TensorRT engines should be built on the target GPU.")
+    print(f"Using CUDA device {index}: {name}")
+
+
+def _default_imgsz(model, fallback):
+    overrides = getattr(model, "overrides", {}) or {}
+    imgsz = overrides.get("imgsz", fallback)
+    if isinstance(imgsz, (list, tuple)):
+        return imgsz[0] if len(imgsz) == 1 else list(imgsz)
+    return int(imgsz)
+
+
+def _export_model(label, model_path, loader, task, args):
+    model_path = Path(model_path).expanduser()
+    if not model_path.exists():
+        raise FileNotFoundError(model_path)
+
+    engine_path = model_path.with_suffix(".engine")
+    if engine_path.exists() and not args.force:
+        print(f"{label}: {engine_path} exists; use --force to rebuild.")
+        return engine_path
+
+    model = loader(str(model_path), task=task) if task else loader(str(model_path))
+    imgsz = args.imgsz or _default_imgsz(model, args.fallback_imgsz)
+    print(f"{label}: exporting {model_path} -> {engine_path} (imgsz={imgsz}, batch={args.batch}, half={args.half})")
+    exported = model.export(
+        format="engine",
+        imgsz=imgsz,
+        batch=args.batch,
+        device=args.device,
+        half=args.half,
+        dynamic=args.dynamic,
+        simplify=False,
+        workspace=args.workspace,
+        opset=args.opset,
+        verbose=args.verbose,
+    )
+    exported_path = Path(exported)
+    if not exported_path.exists():
+        raise RuntimeError(f"{label}: export reported {exported_path}, but the file does not exist.")
+    print(f"{label}: exported {exported_path}")
+    return exported_path
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Export project YOLO/RTDETR weights to TensorRT engines.")
+    parser.add_argument("--device", default="0", help="CUDA device index, e.g. 0 or cuda:0")
+    parser.add_argument("--batch", type=int, default=1, help="TensorRT optimization batch size")
+    parser.add_argument("--workspace", type=float, default=None, help="TensorRT workspace size in GiB")
+    parser.add_argument("--opset", type=int, default=19, help="ONNX opset for TensorRT export")
+    parser.add_argument("--imgsz", type=int, default=None, help="Override export image size for both models")
+    parser.add_argument("--bbox-imgsz", type=int, default=None, help="Override export image size for bbox model")
+    parser.add_argument("--trash-imgsz", type=int, default=None, help="Override export image size for trash model")
+    parser.add_argument("--bbox-model", type=Path, default=BBOX_MODEL, help="YOLO-seg actor model path")
+    parser.add_argument("--trash-model", type=Path, default=TRASH_MODEL, help="RTDETR litter model path")
+    parser.add_argument("--skip-bbox", action="store_true", help="Do not export the bbox/actor model")
+    parser.add_argument("--skip-trash", action="store_true", help="Do not export the trash/litter model")
+    parser.add_argument("--fallback-imgsz", type=int, default=640, help="Fallback image size if a checkpoint has no imgsz")
+    parser.add_argument("--dynamic", action="store_true", help="Build dynamic-shape TensorRT engines")
+    parser.add_argument("--no-half", dest="half", action="store_false", help="Build FP32 engines instead of FP16")
+    parser.add_argument("--force", action="store_true", help="Rebuild existing .engine files")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose TensorRT logs")
+    parser.set_defaults(half=True)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    _check_cuda(args.device)
+    outputs = []
+    if not args.skip_bbox:
+        bbox_args = argparse.Namespace(**vars(args))
+        bbox_args.imgsz = args.bbox_imgsz or args.imgsz
+        outputs.append(_export_model("bbox", args.bbox_model, YOLO, "segment", bbox_args))
+    if not args.skip_trash:
+        trash_args = argparse.Namespace(**vars(args))
+        trash_args.imgsz = args.trash_imgsz or args.imgsz
+        outputs.append(_export_model("trash", args.trash_model, RTDETR, None, trash_args))
+    if not outputs:
+        raise RuntimeError("Nothing to export: both --skip-bbox and --skip-trash were set.")
+    print("Export complete:")
+    for output in outputs:
+        print(f"  {output}")
+
+
+if __name__ == "__main__":
+    main()
