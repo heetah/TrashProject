@@ -1,4 +1,5 @@
 import math
+import numpy as np
 from scipy.spatial import distance
 from smallFunction import validate_trajectory
 
@@ -29,6 +30,10 @@ class GlobalLitterTracker:
         self.min_confirm_downward_displacement = 10.0
 
         self.person_to_vehicle_history = {}
+        # 反追蹤 thrower 時，用車輛/機車 bbox 底邊點估計地面 homography，
+        # 把 2D 影像點轉成 pseudo-ground 座標後再計算距離。
+        self.homography_min_depth = 25.0
+        self.thrower_previous_bonus = 0.85
 
     def update(self, detected_litters, actors, person_vehicle_map=None):
         if person_vehicle_map:
@@ -92,12 +97,22 @@ class GlobalLitterTracker:
                 age = l_data.get('age', 1) + 1
                 state = l_data.get('state', 'pending')
                 
-                # 繼承剛出生時記錄的肇事者
+                # 繼承剛出生時記錄的肇事者，並在 pending 階段依 homography 座標重新評分。
                 thrower_key = l_data.get('thrower_key')
                 thrower_center = l_data.get('thrower_center')
 
                 # ===== 時空軌跡 =====
                 if state == 'pending':
+                    recalculated_key, recalculated_center = self._find_thrower_for_litter(
+                        litter_box,
+                        actors,
+                        history=l_data['history'],
+                        prev_thrower_key=thrower_key,
+                    )
+                    if recalculated_key is not None:
+                        thrower_key = recalculated_key
+                        thrower_center = recalculated_center
+
                     # 取得初始長寬
                     init_w, init_h = l_data.get('init_shape', (curr_w, curr_h))
                     
@@ -175,8 +190,12 @@ class GlobalLitterTracker:
                 }
                 del self.active_litters[best_id]
             else:
-                # 在垃圾剛出現的「第 0 幀」先用幾何位置估計最可能的丟棄者。
-                thrower_key, thrower_center = self._find_thrower_at_birth(centroid, actors)
+                # 在垃圾剛出現的「第 0 幀」先用 homography pseudo-ground 座標估計最可能丟棄者。
+                thrower_key, thrower_center = self._find_thrower_for_litter(
+                    litter_box,
+                    actors,
+                    history=[centroid],
+                )
 
                 litter_id = self.next_id
                 new_active_litters[litter_id] = {
@@ -403,62 +422,178 @@ class GlobalLitterTracker:
         return best_key, best_center
 
     def _find_thrower_at_birth(self, start_centroid, actors):
+        return self._find_thrower_for_litter(start_centroid, actors)
+
+    def _find_thrower_for_litter(self, litter_ref, actors, history=None, prev_thrower_key=None):
         """
-        在垃圾剛出現的瞬間 (Frame 0)，尋找最可能的丟棄者。
+        依車輛 bbox 底邊點估計 homography，將 litter 與 actor 投影到類 3D
+        pseudo-ground 座標後，重新計算最可能的垃圾丟棄者。
         """
         best_actor_key = None
         best_center = None
-        min_dist = float('inf')
+        best_score = float('inf')
 
-        # === 新增：備案機制變數，用來記錄全場絕對距離最近的物件 ===
         fallback_actor_key = None
         fallback_center = None
-        fallback_min_dist = float('inf')
+        fallback_score = float('inf')
+
+        litter_anchor = self._litter_ground_anchor(litter_ref)
+        if litter_anchor is None:
+            return None, None
+
+        homography = self._estimate_ground_homography(actors, litter_anchor)
+        litter_world = self._project_point(litter_anchor, homography)
+        start_world = None
+        end_world = None
+        if history and len(history) >= 2:
+            start_world = self._project_point(history[0], homography)
+            end_world = self._project_point(history[-1], homography)
 
         for actor in actors:
-            ax1, ay1, ax2, ay2 = map(float, actor['box'])
-            track_id = int(actor['track_id'])
-            cls_name = actor['cls']
-            
-            actor_center = ((ax1 + ax2) / 2.0, (ay1 + ay2) / 2.0)
-            
-            # --- 新增：記錄每個物件的絕對距離，供備用機制使用 ---
-            abs_dist = math.hypot(start_centroid[0] - actor_center[0], start_centroid[1] - actor_center[1])
-            if abs_dist < fallback_min_dist:
-                fallback_min_dist = abs_dist
-                fallback_actor_key = (cls_name, track_id)
+            cls_name = str(actor.get('cls', '')).lower()
+            if cls_name not in ('person', 'vehicle', 'scooter'):
+                continue
+
+            try:
+                track_id = int(actor['track_id'])
+                ax1, ay1, ax2, ay2 = map(float, actor['box'])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            actor_key = (cls_name, track_id)
+            actor_center = self._actor_center(actor)
+            actor_anchor = self._actor_ground_anchor(actor)
+            actor_world = self._project_point(actor_anchor, homography)
+            if actor_world is None or litter_world is None:
+                continue
+
+            world_dist = math.hypot(
+                litter_world[0] - actor_world[0],
+                litter_world[1] - actor_world[1],
+            )
+            world_width = self._projected_actor_width((ax1, ay1, ax2, ay2), homography)
+            if cls_name in ('vehicle', 'scooter'):
+                threshold = max(180.0, world_width * 0.75)
+            else:
+                threshold = max(90.0, world_width * 1.8)
+
+            score = world_dist / max(threshold, 1e-6)
+            if actor_key == prev_thrower_key:
+                score *= self.thrower_previous_bonus
+
+            if start_world is not None and end_world is not None:
+                score *= self._trajectory_direction_factor(actor_world, start_world, end_world)
+
+            if score < fallback_score:
+                fallback_score = score
+                fallback_actor_key = actor_key
                 fallback_center = actor_center
-            # --------------------------------------------------
 
-            dist = float('inf')
-            threshold = 0.0
-
-            if cls_name == 'person':
-                # 無姿態模型時，直接以行人中心點做近距離關聯。
-                dist = math.hypot(start_centroid[0] - actor_center[0], start_centroid[1] - actor_center[1])
-                threshold = 90.0
-
-            elif cls_name in ('vehicle', 'scooter'):
-                # 車輛：通常從車窗丟出，使用 BBox 下半部中心來計算
-                vehicle_bottom = ((ax1 + ax2) / 2.0, ay1 + (ay2 - ay1) * 0.7)
-                dist = math.hypot(start_centroid[0] - vehicle_bottom[0], start_centroid[1] - vehicle_bottom[1])
-                
-                # 使用動態門檻，防止高畫質大車造成的誤判
-                vehicle_width = ax2 - ax1
-                threshold = max(180.0, vehicle_width * 0.6) # 最少 180 像素，或車寬的 60%
-
-            # 綜合評判 (原本的嚴格門檻邏輯)
-            if dist < min_dist and dist < threshold:
-                min_dist = dist
-                best_actor_key = (cls_name, track_id)
+            if score <= 1.0 and score < best_score:
+                best_score = score
+                best_actor_key = actor_key
                 best_center = actor_center
 
-        # === 新增：如果原本的嚴格門檻抓不到人，就退回使用「最靠近的物件」 ===
-        if (
-            best_actor_key is None and
-            fallback_actor_key is not None
-        ):
+        if best_actor_key is None and fallback_actor_key is not None:
             best_actor_key = fallback_actor_key
             best_center = fallback_center
 
         return best_actor_key, best_center
+
+    def _litter_ground_anchor(self, litter_ref):
+        try:
+            values = np.asarray(litter_ref, dtype=np.float32).reshape(-1)
+        except (TypeError, ValueError):
+            return None
+
+        if values.size >= 4:
+            x1, y1, x2, y2 = map(float, values[:4])
+            return ((x1 + x2) / 2.0, y2)
+        if values.size >= 2:
+            return (float(values[0]), float(values[1]))
+        return None
+
+    def _actor_ground_anchor(self, actor):
+        ax1, ay1, ax2, ay2 = map(float, actor['box'])
+        # vehicle/scooter 以 bbox 最底部中心當作接地點，對齊 homography 的估計來源。
+        return ((ax1 + ax2) / 2.0, ay2)
+
+    def _estimate_ground_homography(self, actors, litter_anchor):
+        vehicle_bottoms = []
+        vehicle_heights = []
+
+        for actor in actors:
+            cls_name = str(actor.get('cls', '')).lower()
+            if cls_name not in ('vehicle', 'scooter'):
+                continue
+            try:
+                ax1, ay1, ax2, ay2 = map(float, actor['box'])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            vehicle_bottoms.append(((ax1 + ax2) / 2.0, ay2))
+            vehicle_heights.append(max(ay2 - ay1, 1.0))
+
+        if not vehicle_bottoms:
+            return np.asarray([
+                [100.0, 0.0, 0.0],
+                [0.0, 100.0, 0.0],
+                [0.0, 0.0, 100.0],
+            ], dtype=np.float32)
+
+        bottom_x = np.asarray([p[0] for p in vehicle_bottoms], dtype=np.float32)
+        bottom_y = np.asarray([p[1] for p in vehicle_bottoms], dtype=np.float32)
+        median_h = float(np.median(vehicle_heights)) if vehicle_heights else 80.0
+        y_spread = float(np.max(bottom_y) - np.min(bottom_y)) if bottom_y.size > 1 else 0.0
+
+        center_x = float(np.median(bottom_x))
+        ground_ref_y = max(float(np.max(bottom_y)), float(litter_anchor[1]))
+        horizon_offset = max(80.0, median_h * 1.2, y_spread * 1.5)
+        horizon_y = float(np.min(bottom_y)) - horizon_offset
+        ground_scale = max(ground_ref_y - horizon_y, 80.0)
+
+        return np.asarray([
+            [ground_scale, 0.0, -ground_scale * center_x],
+            [0.0, -ground_scale, ground_scale * ground_ref_y],
+            [0.0, 1.0, -horizon_y],
+        ], dtype=np.float32)
+
+    def _project_point(self, point, homography):
+        if point is None:
+            return None
+
+        x, y = map(float, point)
+        projected = homography @ np.asarray([x, y, 1.0], dtype=np.float32)
+        depth = float(projected[2])
+        if abs(depth) < self.homography_min_depth:
+            depth = self.homography_min_depth if depth >= 0.0 else -self.homography_min_depth
+
+        return (float(projected[0]) / depth, float(projected[1]) / depth)
+
+    def _projected_actor_width(self, box, homography):
+        ax1, ay1, ax2, ay2 = map(float, box[:4])
+        left = self._project_point((ax1, ay2), homography)
+        right = self._project_point((ax2, ay2), homography)
+        if left is None or right is None:
+            return max(ax2 - ax1, 1.0)
+
+        return max(math.hypot(right[0] - left[0], right[1] - left[1]), 1.0)
+
+    @staticmethod
+    def _trajectory_direction_factor(actor_world, start_world, end_world):
+        move_vec = (end_world[0] - start_world[0], end_world[1] - start_world[1])
+        from_actor_vec = (start_world[0] - actor_world[0], start_world[1] - actor_world[1])
+        move_len = math.hypot(move_vec[0], move_vec[1])
+        actor_len = math.hypot(from_actor_vec[0], from_actor_vec[1])
+        if move_len < 1e-6 or actor_len < 1e-6:
+            return 1.0
+
+        cosine = (
+            move_vec[0] * from_actor_vec[0] +
+            move_vec[1] * from_actor_vec[1]
+        ) / (move_len * actor_len)
+        if cosine >= 0.25:
+            return 0.9
+        if cosine <= -0.25:
+            return 1.15
+        return 1.0
