@@ -24,8 +24,7 @@ COLORS = {
 }
 
 POSE_MODEL_PATH = 'modules_weight/yolo26x-pose.pt'
-STGCN_WEIGHT_PATH = 'modules_weight/best_acc_top1_epoch_5.pth'
-# STGCN_WEIGHT_PATH = 'modules_weight/best_acc_top1_epoch_16.pth'
+STGCN_WEIGHT_PATH = 'modules_weight/best_acc_top1_epoch_13.pth'
 STGCN_CONFIG_PATH = 'mmaction2/configs/skeleton/stgcnpp/custom_trash_stgcnpp.py'
 # MODEL_BBOX_PATH = 'modules_weight/yolo26x-seg.pt'
 MODEL_BBOX_PATH = 'modules_weight/best-yolo-seg_v3.pt'
