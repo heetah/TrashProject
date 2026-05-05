@@ -805,10 +805,16 @@ def main():
                         for result in yolo_results:
                             if result.boxes is None or len(result.boxes) == 0:
                                 continue
+                            mask_polys = getattr(getattr(result, "masks", None), "xy", None)
                             track_ids = result.boxes.id.int().cpu().tolist() if result.boxes.id is not None else [None] * len(result.boxes)
-                            for cls, conf, xyxy, track_id in zip(result.boxes.cls, result.boxes.conf, result.boxes.xyxy, track_ids):
+                            for det_idx, (cls, conf, xyxy, track_id) in enumerate(zip(result.boxes.cls, result.boxes.conf, result.boxes.xyxy, track_ids)):
                                 class_name = model_class_name(yolo_model, int(cls))
                                 x1, y1, x2, y2 = [int(coord) for coord in xyxy]
+                                polygon = None
+                                if mask_polys is not None and det_idx < len(mask_polys):
+                                    polygon = np.asarray(mask_polys[det_idx], dtype=np.int32).reshape((-1, 1, 2))
+                                    if polygon.shape[0] < 3:
+                                        polygon = None
                                 if class_name == 'person' and track_id is not None:
                                     metrics["seg_person_detections"] += 1
                                     if track_id not in alert_history:
@@ -856,13 +862,19 @@ def main():
                                     else:
                                         color = COLOR_DICT['person']
                                         label = f"YOLO person ID:{track_id}"
-                                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                                    if polygon is not None:
+                                        cv2.polylines(frame, [polygon], True, color, 2)
+                                    else:
+                                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                                     cv2.putText(frame, label, (x1, max(15, y1 - 10)),
                                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                                 elif class_name in COLOR_DICT:
                                     color = COLOR_DICT[class_name]
                                     label = f"YOLO {class_name} {float(conf):.2f}"
-                                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                                    if polygon is not None:
+                                        cv2.polylines(frame, [polygon], True, color, 2)
+                                    else:
+                                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                                     cv2.putText(frame, label, (x1, max(15, y1 - 10)),
                                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 

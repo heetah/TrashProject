@@ -105,20 +105,6 @@ def _resolve_litter_anchor(litter_ref):
         return (float(arr[0]), float(arr[1]))
     return None
 
-
-def _point_in_dilated_polygon(point, polygon, dilation_px):
-    if point is None or polygon is None:
-        return False
-
-    poly = np.asarray(polygon, dtype=np.float32)
-    if poly.ndim != 2 or poly.shape[0] < 3:
-        return False
-
-    contour = poly.reshape((-1, 1, 2))
-    dist = cv2.pointPolygonTest(contour, (float(point[0]), float(point[1])), True)
-    return dist >= -float(dilation_px)
-
-
 def _signed_distance_to_polygon(point, polygon):
     if point is None or polygon is None:
         return None
@@ -140,6 +126,78 @@ def _point_in_box(point, box, margin_px=0.0):
     )
 
 
+def _box_overlap_ratio(inner_box, outer_box):
+    ix1, iy1, ix2, iy2 = map(float, inner_box[:4])
+    ox1, oy1, ox2, oy2 = map(float, outer_box[:4])
+
+    x1 = max(ix1, ox1)
+    y1 = max(iy1, oy1)
+    x2 = min(ix2, ox2)
+    y2 = min(iy2, oy2)
+
+    inter_w = max(0.0, x2 - x1)
+    inter_h = max(0.0, y2 - y1)
+    inner_area = max(1.0, max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1))
+    return (inter_w * inter_h) / inner_area
+
+
+def _expand_box(box, margin_px):
+    x1, y1, x2, y2 = map(float, box[:4])
+    margin = float(margin_px)
+    return (x1 - margin, y1 - margin, x2 + margin, y2 + margin)
+
+
+def _normalized_point_in_box(point, box):
+    px, py = map(float, point)
+    x1, y1, x2, y2 = map(float, box[:4])
+    return (
+        (px - x1) / max(x2 - x1, 1e-6),
+        (py - y1) / max(y2 - y1, 1e-6),
+    )
+
+
+def _polygon_bounds(polygon):
+    if polygon is None:
+        return None
+
+    poly = np.asarray(polygon, dtype=np.float32)
+    if poly.ndim != 2 or poly.shape[0] < 3:
+        return None
+
+    return (
+        float(np.min(poly[:, 0])),
+        float(np.min(poly[:, 1])),
+        float(np.max(poly[:, 0])),
+        float(np.max(poly[:, 1])),
+    )
+
+
+def _normalized_point_in_polygon_bounds(point, polygon):
+    bounds = _polygon_bounds(polygon)
+    if point is None or bounds is None:
+        return None
+
+    px, py = map(float, point)
+    x1, y1, x2, y2 = bounds
+    return (
+        (px - x1) / max(x2 - x1, 1e-6),
+        (py - y1) / max(y2 - y1, 1e-6),
+    )
+
+
+def _latest_distinct_velocity(points, min_motion_px=0.75):
+    if points is None or len(points) < 2:
+        return 0.0, 0.0
+
+    current = points[-1]
+    for prev in reversed(list(points)[:-1]):
+        dx = float(current[0]) - float(prev[0])
+        dy = float(current[1]) - float(prev[1])
+        if math.hypot(dx, dy) >= float(min_motion_px):
+            return dx, dy
+    return 0.0, 0.0
+
+
 def _same_actor(prev_actor_id, cls_name, track_id):
     if isinstance(prev_actor_id, tuple) and len(prev_actor_id) == 2:
         try:
@@ -159,12 +217,31 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
                    mask_overlap_ratio_threshold=0.35,
                    min_mask_overlap_for_vehicle_distance=0.08,
                    prev_litter_center=None,
+                   prev_litter_missed=None,
                    vehicle_history=None,
                    person_mask_dilation_px=10.0,
                    vehicle_mask_dilation_px=16.0,
                    vehicle_mask_gap_threshold=100.0,
                    vehicle_relative_motion_threshold=12.0,
-                   bbox_margin_px=8.0):
+                   bbox_margin_px=8.0,
+                   allow_distance_holding=True,
+                   vehicle_release_downward_threshold=15.0,
+                   vehicle_release_horizontal_threshold=12.0,
+                   vehicle_release_relative_motion_threshold=18.0,
+                   vehicle_release_abs_downward_threshold=10.0,
+                   vehicle_release_abs_horizontal_threshold=10.0,
+                   vehicle_release_abs_motion_threshold=18.0,
+                   vehicle_release_min_mask_gap_px=8.0,
+                   vehicle_release_max_mask_overlap=0.08,
+                   vehicle_release_lower_edge_ratio=0.90,
+                   vehicle_release_side_min_y_ratio=0.55,
+                   vehicle_release_side_min_mask_gap_px=16.0,
+                   vehicle_release_side_max_mask_overlap=0.01,
+                   vehicle_release_max_anchor_missed=3,
+                   vehicle_bbox_gap_threshold=48.0,
+                   vehicle_side_edge_ratio=0.12,
+                   vehicle_lower_edge_ratio=0.75,
+                   vehicle_bottom_gap_ratio=0.95):
     if not actors:
         return False, None
 
@@ -176,20 +253,14 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
 
     # 1. 取得垃圾的移動速度與方向 (若沒有歷史中心，預設無移動)
     litter_vx, litter_vy = 0.0, 0.0
-    is_litter_falling = False
     is_litter_static = False
     
     if prev_litter_center is not None:
         litter_vx = lc_x - float(prev_litter_center[0])
         litter_vy = lc_y - float(prev_litter_center[1])
-        # 垃圾掉落特徵：Y 軸正向位移明顯
-        if litter_vy > 2.0: 
-            is_litter_falling = True
         # 垃圾靜止特徵：X 與 Y 軸位移極小
         if abs(litter_vx) < 1.0 and abs(litter_vy) < 1.0:
             is_litter_static = True
-    has_significant_litter_motion = math.hypot(litter_vx, litter_vy) >= 4.0 or litter_vy >= 2.0
-
     best_actor_key = None
     best_distance = float('inf')
 
@@ -213,19 +284,31 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
             if vehicle_history and track_id in vehicle_history:
                 history = vehicle_history[track_id]['centroids']
                 if len(history) >= 2:
-                    veh_vx = history[-1][0] - history[-2][0]
-                    veh_vy = history[-1][1] - history[-2][1]
+                    veh_vx, veh_vy = _latest_distinct_velocity(history)
                     if abs(veh_vx) > 1.5 or abs(veh_vy) > 1.5:
                         is_vehicle_moving = True
+
+            relative_vx = litter_vx - veh_vx
+            relative_vy = litter_vy - veh_vy
+            relative_motion = math.hypot(relative_vx, relative_vy)
+            abs_litter_motion = math.hypot(litter_vx, litter_vy)
+            is_absolute_release_motion = (
+                prev_litter_center is not None and
+                litter_vy >= float(vehicle_release_abs_downward_threshold) and
+                abs(litter_vx) >= float(vehicle_release_abs_horizontal_threshold) and
+                abs_litter_motion >= float(vehicle_release_abs_motion_threshold)
+            )
+            is_relative_release_motion = (
+                prev_litter_center is not None and
+                relative_vy >= float(vehicle_release_downward_threshold) and
+                abs(relative_vx) >= float(vehicle_release_horizontal_threshold) and
+                relative_motion >= float(vehicle_release_relative_motion_threshold)
+            )
+            is_vehicle_release_motion = is_relative_release_motion or is_absolute_release_motion
 
             # 解綁條件 A：垃圾靜止在地上，但車子還在開 (絕對不是 Holding)
             if is_litter_static and is_vehicle_moving:
                 continue 
-
-            # 解綁條件 B：垃圾正在往下掉，但車子在橫向移動 (分離瞬間)
-            # 這裡簡單判斷：若垃圾 Y 軸位移大，但車輛主要是 X 軸位移
-            if is_litter_falling and abs(veh_vx) > abs(veh_vy):
-                continue
 
             actor_anchor = ((ax1 + ax2) / 2.0, ay2)
             dilation_px = vehicle_mask_dilation_px
@@ -244,6 +327,7 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
         mask_poly = actor.get('mask_poly')
         if mask_poly is not None:
             mask_signed_dist = _signed_distance_to_polygon(anchor_point, mask_poly)
+            mask_overlap_ratio = calculate_mask_overlap_ratio(litter_box, mask_poly)
             is_inside_actual_region = (
                 mask_signed_dist is not None and
                 mask_signed_dist >= 0.0
@@ -253,33 +337,138 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
                 mask_signed_dist >= -float(dilation_px)
             )
 
-            # Vehicle-like objects often have large bboxes. Once the litter has moved
-            # past the actual segmentation boundary, do not keep it attached by dilation alone.
-            if (
-                is_inside and
-                not is_inside_actual_region and
-                cls_name in VEHICLE_LIKE_CLASSES and
-                has_significant_litter_motion
-            ):
+            if cls_name in VEHICLE_LIKE_CLASSES:
+                norm_xy = _normalized_point_in_polygon_bounds(anchor_point, mask_poly)
+                norm_x, norm_y = norm_xy if norm_xy is not None else (None, None)
+                is_near_side_edge = (
+                    norm_x is not None and (
+                        norm_x <= float(vehicle_side_edge_ratio) or
+                        norm_x >= (1.0 - float(vehicle_side_edge_ratio))
+                    )
+                )
+                # 側邊拋出不一定會落到車體最下緣；但側邊最容易受車體移動誤導，
+                # 因此必須有相對車體的分離，或車體本身沒有明顯移動時才接受絕對位移。
+                has_release_side_gap = (
+                    not is_inside_actual_region and
+                    is_near_side_edge and
+                    norm_y is not None and
+                    norm_y >= float(vehicle_release_side_min_y_ratio) and
+                    (
+                        mask_signed_dist is None or
+                        mask_signed_dist <= -float(vehicle_release_side_min_mask_gap_px)
+                    ) and
+                    (
+                        mask_overlap_ratio is None or
+                        mask_overlap_ratio <= float(vehicle_release_side_max_mask_overlap)
+                    )
+                )
+                has_release_lower_gap = (
+                    not is_inside_actual_region and
+                    norm_y is not None and
+                    norm_y >= float(vehicle_release_lower_edge_ratio) and
+                    (
+                        mask_signed_dist is None or
+                        mask_signed_dist <= -float(vehicle_release_min_mask_gap_px)
+                    ) and
+                    (
+                        mask_overlap_ratio is None or
+                        mask_overlap_ratio <= float(vehicle_release_max_mask_overlap)
+                    )
+                )
+                has_fresh_litter_anchor = (
+                    prev_litter_missed is None or
+                    int(prev_litter_missed) <= int(vehicle_release_max_anchor_missed)
+                )
+                side_release_motion = (
+                    has_fresh_litter_anchor and (
+                        is_relative_release_motion or
+                        (is_absolute_release_motion and not is_vehicle_moving)
+                    )
+                )
+                mask_aware_release_motion = (
+                    (
+                        (is_relative_release_motion or is_absolute_release_motion) and
+                        has_release_lower_gap
+                    ) or (
+                        side_release_motion and
+                        has_release_side_gap
+                    )
+                )
+                if is_inside_actual_region:
+                    if norm_x is not None and (
+                        norm_x <= float(vehicle_side_edge_ratio) or
+                        norm_x >= (1.0 - float(vehicle_side_edge_ratio))
+                    ):
+                        return True, (cls_name, track_id)
+
+                is_lower_side_gap = (
+                    not is_inside_actual_region and
+                    mask_signed_dist is not None and
+                    mask_signed_dist >= -float(vehicle_bbox_gap_threshold) and
+                    norm_y is not None and
+                    norm_y >= float(vehicle_lower_edge_ratio) and
+                    norm_x is not None and (
+                        norm_x <= float(vehicle_side_edge_ratio) or
+                        norm_x >= (1.0 - float(vehicle_side_edge_ratio))
+                    )
+                )
+                if is_lower_side_gap and not mask_aware_release_motion:
+                    return True, (cls_name, track_id)
+
+                is_bottom_gap = (
+                    not is_inside_actual_region and
+                    mask_signed_dist is not None and
+                    mask_signed_dist >= -float(vehicle_bbox_gap_threshold) and
+                    norm_y is not None and
+                    norm_y >= float(vehicle_bottom_gap_ratio)
+                )
+                if is_bottom_gap and not mask_aware_release_motion:
+                    return True, (cls_name, track_id)
+
+                is_mask_attached = (
+                    mask_overlap_ratio is not None and
+                    mask_overlap_ratio >= float(min_mask_overlap_for_vehicle_distance)
+                )
+                is_vehicle_attached = is_inside or is_mask_attached
+                if is_vehicle_attached:
+                    if mask_aware_release_motion:
+                        continue
+                    return True, (cls_name, track_id)
+
+                is_near_vehicle_mask = (
+                    mask_signed_dist is not None and
+                    mask_signed_dist >= -float(vehicle_mask_gap_threshold)
+                )
+                if allow_distance_holding and is_near_vehicle_mask and not mask_aware_release_motion:
+                    return True, (cls_name, track_id)
+
                 continue
 
             if is_inside:
                 return True, (cls_name, track_id)
 
-            if cls_name in VEHICLE_LIKE_CLASSES and _point_in_box(anchor_point, actor['box'], bbox_margin_px):
-                relative_motion = math.hypot(litter_vx - veh_vx, litter_vy - veh_vy)
-                if (
-                    (mask_signed_dist is not None and mask_signed_dist >= -float(vehicle_mask_gap_threshold)) or
-                    relative_motion <= float(vehicle_relative_motion_threshold)
-                ):
-                    return True, (cls_name, track_id)
+            if (
+                mask_overlap_ratio is not None and
+                mask_overlap_ratio >= float(mask_overlap_ratio_threshold)
+            ):
+                return True, (cls_name, track_id)
 
             continue
 
-        is_inside_actual_region = _point_in_box(anchor_point, actor['box'], 0.0)
-        is_inside = is_inside_actual_region or _point_in_box(anchor_point, actor['box'], bbox_margin_px)
-        is_distance_holding = dist <= adaptive_thr
-        if is_inside or is_distance_holding:
+        if cls_name in VEHICLE_LIKE_CLASSES:
+            is_distance_holding = (
+                allow_distance_holding and
+                dist <= adaptive_thr and
+                relative_motion <= float(vehicle_relative_motion_threshold)
+            )
+            if is_distance_holding:
+                if is_vehicle_release_motion:
+                    continue
+                return True, (cls_name, track_id)
+            continue
+
+        is_distance_holding = allow_distance_holding and dist <= adaptive_thr
+        if is_distance_holding:
             return True, (cls_name, track_id)
 
     return False, best_actor_key

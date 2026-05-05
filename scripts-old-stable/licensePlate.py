@@ -77,6 +77,11 @@ def preload_license_plate_models(profiler=None):
         return False
 
 
+def disable_license_plate_models():
+    global _plate_disabled
+    _plate_disabled = True
+
+
 def _plate_worker(roi_items, vehicle_history, profiler=None):
     """Heavy lifting: runs YOLO plate detection + OCR in a background thread."""
     try:

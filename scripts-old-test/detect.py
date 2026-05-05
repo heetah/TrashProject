@@ -224,9 +224,6 @@ def detect(frame, model_bbox, model_trash,
         with profile_block(profiler, "detect.action_update"):
             person_action_map = action_module.update(frame, persons, profiler=profiler)
 
-    with profile_block(profiler, "detect.plate_dispatch"):
-        detect_license_plates(frame, vehicles, vehicle_history, profiler=profiler)
-
     filtererd_objects = []
 
     tracking_objects = all_objects
@@ -314,6 +311,7 @@ def detect(frame, model_bbox, model_trash,
 
             # 嘗試從現有 tracker 軌跡取最近上一幀中心，供 holding 判斷
             prev_litter_center = None
+            prev_litter_missed = None
             min_prev_dist = float('inf')
             curr_center = ((lx1 + lx2) / 2.0, (ly1 + ly2) / 2.0)
             for l_data in litter_tracker.active_litters.values():
@@ -328,8 +326,10 @@ def detect(frame, model_bbox, model_trash,
                 if dist < litter_tracker.distance_threshold and dist < min_prev_dist:
                     min_prev_dist = dist
                     prev_litter_center = prev_center
+                    prev_litter_missed = int(l_data.get('missed', 0))
 
-            # 新出現目標先不要做 holding 過濾，避免剛拋出且仍在 vehicle bbox 內時被長時間壓掉。
+            # 新出現目標先進 tracker 建立一個 history anchor；第二幀起才能判斷它
+            # 是否相對車輛真的往下分離，避免把 resize.mp4 這類剛丟出的垃圾第一點擋掉。
             if prev_litter_center is None:
                 filtered_frame_litters.append(litter_box)
                 continue
@@ -338,6 +338,7 @@ def detect(frame, model_bbox, model_trash,
                 litter_box,
                 tracking_objects,
                 prev_litter_center=prev_litter_center,
+                prev_litter_missed=prev_litter_missed,
                 vehicle_history=vehicle_history,
             )
             if is_holding_like:
@@ -361,6 +362,19 @@ def detect(frame, model_bbox, model_trash,
                 ttl=violator_display_ttl,
             )
         active_violators = set(active_violators) | stgcn_violators
+
+    # 車牌辨識只對已鎖定違規者派工；避免每 10 幀掃描所有車輛造成不必要延遲。
+    with profile_block(profiler, "detect.plate_dispatch"):
+        plate_target_keys = set(active_violators)
+        plate_target_keys.update(
+            key for key in violator_display_cache.keys()
+            if key[0] in VEHICLE_LIKE_CLASSES
+        )
+        plate_target_vehicles = [
+            obj for obj in vehicles
+            if (obj['cls'], obj['track_id']) in plate_target_keys
+        ]
+        detect_license_plates(frame, plate_target_vehicles, vehicle_history, profiler=profiler)
 
     with profile_block(profiler, "detect.violator_cache_refresh"):
         for obj in tracking_objects:

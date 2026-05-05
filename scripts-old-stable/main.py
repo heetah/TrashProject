@@ -13,7 +13,7 @@ from ultralytics import RTDETR
 from detect import BBOX_DEVICE, BBOX_HALF, TRASH_DEVICE, TRASH_HALF, detect
 from litterTracker import GlobalLitterTracker
 from action import STGCNActionModule
-from licensePlate import preload_license_plate_models, wait_for_plate_jobs
+from licensePlate import disable_license_plate_models, preload_license_plate_models, wait_for_plate_jobs
 from timeUtils import PipelineProfiler
 
 COLORS = {
@@ -142,12 +142,14 @@ if __name__ == "__main__":
     parser.add_argument("--action-device", default=os.environ.get("ACTION_DEVICE"), help="ACTION_DEVICE override, e.g. cuda:0 or cpu")
     parser.add_argument("--action-predict-interval", type=int, default=None, help="run STGCN every N frames after the sequence window is full")
     parser.add_argument("--action-pose-imgsz", type=int, default=None, help="optional YOLO pose imgsz override")
+    parser.add_argument("--disable-action", action="store_true", help="Disable STGCN action recognition; enabled by default for faster litter-only processing")
     parser.add_argument("--yolo-seg-frame-skip", type=int, default=2, help="run YOLO-seg actor tracking every N frames")
     parser.add_argument("--bbox-model", default=None, help="YOLO-seg actor model path")
     parser.add_argument("--trash-model", default=None, help="RTDETR litter model path")
     parser.add_argument("--no-engine", action="store_true", help="Use .pt weights even when a sibling .engine exists")
     parser.add_argument("--bbox-conf", type=float, default=0.45, help="YOLO-seg actor confidence threshold")
-    parser.add_argument("--trash-conf", type=float, default=0.6, help="RTDETR litter confidence threshold")
+    parser.add_argument("--trash-conf", type=float, default=0.4, help="RTDETR litter confidence threshold")
+    parser.add_argument("--disable-plate", action="store_true", help="Disable license plate detection/OCR for faster litter-only processing")
     parser.add_argument("--skip-plate-preload", action="store_true", help="Do not preload license plate detector/OCR models")
     args = parser.parse_args()
 
@@ -171,19 +173,23 @@ if __name__ == "__main__":
             print("Preloading all configured models before video processing...")
             print(f"BBOX candidates: {bbox_model_candidates}")
             print(f"Trash candidates: {trash_model_candidates}")
-            print(f"Pose model: {args.pose_model}")
-            print(f"STGCN weight: {args.stgcn_weight}")
-            with profiler.time_block("model_load.action_module_total"):
-                action_module = STGCNActionModule(
-                    pose_model_path=args.pose_model,
-                    stgcn_weight_path=args.stgcn_weight,
-                    stgcn_config_path=args.stgcn_config,
-                    action_threshold=args.action_threshold,
-                    window_size=args.action_window,
-                    device=args.action_device,
-                    profiler=profiler,
-                )
-            action_module.warmup(profiler=profiler)
+            action_module = None
+            if not args.disable_action:
+                print(f"Pose model: {args.pose_model}")
+                print(f"STGCN weight: {args.stgcn_weight}")
+                with profiler.time_block("model_load.action_module_total"):
+                    action_module = STGCNActionModule(
+                        pose_model_path=args.pose_model,
+                        stgcn_weight_path=args.stgcn_weight,
+                        stgcn_config_path=args.stgcn_config,
+                        action_threshold=args.action_threshold,
+                        window_size=args.action_window,
+                        device=args.action_device,
+                        profiler=profiler,
+                    )
+                action_module.warmup(profiler=profiler)
+            else:
+                print("STGCN action module skipped; use --disable-action when action recognition is required.")
 
             model_bbox, bbox_model_path = _load_model_with_warmup(
                 "bbox_yolo",
@@ -201,7 +207,10 @@ if __name__ == "__main__":
             )
             print(f"BBOX model selected: {bbox_model_path}")
             print(f"Trash model selected: {trash_model_path}")
-            if not args.skip_plate_preload:
+            if args.disable_plate:
+                disable_license_plate_models()
+                print("License plate detector/OCR disabled by --disable-plate.")
+            elif not args.skip_plate_preload:
                 preload_license_plate_models(profiler=profiler)
             else:
                 print("License plate detector/OCR preload skipped by --skip-plate-preload.")
