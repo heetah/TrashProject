@@ -191,7 +191,10 @@ class PipelineProfiler:
                         "影像寫入/壓縮/清理",
                         [
                             "frame.write_temp_avi",
+                            "frame.write_output",
+                            "frame.ffmpeg_stdin_write",
                             "encode.ffmpeg_compress",
+                            "encode.ffmpeg_pipe_close",
                             "cleanup.remove_temp_avi",
                             "cleanup.release_video_io",
                         ],
@@ -230,6 +233,7 @@ class PipelineProfiler:
                         [
                             "setup.output_dir",
                             "setup.background_subtractor",
+                            "setup.motion_masker",
                             "video.open_writer",
                             "setup.litter_tracker",
                         ],

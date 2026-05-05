@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+# 單幀與批次偵測核心：整合 actor tracking、litter detection、holding/motion filter、tracker 與畫面渲染。
 import cv2
 import numpy as np
 import math
@@ -10,6 +12,7 @@ from smallFunction import (
     litter_holding,
 )
 
+# 類別顏色與名稱正規化：避免不同模型 label-space 造成 actor 解析錯誤。
 BLACK = (0, 0, 0)
 WARN = (0, 0, 255)
 ACTOR_CLASSES = ('person', 'scooter', 'vehicle')
@@ -31,6 +34,7 @@ except Exception:
 
 
 def _select_device(env_name):
+    # 依環境變數選 GPU/CPU；若使用者要求 CUDA 但不可用，自動回退 CPU。
     requested = os.environ.get(env_name) or os.environ.get("YOLO_DEVICE")
     if requested:
         requested_str = str(requested).strip().lower()
@@ -48,6 +52,7 @@ def _select_device(env_name):
 
 
 def _can_use_half(device):
+    # half precision 只在 CUDA 裝置上啟用，避免 CPU/MPS 不支援。
     if torch is None or not torch.cuda.is_available():
         return False
     return str(device).lower() not in ("cpu", "mps")
@@ -60,6 +65,7 @@ TRASH_HALF = _can_use_half(TRASH_DEVICE)
 
 
 def _model_class_name(model, cls_id):
+    # 將模型 class id 轉成專案需要的 actor 類別，兼容自訂模型與 COCO fallback。
     names = getattr(model, "names", {})
     if isinstance(names, dict):
         raw_name = names.get(int(cls_id), str(cls_id))
@@ -73,12 +79,11 @@ def _model_class_name(model, cls_id):
     if class_name in ACTOR_CLASSES:
         return class_name
 
-    # Custom project models use id 0 for litter. Do not apply COCO id fallback
-    # when the model provides an explicit non-actor class name.
+    # 自訂專案模型常用 id 0 表示 litter；若有明確名稱，不能套 COCO actor fallback。
     if not str(raw_name).strip().isdigit():
         return None
 
-    # Backward-compatible fallback for older COCO-style person/vehicle models.
+    # 舊 COCO 類模型相容路徑。
     if int(cls_id) == 0:
         return 'person'
     if int(cls_id) in COCO_VEHICLE_IDS:
@@ -87,10 +92,21 @@ def _model_class_name(model, cls_id):
 
 
 def _clone_actors(actors):
+    # 複製 actor dict，避免快取資料在後續流程被原地修改。
     return [dict(actor) for actor in actors]
 
 
+def _as_result_list(results):
+    # Ultralytics 有時回傳單物件、有時回傳 list；統一成 list 方便批次處理。
+    if results is None:
+        return []
+    if isinstance(results, (list, tuple)):
+        return list(results)
+    return [results]
+
+
 def _extract_actor_tracks(results, model_bbox):
+    # 從 YOLO track 結果抽出 person/vehicle/scooter，保留 bbox、track id 與 segmentation polygon。
     persons = []
     vehicles = []
 
@@ -118,7 +134,7 @@ def _extract_actor_tracks(results, model_bbox):
                 'box': box,
                 'track_id': int(track_id),
                 'cls': class_name,
-                # Keep polygon so holding can use segmentation instead of bbox-only overlap.
+                # 保留 polygon，讓 holding 可用 segmentation，而不是只看 bbox overlap。
                 'mask_poly': actor_mask_poly,
             }
 
@@ -144,7 +160,12 @@ def detect(frame, model_bbox, model_trash,
            trash_conf=0.5,
            profiler=None,
            moving_threshold=0.25,
-           core_moving_threshold=0.3,):
+           core_moving_threshold=0.3,
+           precomputed_persons=None,
+           precomputed_vehicles=None,
+           precomputed_trash_results=None,
+           fg_mask_scale=1.0):
+    # 單幀偵測入口：負責一幀內完整 actor、litter、違規者、渲染流程。
     if violator_display_cache is None:
         violator_display_cache = {}
     if yolo_seg_cache is None:
@@ -161,33 +182,38 @@ def detect(frame, model_bbox, model_trash,
             if violator_display_cache[actor_key]['ttl'] <= 0:
                 del violator_display_cache[actor_key]
 
-    # 1. 第一次偵測
-    # === YOLO 人與車輛偵測 ===
-    should_run_yolo_seg = (
-        frame_index % yolo_seg_frame_skip == 0 or
-        'persons' not in yolo_seg_cache or
-        'vehicles' not in yolo_seg_cache
-    )
-    if should_run_yolo_seg:
-        with profile_block(profiler, "detect.yolo_actor_track"):
-            results = model_bbox.track(
-                frame,
-                persist = True,
-                conf = bbox_conf,
-                device = BBOX_DEVICE,
-                half = BBOX_HALF,
-                verbose = False,
-                tracker = "botsort.yaml"
-            )
-        with profile_block(profiler, "detect.yolo_actor_parse"):
-            persons, vehicles = _extract_actor_tracks(results, model_bbox)
-        yolo_seg_cache['persons'] = _clone_actors(persons)
-        yolo_seg_cache['vehicles'] = _clone_actors(vehicles)
-        yolo_seg_cache['frame_index'] = frame_index
+    # 第一段：YOLO actor tracking。若 batch 外層已預先計算，直接使用 precomputed 結果。
+    if precomputed_persons is not None and precomputed_vehicles is not None:
+        persons = _clone_actors(precomputed_persons)
+        vehicles = _clone_actors(precomputed_vehicles)
     else:
-        with profile_block(profiler, "detect.yolo_actor_cache_reuse"):
-            persons = _clone_actors(yolo_seg_cache.get('persons', []))
-            vehicles = _clone_actors(yolo_seg_cache.get('vehicles', []))
+        should_run_yolo_seg = (
+            frame_index % yolo_seg_frame_skip == 0 or
+            'persons' not in yolo_seg_cache or
+            'vehicles' not in yolo_seg_cache
+        )
+        if should_run_yolo_seg:
+            # 每 N 幀才跑 YOLO tracking，其餘幀沿用快取以降低耗時。
+            with profile_block(profiler, "detect.yolo_actor_track"):
+                results = model_bbox.track(
+                    frame,
+                    persist = True,
+                    conf = bbox_conf,
+                    device = BBOX_DEVICE,
+                    half = BBOX_HALF,
+                    verbose = False,
+                    tracker = "botsort.yaml"
+                )
+            with profile_block(profiler, "detect.yolo_actor_parse"):
+                persons, vehicles = _extract_actor_tracks(results, model_bbox)
+            yolo_seg_cache['persons'] = _clone_actors(persons)
+            yolo_seg_cache['vehicles'] = _clone_actors(vehicles)
+            yolo_seg_cache['frame_index'] = frame_index
+        else:
+            # 快取重用：保留上次 actor 狀態，讓跳幀不會讓畫面完全沒有 actor。
+            with profile_block(profiler, "detect.yolo_actor_cache_reuse"):
+                persons = _clone_actors(yolo_seg_cache.get('persons', []))
+                vehicles = _clone_actors(yolo_seg_cache.get('vehicles', []))
 
     annotated_frame = frame.copy()
     box_thickness = 4
@@ -228,7 +254,7 @@ def detect(frame, model_bbox, model_trash,
 
     tracking_objects = all_objects
 
-    # 第二次遍歷：依 bbox 相對速度過濾車輛
+    # 第二段：更新車輛中心點歷史，供 holding 與後續相對運動判斷使用。
     with profile_block(profiler, "detect.vehicle_history_filter"):
         for obj in all_objects:
             # 針對 vehicle 進行相對速度過濾
@@ -240,20 +266,23 @@ def detect(frame, model_bbox, model_trash,
 
             filtererd_objects.append(obj)
 
-    # 2. 第二次偵測: RTDETR 全圖偵測垃圾
+    # 第三段：RTDETR 全圖偵測垃圾。
     current_frame_litters = []
 
     # 直接使用全圖進行 RTDETR 追蹤/偵測
-    with profile_block(profiler, "detect.rtdetr_litter_predict"):
-        chunk_results = model_trash.predict(
-            frame,          # 直接傳入整張圖 
-            conf=trash_conf,
-            device=TRASH_DEVICE,
-            half=TRASH_HALF,
-            verbose=False
-        )
+    if precomputed_trash_results is None:
+        with profile_block(profiler, "detect.rtdetr_litter_predict"):
+            chunk_results = model_trash.predict(
+                frame,          # 直接傳入整張圖
+                conf=trash_conf,
+                device=TRASH_DEVICE,
+                half=TRASH_HALF,
+                verbose=False
+            )
+    else:
+        chunk_results = _as_result_list(precomputed_trash_results)
 
-    # 解析 RTDETR 結果 (因為是全圖，不須再加 ROI 偏移量)
+    # 解析 RTDETR 結果：全圖推理不需要 ROI 座標偏移。
     with profile_block(profiler, "detect.rtdetr_parse"):
         for r_res in chunk_results:
             if r_res.boxes is None:
@@ -269,15 +298,15 @@ def detect(frame, model_bbox, model_trash,
                     bbox_width = lx2 - lx1
                     bbox_height = ly2 - ly1
 
-                    # 垃圾長寬比例過濾，防止動態模糊被誤殺
+                    # 基礎 bbox 尺寸與長寬比過濾：去掉極端扁長或過小雜訊。
                     aspect_ratio = bbox_width / max(bbox_height, 1e-6)
                     if aspect_ratio > 6.0 or aspect_ratio < 0.15 or bbox_width < 3 or bbox_height < 3:
                         continue
                     
-                    # 座標已經是全域的，直接加入
+                    # 座標已經是全域座標，直接加入本幀候選 litter。
                     current_frame_litters.append([lx1, ly1, lx2, ly2, r_conf])
                 
-    # detect 端先做 motion + holding 過濾，tracker 僅做反追蹤關聯
+    # 第四段：motion + holding 前處理。只有真的在動、且不像仍被人車持有的 litter 才進 tracker。
     filtered_frame_litters = []
     with profile_block(profiler, "detect.motion_holding_filter"):
         for litter_box in current_frame_litters:
@@ -285,11 +314,12 @@ def detect(frame, model_bbox, model_trash,
             litter_w = max(int(lx2 - lx1), 1)
             litter_h = max(int(ly2 - ly1), 1)
 
-            # 傳入整張 mask 與litter 中心座標，讓 check_motion 自行決定要檢查整個 bbox 還是中心點，並根據目標大小調整閾值
+            # 檢查整個 litter bbox 的前景像素比例，先排除靜止舊垃圾。
             is_moving = check_motion(
                 fg_mask,
                 (int(lx1), int(ly1), int(lx2), int(ly2)),
                 threshold=moving_threshold,
+                mask_scale=fg_mask_scale,
             )
             if not is_moving:
                 continue
@@ -305,11 +335,12 @@ def detect(frame, model_bbox, model_trash,
                     fg_mask,
                     (core_x1, core_y1, core_x2, core_y2),
                     threshold=core_moving_threshold,
+                    mask_scale=fg_mask_scale,
                 )
                 if not is_core_moving:
                     continue
 
-            # 嘗試從現有 tracker 軌跡取最近上一幀中心，供 holding 判斷
+            # 從 tracker 取最近上一幀中心，供 holding 判斷相對位移與釋放方向。
             prev_litter_center = None
             prev_litter_missed = None
             min_prev_dist = float('inf')
@@ -346,7 +377,7 @@ def detect(frame, model_bbox, model_trash,
 
             filtered_frame_litters.append(litter_box)
 
-    # 更新垃圾追蹤器，取得目前的追蹤狀態
+    # 第五段：更新 GlobalLitterTracker，將 pending litter 依軌跡轉成 confirmed。
     with profile_block(profiler, "detect.litter_tracker_update"):
         tracked_litters, active_violators = litter_tracker.update(
             filtered_frame_litters,
@@ -354,6 +385,7 @@ def detect(frame, model_bbox, model_trash,
             person_vehicle_map=person_vehicle_map
         )
     if person_action_map:
+        # STGCN 若判定 person 正在 littering，也可直接把人/車註冊成違規者。
         with profile_block(profiler, "detect.stgcn_violator_register"):
             stgcn_violators = litter_tracker.register_action_violators(
                 person_action_map,
@@ -387,7 +419,7 @@ def detect(frame, model_bbox, model_trash,
                     'center': center,
                 }
 
-        # Ensure locked violators remain drawable even when temporarily filtered by speed.
+        # 已鎖定違規者即使被速度過濾暫時排除，也要保留渲染框。
         filtered_keys = {(obj['cls'], obj['track_id']) for obj in filtererd_objects}
         render_objects = list(filtererd_objects)
         for obj in tracking_objects:
@@ -395,7 +427,7 @@ def detect(frame, model_bbox, model_trash,
             if obj_key in violator_display_cache and obj_key not in filtered_keys:
                 render_objects.append(obj)
 
-    # 2. 統一渲染：畫出人、車與違規紅框
+    # 第六段：統一渲染 actor。違規者紅框，正常人車用各類別顏色。
     with profile_block(profiler, "detect.render_actors"):
         for obj in render_objects:
             x1, y1, x2, y2 = map(int, obj['box'])
@@ -446,7 +478,7 @@ def detect(frame, model_bbox, model_trash,
                 cv2.putText(annotated_frame, label_text, (x1, max(10, y1 - 10)),
                             cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, text_thickness)
 
-    # 3. 統一渲染：畫出垃圾追蹤框
+    # 第七段：只畫 confirmed litter，避免 pending 候選框造成誤解。
     with profile_block(profiler, "detect.render_litters"):
         for l_id, l_data in tracked_litters.items():
             lx1, ly1, lx2, ly2, conf = l_data['bbox']
@@ -459,3 +491,218 @@ def detect(frame, model_bbox, model_trash,
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, l_color, 2)
 
     return annotated_frame
+
+
+def _run_batched_actor_track(model_bbox, frames, bbox_conf, profiler=None):
+    # 批次 YOLO actor tracking；若 backend 不支援批次，回退逐幀 tracking。
+    source = frames if len(frames) > 1 else frames[0]
+    try:
+        with profile_block(profiler, "detect.yolo_actor_track_batch"):
+            results = model_bbox.track(
+                source,
+                persist=True,
+                conf=bbox_conf,
+                device=BBOX_DEVICE,
+                half=BBOX_HALF,
+                verbose=False,
+                tracker="botsort.yaml",
+            )
+        result_list = _as_result_list(results)
+        if len(result_list) != len(frames):
+            raise RuntimeError(f"expected {len(frames)} YOLO results, got {len(result_list)}")
+        return result_list
+    except Exception as exc:
+        if len(frames) <= 1:
+            raise
+        print(f"Warning: batched YOLO actor tracking failed; falling back to per-frame tracking: {exc}")
+        result_list = []
+        for frame in frames:
+            with profile_block(profiler, "detect.yolo_actor_track_fallback"):
+                single_results = model_bbox.track(
+                    frame,
+                    persist=True,
+                    conf=bbox_conf,
+                    device=BBOX_DEVICE,
+                    half=BBOX_HALF,
+                    verbose=False,
+                    tracker="botsort.yaml",
+                )
+            single_list = _as_result_list(single_results)
+            if not single_list:
+                raise RuntimeError("YOLO actor fallback returned no results")
+            result_list.append(single_list[0])
+        return result_list
+
+
+def _run_batched_trash_predict(model_trash, frames, trash_conf, export_batch_size, profiler=None):
+    # 批次 RTDETR litter predict；尾端不足 batch 時用最後一幀 padding，輸出再裁回原長度。
+    infer_frames = list(frames)
+    if export_batch_size > len(infer_frames):
+        infer_frames.extend([infer_frames[-1]] * (export_batch_size - len(infer_frames)))
+
+    source = infer_frames if len(infer_frames) > 1 else infer_frames[0]
+    with profile_block(profiler, "detect.rtdetr_litter_predict_batch"):
+        results = model_trash.predict(
+            source,
+            conf=trash_conf,
+            device=TRASH_DEVICE,
+            half=TRASH_HALF,
+            verbose=False,
+        )
+    result_list = _as_result_list(results)
+    if len(result_list) < len(frames):
+        raise RuntimeError(f"expected at least {len(frames)} RTDETR results, got {len(result_list)}")
+    return result_list[:len(frames)]
+
+
+def _prepare_actor_batch(frames, frame_indices, model_bbox, bbox_conf,
+                         yolo_seg_frame_skip, yolo_seg_cache, profiler=None):
+    # 為 detect_batch 準備每幀 actor 結果：該跑 YOLO 的幀跑推理，其餘幀沿用快取。
+    actor_pairs = [None] * len(frames)
+    run_positions = []
+    run_frames = []
+    cache_available = 'persons' in yolo_seg_cache and 'vehicles' in yolo_seg_cache
+
+    for pos, (frame, frame_index) in enumerate(zip(frames, frame_indices)):
+        should_run_yolo_seg = (
+            frame_index % yolo_seg_frame_skip == 0 or
+            not cache_available
+        )
+        if should_run_yolo_seg:
+            run_positions.append(pos)
+            run_frames.append(frame)
+            cache_available = True
+        else:
+            actor_pairs[pos] = None
+
+    run_result_map = {}
+    if run_frames:
+        run_results = _run_batched_actor_track(model_bbox, run_frames, bbox_conf, profiler=profiler)
+        for pos, result in zip(run_positions, run_results):
+            run_result_map[pos] = result
+
+    for pos, frame_index in enumerate(frame_indices):
+        if pos in run_result_map:
+            with profile_block(profiler, "detect.yolo_actor_parse_batch"):
+                persons, vehicles = _extract_actor_tracks([run_result_map[pos]], model_bbox)
+            yolo_seg_cache['persons'] = _clone_actors(persons)
+            yolo_seg_cache['vehicles'] = _clone_actors(vehicles)
+            yolo_seg_cache['frame_index'] = frame_index
+            actor_pairs[pos] = (persons, vehicles)
+
+        if actor_pairs[pos] is None:
+            actor_pairs[pos] = (
+                _clone_actors(yolo_seg_cache.get('persons', [])),
+                _clone_actors(yolo_seg_cache.get('vehicles', [])),
+            )
+
+    return actor_pairs
+
+
+def detect_batch(frames, model_bbox, model_trash,
+                 color_dict, fg_masks, litter_tracker, vehicle_history,
+                 fps=30.0, vehicle_relative_speed_threshold_pct_per_s=20.0,
+                 enable_vehicle_speed_filter=True,
+                 violator_display_cache=None, violator_display_ttl=60,
+                 violator_display_max_jump=80.0,
+                 action_module=None,
+                 frame_start_index=0,
+                 yolo_seg_frame_skip=2,
+                 yolo_seg_cache=None,
+                 bbox_conf=0.3,
+                 trash_conf=0.5,
+                 profiler=None,
+                 moving_threshold=0.25,
+                 core_moving_threshold=0.3,
+                 batch_size=1,
+                 fg_mask_scale=1.0):
+    # 批次偵測入口：RTDETR 批次推理、actor 可跳幀快取，最後逐幀套用單幀後處理。
+    if not frames:
+        return []
+    if len(frames) != len(fg_masks):
+        raise ValueError(f"frames and fg_masks length mismatch: {len(frames)} != {len(fg_masks)}")
+    if violator_display_cache is None:
+        violator_display_cache = {}
+    if yolo_seg_cache is None:
+        yolo_seg_cache = {}
+
+    batch_size = max(int(batch_size or 1), 1)
+    frame_indices = [int(frame_start_index) + i for i in range(len(frames))]
+
+    if batch_size <= 1 or len(frames) <= 1:
+        # batch 被關閉或尾端只剩單幀時，直接走單幀流程保持行為一致。
+        return [
+            detect(
+                frame, model_bbox, model_trash, color_dict,
+                fg_mask, litter_tracker, vehicle_history,
+                fps=fps,
+                vehicle_relative_speed_threshold_pct_per_s=vehicle_relative_speed_threshold_pct_per_s,
+                enable_vehicle_speed_filter=enable_vehicle_speed_filter,
+                violator_display_cache=violator_display_cache,
+                violator_display_ttl=violator_display_ttl,
+                violator_display_max_jump=violator_display_max_jump,
+                action_module=action_module,
+                frame_index=frame_index,
+                yolo_seg_frame_skip=yolo_seg_frame_skip,
+                yolo_seg_cache=yolo_seg_cache,
+                bbox_conf=bbox_conf,
+                trash_conf=trash_conf,
+                profiler=profiler,
+                moving_threshold=moving_threshold,
+                core_moving_threshold=core_moving_threshold,
+                fg_mask_scale=fg_mask_scale,
+            )
+            for frame, fg_mask, frame_index in zip(frames, fg_masks, frame_indices)
+        ]
+
+    # 批次前處理：actor 結果可跳幀快取，litter 結果用 RTDETR 批次推理。
+    actor_pairs = _prepare_actor_batch(
+        frames,
+        frame_indices,
+        model_bbox,
+        bbox_conf,
+        yolo_seg_frame_skip,
+        yolo_seg_cache,
+        profiler=profiler,
+    )
+    trash_results = _run_batched_trash_predict(
+        model_trash,
+        frames,
+        trash_conf,
+        batch_size,
+        profiler=profiler,
+    )
+
+    annotated_frames = []
+    # 批次推理完成後，逐幀套用相同的 motion/holding/tracker/render 後處理。
+    for frame, fg_mask, frame_index, actor_pair, trash_result in zip(
+        frames, fg_masks, frame_indices, actor_pairs, trash_results
+    ):
+        persons, vehicles = actor_pair
+        annotated_frames.append(
+            detect(
+                frame, model_bbox, model_trash, color_dict,
+                fg_mask, litter_tracker, vehicle_history,
+                fps=fps,
+                vehicle_relative_speed_threshold_pct_per_s=vehicle_relative_speed_threshold_pct_per_s,
+                enable_vehicle_speed_filter=enable_vehicle_speed_filter,
+                violator_display_cache=violator_display_cache,
+                violator_display_ttl=violator_display_ttl,
+                violator_display_max_jump=violator_display_max_jump,
+                action_module=action_module,
+                frame_index=frame_index,
+                yolo_seg_frame_skip=yolo_seg_frame_skip,
+                yolo_seg_cache=yolo_seg_cache,
+                bbox_conf=bbox_conf,
+                trash_conf=trash_conf,
+                profiler=profiler,
+                moving_threshold=moving_threshold,
+                core_moving_threshold=core_moving_threshold,
+                precomputed_persons=persons,
+                precomputed_vehicles=vehicles,
+                precomputed_trash_results=[trash_result],
+                fg_mask_scale=fg_mask_scale,
+            )
+        )
+
+    return annotated_frames

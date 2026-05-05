@@ -1,11 +1,14 @@
+# -*- coding: utf-8 -*-
+# 車牌辨識模組：只對已鎖定違規的 vehicle/scooter ROI 派工，背景執行 YOLO 車牌偵測與 PaddleOCR。
 import os
 import threading
 import numpy as np
 from timeUtils import profile_block
 
+# 全域模型與背景執行狀態：避免每幀重複載入 OCR/plate detector。
 _plate_model = None
 _ocr_model = None
-_plate_lock = threading.Lock()          # prevents overlapping background jobs
+_plate_lock = threading.Lock()          # 防止背景車牌任務重疊執行。
 _plate_thread = None
 _plate_disabled = False
 
@@ -16,6 +19,7 @@ except Exception:
 
 
 def _get_plate_device():
+    # 車牌 YOLO 使用 PLATE_DETECT_DEVICE；未指定時優先 CUDA，否則 CPU。
     env_device = os.environ.get("PLATE_DETECT_DEVICE")
     if env_device:
         return env_device
@@ -25,12 +29,14 @@ def _get_plate_device():
 
 
 def _can_use_half(device):
+    # plate detector 只有 CUDA 裝置才使用 half precision。
     if torch is None or not torch.cuda.is_available():
         return False
     return str(device).lower() != "cpu"
 
 
 def _get_plate_models(profiler=None):
+    # lazy load 車牌偵測與 OCR 模型；第一次使用或 preload 時才載入。
     global _plate_model, _ocr_model
 
     if _plate_model is None:
@@ -49,6 +55,7 @@ def _get_plate_models(profiler=None):
 
 
 def preload_license_plate_models(profiler=None):
+    # 主流程開場預載並 warmup，避免第一次違規時才卡住推理。
     global _plate_disabled
     try:
         with profile_block(profiler, "model_load.plate_models_total"):
@@ -78,12 +85,13 @@ def preload_license_plate_models(profiler=None):
 
 
 def disable_license_plate_models():
+    # CLI 可停用車牌流程，適合只驗證 litter/thrower pipeline。
     global _plate_disabled
     _plate_disabled = True
 
 
 def _plate_worker(roi_items, vehicle_history, profiler=None):
-    """Heavy lifting: runs YOLO plate detection + OCR in a background thread."""
+    """背景重工作業：執行 YOLO 車牌偵測與 OCR。"""
     try:
         if _plate_disabled:
             return
@@ -92,6 +100,7 @@ def _plate_worker(roi_items, vehicle_history, profiler=None):
             plate_model, ocr_model = _get_plate_models(profiler=profiler)
 
             plate_device = _get_plate_device()
+            # 一次對多個 vehicle ROI 做 plate detection，降低模型呼叫次數。
             with profile_block(profiler, "license_plate.yolo_plate_predict"):
                 plate_results = plate_model.predict(
                     [roi for _, roi in roi_items],
@@ -107,6 +116,7 @@ def _plate_worker(roi_items, vehicle_history, profiler=None):
                 plate_results = [plate_results]
 
             with profile_block(profiler, "license_plate.parse_and_ocr"):
+                # 對每台車最多取一張高信心車牌，OCR 成功後寫回 vehicle_history。
                 for (vehicle, vehicle_roi), plate_box_result in zip(roi_items, plate_results):
                     if not plate_box_result or plate_box_result.boxes is None:
                         continue
@@ -152,6 +162,7 @@ def _plate_worker(roi_items, vehicle_history, profiler=None):
 
 
 def wait_for_plate_jobs(profiler=None, timeout=None):
+    # 影片結尾等待背景 OCR 完成，避免輸出摘要前仍有 thread 在跑。
     thread = _plate_thread
     if thread is not None and thread.is_alive():
         with profile_block(profiler, "cleanup.wait_license_plate_jobs"):
@@ -159,7 +170,7 @@ def wait_for_plate_jobs(profiler=None, timeout=None):
 
 
 def detect_license_plates(frame, vehicles, vehicle_history, skip=10, profiler=None):
-    """Returns almost immediately. Plate detection + OCR runs in a background thread."""
+    """呼叫端幾乎立即返回；車牌偵測與 OCR 會在背景 thread 執行。"""
     global _plate_thread
     if _plate_disabled:
         return
@@ -180,11 +191,11 @@ def detect_license_plates(frame, vehicles, vehicle_history, skip=10, profiler=No
 
     detect_license_plates.counter = 0
 
-    # If a previous job is still running, skip this invocation
+    # 若上一個背景任務還在跑，本幀略過，避免 OCR 堆積拖慢主流程。
     if not _plate_lock.acquire(blocking=False):
         return
 
-    # --- lightweight prep (still on the caller's thread) ---
+    # 輕量前處理：在主 thread 裁切 vehicle ROI，再丟給背景任務。
     with profile_block(profiler, "license_plate.prepare_rois"):
         frame_h, frame_w = frame.shape[:2]
         roi_items = []
@@ -197,7 +208,7 @@ def detect_license_plates(frame, vehicles, vehicle_history, skip=10, profiler=No
             if x2 <= x1 or y2 <= y1:
                 continue
 
-            # .copy() so the caller can safely reuse / mutate the frame
+            # copy 後呼叫端可安全覆寫 frame，不影響背景 OCR。
             vehicle_roi = frame[y1:y2, x1:x2].copy()
             if vehicle_roi.size == 0:
                 continue
@@ -208,7 +219,7 @@ def detect_license_plates(frame, vehicles, vehicle_history, skip=10, profiler=No
         _plate_lock.release()
         return
 
-    # --- fire-and-forget background thread ---
+    # 背景 thread：主流程不用等待車牌偵測/OCR。
     print("creating background thread for license plate detection + OCR...")
     t = threading.Thread(
         target=_plate_worker,
@@ -220,12 +231,14 @@ def detect_license_plates(frame, vehicles, vehicle_history, skip=10, profiler=No
 
 
 def legal_license_plate(plate_number):
+    # 車牌字元正規化：常見 OCR 混淆字轉換並移除標點空白。
     new_plate_number = plate_number.replace("O", "0").replace("I", "1")
     new_plate_number = new_plate_number.replace(".", "").replace("-", "").replace(":", "").replace(" ", "")
     return new_plate_number
 
 
 def get_plate_number(vehicle_history, id):
+    # 渲染階段讀取已辨識車牌；尚未辨識則顯示 Unknown。
     if vehicle_history.get(id, {}).get('license_plate') is not None:
         return vehicle_history[id]['license_plate']['number']
     return "Unknown"

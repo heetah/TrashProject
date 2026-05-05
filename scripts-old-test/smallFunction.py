@@ -8,9 +8,15 @@ import numpy as np
 ACTOR_CLASSES = ('person', 'vehicle', 'scooter')
 VEHICLE_LIKE_CLASSES = ('vehicle', 'scooter')
 
-def check_motion(fg_mask, coords, threshold):
+def check_motion(fg_mask, coords, threshold, mask_scale=1.0):
     # 檢查指定 bbox 內前景像素比例；用於排除靜止舊垃圾或雜訊框。
     x1, y1, x2, y2 = coords
+    scale = float(mask_scale or 1.0)
+    if scale != 1.0:
+        x1 = int(math.floor(float(x1) * scale))
+        y1 = int(math.floor(float(y1) * scale))
+        x2 = int(math.ceil(float(x2) * scale))
+        y2 = int(math.ceil(float(y2) * scale))
     h, w = fg_mask.shape[:2]
     
     # 嚴格限制邊界，避免負數索引與越界。

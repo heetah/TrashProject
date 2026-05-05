@@ -163,7 +163,8 @@ def detect(frame, model_bbox, model_trash,
            core_moving_threshold=0.3,
            precomputed_persons=None,
            precomputed_vehicles=None,
-           precomputed_trash_results=None,):
+           precomputed_trash_results=None,
+           fg_mask_scale=1.0):
     # 單幀偵測入口：負責一幀內完整 actor、litter、違規者、渲染流程。
     if violator_display_cache is None:
         violator_display_cache = {}
@@ -318,6 +319,7 @@ def detect(frame, model_bbox, model_trash,
                 fg_mask,
                 (int(lx1), int(ly1), int(lx2), int(ly2)),
                 threshold=moving_threshold,
+                mask_scale=fg_mask_scale,
             )
             if not is_moving:
                 continue
@@ -333,6 +335,7 @@ def detect(frame, model_bbox, model_trash,
                     fg_mask,
                     (core_x1, core_y1, core_x2, core_y2),
                     threshold=core_moving_threshold,
+                    mask_scale=fg_mask_scale,
                 )
                 if not is_core_moving:
                     continue
@@ -611,7 +614,8 @@ def detect_batch(frames, model_bbox, model_trash,
                  profiler=None,
                  moving_threshold=0.25,
                  core_moving_threshold=0.3,
-                 batch_size=1):
+                 batch_size=1,
+                 fg_mask_scale=1.0):
     # 批次偵測入口：RTDETR 批次推理、actor 可跳幀快取，最後逐幀套用單幀後處理。
     if not frames:
         return []
@@ -646,6 +650,7 @@ def detect_batch(frames, model_bbox, model_trash,
                 profiler=profiler,
                 moving_threshold=moving_threshold,
                 core_moving_threshold=core_moving_threshold,
+                fg_mask_scale=fg_mask_scale,
             )
             for frame, fg_mask, frame_index in zip(frames, fg_masks, frame_indices)
         ]
@@ -696,6 +701,7 @@ def detect_batch(frames, model_bbox, model_trash,
                 precomputed_persons=persons,
                 precomputed_vehicles=vehicles,
                 precomputed_trash_results=[trash_result],
+                fg_mask_scale=fg_mask_scale,
             )
         )
 

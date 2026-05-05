@@ -9,9 +9,9 @@ from ultralytics import RTDETR, YOLO
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-# 預設匯出 batch 權重資料夾；main.py batch 8 會優先尋找 *_b8.engine。
-BBOX_MODEL = PROJECT_ROOT / "modules_weight/batch" / "best-yolo-seg_v3.pt"
-TRASH_MODEL = PROJECT_ROOT / "modules_weight/batch" / "best-rtdetr-seg.pt"
+# 預設匯出 batch 權重資料夾；main.py batch 2 會優先尋找 *_b2.engine。
+BBOX_MODEL = PROJECT_ROOT / "modules_weight" / "yolo26x-seg.pt"
+TRASH_MODEL = PROJECT_ROOT / "modules_weight" / "best-rtdetr-seg.pt"
 
 
 def _device_index(device):
@@ -121,7 +121,7 @@ def parse_args():
     # CLI 參數：控制 device、batch、imgsz、FP16、dynamic shape 與是否重建既有 engine。
     parser = argparse.ArgumentParser(description="Export project YOLO/RTDETR weights to TensorRT engines.")
     parser.add_argument("--device", default="0", help="CUDA device index, e.g. 0 or cuda:0")
-    parser.add_argument("--batch", type=int, default=8, choices=(1, 8), help="TensorRT optimization batch size")
+    parser.add_argument("--batch", type=int, default=2, choices=(1, 2), help="TensorRT optimization batch size")
     parser.add_argument("--workspace", type=float, default=None, help="TensorRT workspace size in GiB")
     parser.add_argument("--opset", type=int, default=19, help="ONNX opset for TensorRT export")
     parser.add_argument("--imgsz", type=int, default=None, help="Override export image size for both models")
