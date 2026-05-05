@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+# Pipeline 耗時計算工具：提供可巢狀使用的 profiler、CJK 對齊摘要與函式計時 decorator。
 import time
 import threading
 import unicodedata
@@ -9,12 +11,14 @@ from typing import Optional
 
 @dataclass
 class TimingStat:
+    # 單一階段統計：次數、總耗時、最小/最大耗時與平均耗時。
     count: int = 0
     total: float = 0.0
     minimum: Optional[float] = None
     maximum: float = 0.0
 
     def add(self, duration):
+        # 累加一次量測結果。
         duration = float(duration)
         self.count += 1
         self.total += duration
@@ -23,16 +27,19 @@ class TimingStat:
 
     @property
     def average(self):
+        # 平均秒數；沒有樣本時回傳 0。
         return self.total / self.count if self.count else 0.0
 
 
 class PipelineProfiler:
+    # 執行緒安全 profiler：主流程與車牌背景 thread 可共同寫入。
     def __init__(self, enabled=True):
         self.enabled = bool(enabled)
         self._stats = {}
         self._lock = threading.Lock()
 
     def record(self, name, duration):
+        # 依 stage name 累積耗時，enabled=False 時零成本略過。
         if not self.enabled:
             return
         with self._lock:
@@ -41,6 +48,7 @@ class PipelineProfiler:
 
     @contextmanager
     def time_block(self, name):
+        # context manager 形式的計時區塊，搭配 with 使用。
         if not self.enabled:
             yield
             return
@@ -52,6 +60,7 @@ class PipelineProfiler:
             self.record(name, time.perf_counter() - start_time)
 
     def snapshot(self):
+        # 複製目前統計快照，避免列印時持有 lock 過久。
         with self._lock:
             return {
                 name: TimingStat(
@@ -64,6 +73,7 @@ class PipelineProfiler:
             }
 
     def print_summary(self, title="Pipeline Timing Summary", wall_label="pipeline.total_wall"):
+        # 詳細版耗時表：列出所有 stage，依總耗時排序。
         stats = self.snapshot()
         if not stats:
             print("\n=== Pipeline Timing Summary ===")
@@ -94,6 +104,7 @@ class PipelineProfiler:
             )
 
     def print_compact_summary(self, frame_count=0, title="Pipeline Timing Summary / 推理與處理耗時統計"):
+        # 精簡版耗時表：依使用者關心的階段分組，並輸出瓶頸 Top 3。
         stats = self.snapshot()
         if not stats:
             print("\n=== Pipeline Timing Summary ===")
@@ -105,6 +116,7 @@ class PipelineProfiler:
             wall_total = max((stat.total for stat in stats.values()), default=0.0)
 
         sections = [
+            # 分組定義：同一列可合併多個低階 profiler key。
             (
                 "1. 模型前置載入",
                 [
@@ -136,7 +148,10 @@ class PipelineProfiler:
                         "YOLO",
                         [
                             "detect.yolo_actor_track",
+                            "detect.yolo_actor_track_batch",
+                            "detect.yolo_actor_track_fallback",
                             "detect.yolo_actor_parse",
+                            "detect.yolo_actor_parse_batch",
                             "detect.yolo_actor_cache_reuse",
                         ],
                     ),
@@ -144,6 +159,7 @@ class PipelineProfiler:
                         "RTDETR",
                         [
                             "detect.rtdetr_litter_predict",
+                            "detect.rtdetr_litter_predict_batch",
                             "detect.rtdetr_parse",
                         ],
                     ),
@@ -224,6 +240,7 @@ class PipelineProfiler:
 
         rows_by_section = []
         flat_rows = []
+        # 將低階 stage 聚合成顯示列，方便閱讀整體耗時。
         for section_title, groups in sections:
             section_rows = []
             for label, names in groups:
@@ -238,6 +255,7 @@ class PipelineProfiler:
         total_avg_ms = (wall_total / frame_count * 1000.0) if frame_count else 0.0
         slowest_rows = sorted(flat_rows, key=lambda row: row[1], reverse=True)[:3]
 
+        # CJK 對齊：中文寬字元需要 display width，不可只用 len()。
         name_width = 24
         line_width = 72
         print(f"\n{'=' * line_width}")
@@ -279,6 +297,7 @@ class PipelineProfiler:
 
 
 def _display_width(text):
+    # 計算終端顯示寬度，中文全形/寬字元算 2。
     width = 0
     for char in str(text):
         width += 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
@@ -286,12 +305,14 @@ def _display_width(text):
 
 
 def _pad_display(text, width):
+    # 以 display width 補空白，讓中英文混排表格對齊。
     text = str(text)
     return text + " " * max(width - _display_width(text), 0)
 
 
 @contextmanager
 def profile_block(profiler, name):
+    # 安全包裝：profiler=None 時仍可用同一個 with 寫法。
     if profiler is None:
         yield
     else:
@@ -299,18 +320,19 @@ def profile_block(profiler, name):
             yield
 
 def time_it(func):
+    # 簡易 decorator：用於臨時測量單一函式耗時。
     @wraps(func)
     def wrapper(*args, **kwargs):
-        # Record the start time
+        # 記錄開始時間。
         start_time = time.perf_counter()
         
-        # Execute the actual function
+        # 執行原始函式。
         result = func(*args, **kwargs)
         
-        # Record the end time
+        # 記錄結束時間。
         end_time = time.perf_counter()
         
-        # Calculate duration
+        # 計算並輸出耗時。
         duration = end_time - start_time
         
         print(f"Function '{func.__name__}' executed in {duration:.4f} seconds")

@@ -1,4 +1,5 @@
 __pycache__/
+.agents/
 .streamlit/
 .vscode/
 dataset-*/
@@ -18,3 +19,4 @@ STGCN_GUIDE.MD
 train-fusion.py
 train.py
 yolo26n.pt
+skills-lock.json

@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+# 全域垃圾追蹤器：把 RTDETR 候選 litter 串成軌跡，判斷 pending/confirmed，並反推丟擲者。
 import math
 import numpy as np
 from scipy.spatial import distance
@@ -5,8 +7,9 @@ from smallFunction import validate_trajectory
 
 class GlobalLitterTracker:
     def __init__(self, distance_threshold=250):
+        # active_litters 保存仍在追蹤中的垃圾；violators 保存已確認違規者與顯示 TTL。
         self.active_litters = {}
-        # violators: {(cls, track_id): {'ttl': int, 'center': (x, y)}}
+        # violators 結構：{(類別, track_id): {'ttl': int, 'center': (x, y)}}。
         self.violators = {}
         self.next_id = 0
         self.distance_threshold = distance_threshold
@@ -36,6 +39,7 @@ class GlobalLitterTracker:
         self.thrower_previous_bonus = 0.85
 
     def update(self, detected_litters, actors, person_vehicle_map=None):
+        # 主更新流程：接收本幀通過前處理的 litter，更新軌跡與違規者集合。
         if person_vehicle_map:
             for p_id, vehicle_key_or_id in person_vehicle_map.items():
                 self.person_to_vehicle_history[int(p_id)] = self._normalize_vehicle_like_key(vehicle_key_or_id)
@@ -47,7 +51,7 @@ class GlobalLitterTracker:
         
         new_active_litters = {}
 
-        # 聚焦 litter bbox 的中心點
+        # 第一段：把每個 detected litter 與既有 active litter 做距離/尺寸配對。
         for litter_box in detected_litters:
             lx1, ly1, lx2, ly2, _ = litter_box
             centroid = ((lx1 + lx2) / 2, (ly1 + ly2) / 2)
@@ -58,7 +62,7 @@ class GlobalLitterTracker:
             best_id = None
             min_dist = float("inf")
 
-            # 找到 active litters 的相關資料
+            # 找到目前仍在追蹤的 litter 相關資料。
             for l_id, l_data in self.active_litters.items():
                 prev_box = l_data['bbox']
                 prev_centroid = (
@@ -79,7 +83,7 @@ class GlobalLitterTracker:
                 )
                 is_shape_consistent = (w_diff_ratio <= shape_thr) and (h_diff_ratio <= shape_thr)
 
-                # confirmed 軌跡優先保持連續，避免尺寸波動導致 ID 斷裂
+                # confirmed 軌跡優先保持連續，避免尺寸波動導致 ID 斷裂。
                 allow_confirmed_dist_only = (
                     prev_state == 'confirmed' and dist < (self.distance_threshold * 0.7)
                 )
@@ -89,6 +93,7 @@ class GlobalLitterTracker:
                     best_id = l_id
 
             if best_id is not None:
+                # 第二段：延續既有 litter，更新 history、age、shape reference。
                 l_data = self.active_litters[best_id]
                 l_data['history'].append(centroid)
                 if len(l_data['history']) > self.trajectory_history_len:
@@ -131,7 +136,7 @@ class GlobalLitterTracker:
                     if age >= self.min_confirm_age:
                         is_physics_valid, _ = validate_trajectory(l_data['history'])
 
-                    # 3. 確認條件：
+                    # 3. confirmed 條件：
                     # - 軌跡符合物理特性且有向下位移
                     # - 或 有明顯位移 + 向下位移 + 具 thrower 關聯（避免舊垃圾堆誤判）
                     can_confirm_by_trajectory = (
@@ -150,6 +155,7 @@ class GlobalLitterTracker:
                         state = 'confirmed' # 確認為垃圾！
                         
                         if thrower_key is not None:
+                            # confirmed 後標記 thrower；若該人綁定車輛，也同步標記車輛。
                             current_actor_center = thrower_center # 預設為舊位置
                             
                             # 去目前的 actors 裡面找他現在開到哪了
@@ -190,7 +196,7 @@ class GlobalLitterTracker:
                 }
                 del self.active_litters[best_id]
             else:
-                # 在垃圾剛出現的「第 0 幀」先用 homography pseudo-ground 座標估計最可能丟棄者。
+                # 第三段：新 litter 建立 pending 狀態，出生幀先估計最可能丟棄者。
                 thrower_key, thrower_center = self._find_thrower_for_litter(
                     litter_box,
                     actors,
@@ -211,7 +217,7 @@ class GlobalLitterTracker:
                 }
 
                 self.next_id += 1
-        
+        # 第四段：處理本幀沒被配對到的舊 litter；短暫消失可保留，超過門檻移除。
         for l_id, l_data in self.active_litters.items():
             l_data['missed'] += 1
             if l_data['missed'] < self.max_missed_frames:
@@ -219,7 +225,7 @@ class GlobalLitterTracker:
         
         self.active_litters = new_active_litters
 
-        # 僅回傳本幀中「位置連續」的違規者，並允許短暫 miss 與同類別近距離 rebind
+        # 第五段：僅回傳本幀中位置連續的違規者；允許短暫 miss 與同類別近距離 rebind。
         active_violator_keys = set()
         actor_center_map = {}
         for actor in actors:
@@ -277,6 +283,7 @@ class GlobalLitterTracker:
         return self.active_litters, active_violator_keys
 
     def register_action_violators(self, person_action_map, actors, person_vehicle_map=None, ttl=None):
+        # STGCN 旁路：動作模型已判定 littering 時，直接註冊 person 與其對應車輛。
         if not person_action_map:
             return set()
 
@@ -321,23 +328,27 @@ class GlobalLitterTracker:
         return marked_violators
 
     def _actor_key(self, actor):
+        # 將 actor 統一成 (class, track_id) key，避免 person/vehicle id 空間互相衝突。
         return (actor['cls'], int(actor['track_id']))
 
     def _normalize_vehicle_like_key(self, actor_key_or_id):
+        # person_vehicle_map 可能傳 tuple 或舊版純 id；統一成車輛類 key。
         if isinstance(actor_key_or_id, tuple) and len(actor_key_or_id) == 2:
             cls_name = str(actor_key_or_id[0]).lower()
             if cls_name not in ('vehicle', 'scooter'):
                 cls_name = 'vehicle'
             return (cls_name, int(actor_key_or_id[1]))
 
-        # Backward-compatible path for old callers that passed only a vehicle id.
+        # 舊呼叫端只傳 vehicle id 時的相容路徑。
         return ('vehicle', int(actor_key_or_id))
 
     def _actor_center(self, actor):
+        # actor bbox 中心點，用於違規顯示連續性與 rebind。
         ax1, ay1, ax2, ay2 = actor['box']
         return ((ax1 + ax2) / 2.0, (ay1 + ay2) / 2.0)
 
     def _mark_violator(self, actor_key, center, ttl):
+        # 寫入或延長違規者 TTL；center 用來避免 ID 重用造成誤標。
         if actor_key is None:
             return
 
@@ -352,6 +363,7 @@ class GlobalLitterTracker:
         prev['missed'] = 0
 
     def _find_vehicle_for_person(self, person_id, actors):
+        # 找出與 person bbox 重疊最多的 vehicle/scooter，供 STGCN 違規同步標車。
         person_box = None
         for actor in actors:
             actor_key = self._actor_key(actor)
@@ -378,6 +390,7 @@ class GlobalLitterTracker:
 
     @staticmethod
     def _box_iou(box_a, box_b):
+        # 基礎 bbox IoU，給 person-to-vehicle 關聯使用。
         ax1, ay1, ax2, ay2 = map(float, box_a[:4])
         bx1, by1, bx2, by2 = map(float, box_b[:4])
 
@@ -399,6 +412,7 @@ class GlobalLitterTracker:
         return inter / union
 
     def _find_rebind_actor(self, violator_key, saved_center, actor_center_map, occupied_actor_keys):
+        # 追蹤器短暫換 ID 時，允許同類別、近距離 actor 繼承違規狀態。
         if saved_center is None:
             return None, None
 
@@ -422,6 +436,7 @@ class GlobalLitterTracker:
         return best_key, best_center
 
     def _find_thrower_at_birth(self, start_centroid, actors):
+        # 舊 API 相容：出生幀 thrower 也走新版 pseudo-ground 評分。
         return self._find_thrower_for_litter(start_centroid, actors)
 
     def _find_thrower_for_litter(self, litter_ref, actors, history=None, prev_thrower_key=None):
@@ -429,6 +444,7 @@ class GlobalLitterTracker:
         依車輛 bbox 底邊點估計 homography，將 litter 與 actor 投影到類 3D
         pseudo-ground 座標後，重新計算最可能的垃圾丟棄者。
         """
+        # 使用 pseudo-ground 座標計算 litter 與 actor 距離，降低透視造成的誤選。
         best_actor_key = None
         best_center = None
         best_score = float('inf')
@@ -501,6 +517,7 @@ class GlobalLitterTracker:
         return best_actor_key, best_center
 
     def _litter_ground_anchor(self, litter_ref):
+        # litter anchor 使用 bbox 底部中心，較接近地面接觸點。
         try:
             values = np.asarray(litter_ref, dtype=np.float32).reshape(-1)
         except (TypeError, ValueError):
@@ -514,11 +531,13 @@ class GlobalLitterTracker:
         return None
 
     def _actor_ground_anchor(self, actor):
+        # actor anchor 使用 bbox 底部中心，對齊 ground homography 估計。
         ax1, ay1, ax2, ay2 = map(float, actor['box'])
         # vehicle/scooter 以 bbox 最底部中心當作接地點，對齊 homography 的估計來源。
         return ((ax1 + ax2) / 2.0, ay2)
 
     def _estimate_ground_homography(self, actors, litter_anchor):
+        # 用畫面中的車輛底部點估計簡化 homography；無車輛時退回穩定的等比例投影。
         vehicle_bottoms = []
         vehicle_heights = []
 
@@ -559,6 +578,7 @@ class GlobalLitterTracker:
         ], dtype=np.float32)
 
     def _project_point(self, point, homography):
+        # 將影像點投影到 pseudo-ground，並避免深度接近 0 造成數值爆炸。
         if point is None:
             return None
 
@@ -571,6 +591,7 @@ class GlobalLitterTracker:
         return (float(projected[0]) / depth, float(projected[1]) / depth)
 
     def _projected_actor_width(self, box, homography):
+        # 投影後 actor 寬度作為距離容忍門檻，讓遠近車輛尺度更一致。
         ax1, ay1, ax2, ay2 = map(float, box[:4])
         left = self._project_point((ax1, ay2), homography)
         right = self._project_point((ax2, ay2), homography)
@@ -581,6 +602,7 @@ class GlobalLitterTracker:
 
     @staticmethod
     def _trajectory_direction_factor(actor_world, start_world, end_world):
+        # 軌跡方向若像是從 actor 往外離開，稍微降低該 actor 的 score。
         move_vec = (end_world[0] - start_world[0], end_world[1] - start_world[1])
         from_actor_vec = (start_world[0] - actor_world[0], start_world[1] - actor_world[1])
         move_len = math.hypot(move_vec[0], move_vec[1])

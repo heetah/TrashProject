@@ -1,15 +1,19 @@
+# -*- coding: utf-8 -*-
+# 共用幾何與判斷工具：前景 motion、IoU、mask overlap、holding 判斷、物理軌跡驗證。
 import math
 import cv2
 import numpy as np
 
+# actor 類別定義：holding 只處理人、車、機車，避免其他類別干擾。
 ACTOR_CLASSES = ('person', 'vehicle', 'scooter')
 VEHICLE_LIKE_CLASSES = ('vehicle', 'scooter')
 
 def check_motion(fg_mask, coords, threshold):
+    # 檢查指定 bbox 內前景像素比例；用於排除靜止舊垃圾或雜訊框。
     x1, y1, x2, y2 = coords
     h, w = fg_mask.shape[:2]
     
-    # 嚴格限制邊界，避免負數索引與 Out of Bounds
+    # 嚴格限制邊界，避免負數索引與越界。
     x1 = max(0, min(x1, w))
     y1 = max(0, min(y1, h))
     x2 = max(0, min(x2, w))
@@ -27,8 +31,8 @@ def check_motion(fg_mask, coords, threshold):
 
     return ratio >= threshold
 
-# 計算重疊區域比例
 def calculate_iou_matrix(boxes1, boxes2):
+    # 計算兩組 bbox 的 IoU 矩陣，用於 person 與 vehicle 關聯。
     b1 = np.array(boxes1)
     b2 = np.array(boxes2)
 
@@ -62,6 +66,7 @@ def calculate_iou_matrix(boxes1, boxes2):
 
 
 def calculate_mask_overlap_ratio(litter_box, actor_mask_poly):
+    # 計算 litter bbox 被 actor segmentation mask 覆蓋的比例，支援 polygon-aware holding。
     if actor_mask_poly is None:
         return None
 
@@ -94,6 +99,7 @@ def calculate_mask_overlap_ratio(litter_box, actor_mask_poly):
 
 
 def _resolve_litter_anchor(litter_ref):
+    # litter anchor 使用 bbox 中心；若傳入點座標也可直接相容。
     if litter_ref is None:
         return None
 
@@ -106,6 +112,7 @@ def _resolve_litter_anchor(litter_ref):
     return None
 
 def _signed_distance_to_polygon(point, polygon):
+    # OpenCV pointPolygonTest：正值代表點在 polygon 內，負值代表在外側。
     if point is None or polygon is None:
         return None
 
@@ -118,6 +125,7 @@ def _signed_distance_to_polygon(point, polygon):
 
 
 def _point_in_box(point, box, margin_px=0.0):
+    # bbox 內點判斷，可加 margin 容忍偵測框抖動。
     px, py = map(float, point)
     x1, y1, x2, y2 = map(float, box[:4])
     return (
@@ -127,6 +135,7 @@ def _point_in_box(point, box, margin_px=0.0):
 
 
 def _box_overlap_ratio(inner_box, outer_box):
+    # inner_box 被 outer_box 覆蓋的比例；保留給 bbox-based holding fallback。
     ix1, iy1, ix2, iy2 = map(float, inner_box[:4])
     ox1, oy1, ox2, oy2 = map(float, outer_box[:4])
 
@@ -142,12 +151,14 @@ def _box_overlap_ratio(inner_box, outer_box):
 
 
 def _expand_box(box, margin_px):
+    # 擴張 bbox，用於容忍 segmentation 或 bbox 邊緣小幅抖動。
     x1, y1, x2, y2 = map(float, box[:4])
     margin = float(margin_px)
     return (x1 - margin, y1 - margin, x2 + margin, y2 + margin)
 
 
 def _normalized_point_in_box(point, box):
+    # 將點轉成 bbox 內的 0~1 相對座標，方便判斷靠近側邊/底部。
     px, py = map(float, point)
     x1, y1, x2, y2 = map(float, box[:4])
     return (
@@ -157,6 +168,7 @@ def _normalized_point_in_box(point, box):
 
 
 def _polygon_bounds(polygon):
+    # 取得 polygon 外接框，作為 mask 內相對位置的計算基準。
     if polygon is None:
         return None
 
@@ -173,6 +185,7 @@ def _polygon_bounds(polygon):
 
 
 def _normalized_point_in_polygon_bounds(point, polygon):
+    # 將點轉成 polygon 外接框內的 0~1 相對座標。
     bounds = _polygon_bounds(polygon)
     if point is None or bounds is None:
         return None
@@ -186,6 +199,7 @@ def _normalized_point_in_polygon_bounds(point, polygon):
 
 
 def _latest_distinct_velocity(points, min_motion_px=0.75):
+    # 從歷史中心點找最近一次有效位移，避免連續幀小抖動被當成速度。
     if points is None or len(points) < 2:
         return 0.0, 0.0
 
@@ -199,6 +213,7 @@ def _latest_distinct_velocity(points, min_motion_px=0.75):
 
 
 def _same_actor(prev_actor_id, cls_name, track_id):
+    # 判斷上一個關聯 actor 是否與目前 actor 相同，兼容 tuple 與舊版純 id。
     if isinstance(prev_actor_id, tuple) and len(prev_actor_id) == 2:
         try:
             return str(prev_actor_id[0]).lower() == cls_name and int(prev_actor_id[1]) == int(track_id)
@@ -242,6 +257,7 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
                    vehicle_side_edge_ratio=0.12,
                    vehicle_lower_edge_ratio=0.75,
                    vehicle_bottom_gap_ratio=0.95):
+    # holding 主判斷：若 litter 仍在 actor mask/bbox 內或近旁，視為尚未被丟出。
     if not actors:
         return False, None
 
@@ -251,7 +267,7 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
 
     lc_x, lc_y = anchor_point
 
-    # 1. 取得垃圾的移動速度與方向 (若沒有歷史中心，預設無移動)
+    # 第一段：取得垃圾移動速度與方向；沒有歷史中心時，預設尚無位移證據。
     litter_vx, litter_vy = 0.0, 0.0
     is_litter_static = False
     
@@ -264,6 +280,7 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
     best_actor_key = None
     best_distance = float('inf')
 
+    # 第二段：逐一檢查所有 actor，依 person/vehicle 採用不同 holding 與 release 條件。
     for actor in actors:
         cls_name = str(actor.get('cls', '')).lower()
         if cls_name not in ACTOR_CLASSES:
@@ -278,6 +295,7 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
             continue
 
         if cls_name in VEHICLE_LIKE_CLASSES:
+            # 車輛類 actor 要同時考慮車輛自身速度與 litter 相對車輛的分離方向。
             veh_vx, veh_vy = 0.0, 0.0
             is_vehicle_moving = False
             
@@ -306,7 +324,7 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
             )
             is_vehicle_release_motion = is_relative_release_motion or is_absolute_release_motion
 
-            # 解綁條件 A：垃圾靜止在地上，但車子還在開 (絕對不是 Holding)
+            # 解綁條件 A：垃圾靜止在地上，但車子還在開，表示不是持有狀態。
             if is_litter_static and is_vehicle_moving:
                 continue 
 
@@ -326,6 +344,7 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
 
         mask_poly = actor.get('mask_poly')
         if mask_poly is not None:
+            # 優先使用 segmentation mask：比 bbox 更能判斷 litter 是否仍貼在車體/人體上。
             mask_signed_dist = _signed_distance_to_polygon(anchor_point, mask_poly)
             mask_overlap_ratio = calculate_mask_overlap_ratio(litter_box, mask_poly)
             is_inside_actual_region = (
@@ -338,6 +357,7 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
             )
 
             if cls_name in VEHICLE_LIKE_CLASSES:
+                # 車輛 release gate：必須有向下、水平、相對或絕對位移，才允許從 holding 解綁。
                 norm_xy = _normalized_point_in_polygon_bounds(anchor_point, mask_poly)
                 norm_x, norm_y = norm_xy if norm_xy is not None else (None, None)
                 is_near_side_edge = (
@@ -456,6 +476,7 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
             continue
 
         if cls_name in VEHICLE_LIKE_CLASSES:
+            # 沒有 mask 時退回 bbox 距離與相對速度判斷。
             is_distance_holding = (
                 allow_distance_holding and
                 dist <= adaptive_thr and
@@ -474,10 +495,10 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
     return False, best_actor_key
 
 def validate_trajectory(centroid_history):
-    
     """
     驗證軌跡是否符合物理拋落特性
     """
+    # confirmed 前的物理軌跡驗證：排除原地閃爍、亂跳雜訊與非向下移動。
     if len(centroid_history) < 2: # 至少需要 2 幀來確認軌跡
         return False, 0.0
 
@@ -491,7 +512,7 @@ def validate_trajectory(centroid_history):
     if total_displacement < 15.0: # 總位移不到 15 pixel 視為雜訊
         return False, 0.0
 
-    # 2. 軌跡平滑度 (Straightness Index)
+    # 2. 軌跡平滑度：起終點直線距離 / 實際軌跡總長度。
     # 平滑度 = 起終點直線距離 / 實際走過的軌跡總長度
     # 物理掉落物的平滑度極高 (接近 1.0)；而雜訊亂跳的軌跡平滑度會很低 (< 0.5)
     path_length = np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1))

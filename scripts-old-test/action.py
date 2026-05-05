@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+# STGCN++ 動作辨識模組：從 person bbox 對應 pose keypoints，累積序列後判斷 normal/littering。
 import os
 import sys
 import traceback
@@ -10,6 +12,7 @@ from timeUtils import profile_block
 
 
 def _int_env(name, default):
+    # 讀取整數環境變數；格式錯誤時回退預設值。
     try:
         return int(os.environ.get(name, str(default)))
     except ValueError:
@@ -17,12 +20,14 @@ def _int_env(name, default):
 
 
 def _can_use_half(device):
+    # pose YOLO 只有在 CUDA 上使用 half precision。
     if not torch.cuda.is_available():
         return False
     return str(device).lower() not in ("cpu", "mps")
 
 
 def _select_device(device=None):
+    # STGCN/pose 裝置選擇：CLI 優先，其次 ACTION_DEVICE，最後自動偵測 CUDA。
     requested = device if device is not None else os.environ.get("ACTION_DEVICE")
     if requested is None or str(requested).strip() == "":
         return 0 if torch.cuda.is_available() else "cpu"
@@ -43,6 +48,7 @@ def _select_device(device=None):
 
 
 def iou_xyxy(box_a, box_b):
+    # bbox IoU：用來把 YOLO pose 偵測到的人與主流程 person track 對齊。
     ax1, ay1, ax2, ay2 = box_a
     bx1, by1, bx2, by2 = box_b
     inter_x1 = max(ax1, bx1)
@@ -59,6 +65,7 @@ def iou_xyxy(box_a, box_b):
 
 
 class STGCNActionModule:
+    # 封裝模型載入、pose 擷取、骨架序列快取、STGCN 推理與 alert 維持。
     def __init__(
         self,
         pose_model_path,
@@ -72,6 +79,7 @@ class STGCNActionModule:
         device=None,
         profiler=None,
     ):
+        # 初始化 STGCN 狀態：每個 track_id 都有自己的骨架 history 與 alert counter。
         self.profiler = profiler
         selected_device = _select_device(device)
         self.pose_device = selected_device
@@ -96,6 +104,7 @@ class STGCNActionModule:
         self.loaded = False
         self._load_stgcn(stgcn_weight_path, stgcn_config_path, profiler=profiler)
         if self.loaded:
+            # STGCN 成功後才載入 pose model，避免 action 不可用時浪費額外模型成本。
             try:
                 with profile_block(profiler, "model_load.pose_yolo"):
                     self.pose_model = YOLO(pose_model_path)
@@ -104,6 +113,7 @@ class STGCNActionModule:
                 print(f"YOLO pose model load failed: {e}")
 
     def _load_stgcn(self, weight_path, config_path, profiler=None):
+        # 載入 MMACTION2 recognizer；若缺檔或 import 失敗，action 自動退回 normal。
         if not (weight_path and os.path.exists(weight_path)):
             print("STGCN weight not found, fallback mode")
             return
@@ -112,6 +122,7 @@ class STGCNActionModule:
             return
         try:
             try:
+                # transformers 新舊版本符號位置不同，這裡補相容 alias。
                 import transformers.modeling_utils as tf_modeling_utils
                 from transformers import pytorch_utils as tf_pt_utils
 
@@ -128,6 +139,7 @@ class STGCNActionModule:
             project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
             mmaction_repo = os.path.join(project_root, "mmaction2")
             if mmaction_repo not in sys.path:
+                # 使用專案內 mmaction2，避免吃到系統其他版本。
                 sys.path.insert(0, mmaction_repo)
             from mmaction.apis import init_recognizer, inference_skeleton
 
@@ -138,6 +150,7 @@ class STGCNActionModule:
             original_torch_load = torch.load
 
             def compat_torch_load(*args, **kwargs):
+                # MMACTION2 舊 checkpoint 需要 weights_only=False 才能完整載入。
                 kwargs.setdefault("weights_only", False)
                 return original_torch_load(*args, **kwargs)
 
@@ -156,6 +169,7 @@ class STGCNActionModule:
 
     @staticmethod
     def _extract_skeleton(pose_result, person_idx):
+        # 從 YOLO pose 結果取出單人的 17 點骨架與 confidence。
         try:
             keypoints = pose_result.keypoints
             if keypoints is None or keypoints.xy is None or len(keypoints.xy) <= person_idx:
@@ -170,6 +184,7 @@ class STGCNActionModule:
             return None
 
     def _predict_action(self, skeleton_sequence, profiler=None, profile_name="action.stgcn_predict"):
+        # 將骨架序列轉成 MMACTION2 inference_skeleton 格式並取得分類分數。
         if not self.loaded or self.model is None:
             return "normal", 0.0
         try:
@@ -196,6 +211,7 @@ class STGCNActionModule:
             return "normal", 0.0
 
     def warmup(self, profiler=None):
+        # 先跑 pose 與 STGCN 假資料，避免正式影片第一段因 backend 初始化變慢。
         active_profiler = profiler if profiler is not None else self.profiler
         if not self.loaded or self.model is None or self.pose_model is None:
             return
@@ -228,9 +244,10 @@ class STGCNActionModule:
 
     def update(self, frame, persons, profiler=None):
         """
-        persons: list of {'box': xyxy, 'track_id': int, ...}
-        return: {track_id: {'action': str, 'conf': float, 'stgcn_conf': float, 'alert': bool}}
+        persons：格式為 {'box': xyxy, 'track_id': int, ...} 的 list。
+        回傳：{track_id: {'action': str, 'conf': float, 'stgcn_conf': float, 'alert': bool}}。
         """
+        # 每幀更新入口：追蹤每個 person 的骨架 history，視 interval 決定是否跑 STGCN。
         active_profiler = profiler if profiler is not None else self.profiler
         with profile_block(active_profiler, "action.update_total"):
             action_map = {}
@@ -238,6 +255,7 @@ class STGCNActionModule:
             if not persons:
                 return action_map
             if not self.loaded or self.model is None or self.pose_model is None:
+                # action 模組不可用時仍回傳 normal 結果，讓主流程不用分支處理。
                 for person in persons:
                     track_id = person.get("track_id")
                     if track_id is None or int(track_id) < 0:
@@ -261,6 +279,7 @@ class STGCNActionModule:
                 pose_kwargs["imgsz"] = self.pose_imgsz
 
             with profile_block(active_profiler, "action.pose_predict"):
+                # 對整張 frame 跑 pose，再用 IoU 配對回主流程的 tracked person。
                 pose_results = self.pose_model.predict(frame, **pose_kwargs)
             pose_result = pose_results[0] if pose_results else None
             pose_boxes = []
@@ -270,6 +289,7 @@ class STGCNActionModule:
                         pose_boxes.append([int(c) for c in pxyxy])
 
             with profile_block(active_profiler, "action.track_match_and_state"):
+                # 逐一更新每個 tracked person 的骨架序列與最近一次動作結果。
                 for person in persons:
                     track_id = person.get("track_id")
                     if track_id is None or int(track_id) < 0:
@@ -300,6 +320,7 @@ class STGCNActionModule:
                         (self.frame_index % self.predict_interval) == 0
                     )
                     if should_predict:
+                        # 序列滿窗且到達推理間隔時才跑 STGCN，降低每幀推理成本。
                         with torch.inference_mode():
                             action, conf = self._predict_action(
                                 np.array(list(self.track_history[track_id])),
@@ -318,6 +339,7 @@ class STGCNActionModule:
                         "stgcn_conf": conf,
                     }
                     if self.alert_counter[track_id] > 0:
+                        # alert_frames 讓違規標記維持數幀，避免單幀分類閃爍。
                         self.alert_counter[track_id] -= 1
                         action_result["alert"] = True
                     else:
