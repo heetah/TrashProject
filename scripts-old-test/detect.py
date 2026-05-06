@@ -26,6 +26,7 @@ CLASS_ALIASES = {
     'truck': 'vehicle',
 }
 COCO_VEHICLE_IDS = {2, 3, 5, 7}
+_WARNED_MESSAGES = set()
 
 try:
     import torch
@@ -105,6 +106,55 @@ def _as_result_list(results):
     return [results]
 
 
+def _warn_once(key, message):
+    # batch fallback 若每批都印會淹沒進度列；同類問題只提示一次。
+    if key in _WARNED_MESSAGES:
+        return
+    _WARNED_MESSAGES.add(key)
+    print(message)
+
+
+def _result_box_count(result):
+    boxes = getattr(result, "boxes", None)
+    if boxes is None:
+        return 0
+    try:
+        return len(boxes)
+    except TypeError:
+        return 0
+
+
+def _add_stat(stats, key, amount=1):
+    if stats is not None:
+        stats[key] = stats.get(key, 0) + amount
+
+
+def _actor_iou(box_a, box_b):
+    ax1, ay1, ax2, ay2 = map(float, box_a)
+    bx1, by1, bx2, by2 = map(float, box_b)
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _split_actors(actors):
+    persons = []
+    vehicles = []
+    for actor in actors:
+        if actor['cls'] == 'person':
+            persons.append(actor)
+        elif actor['cls'] in VEHICLE_LIKE_CLASSES:
+            vehicles.append(actor)
+    return persons, vehicles
+
+
 def _extract_actor_tracks(results, model_bbox):
     # 從 YOLO track 結果抽出 person/vehicle/scooter，保留 bbox、track id 與 segmentation polygon。
     persons = []
@@ -146,6 +196,75 @@ def _extract_actor_tracks(results, model_bbox):
     return persons, vehicles
 
 
+def _extract_actor_detections(results, model_bbox):
+    # YOLO predict 沒有 tracker id；先抽出 actor detection，後面用輕量 IoU id 補上。
+    actors = []
+
+    for result in results:
+        if result.boxes is None:
+            continue
+
+        boxes = result.boxes.xyxy.cpu().numpy()
+        classes = result.boxes.cls.cpu().numpy().astype(int)
+
+        if result.masks is not None and getattr(result.masks, 'xy', None) is not None:
+            mask_xy = result.masks.xy
+        else:
+            mask_xy = [None] * len(boxes)
+
+        for det_idx, (box, cls_id) in enumerate(zip(boxes, classes)):
+            class_name = _model_class_name(model_bbox, cls_id)
+            if class_name is None:
+                continue
+
+            actors.append({
+                'box': box,
+                'cls': class_name,
+                'mask_poly': mask_xy[det_idx] if det_idx < len(mask_xy) else None,
+            })
+
+    return actors
+
+
+def _assign_fast_actor_track_ids(actors, yolo_seg_cache, iou_threshold=0.3):
+    # 極速模式用 predict 取代 BoT-SORT；用前一次 bbox IoU 給穩定 id，保留後續 holding/backtrack 基本需求。
+    tracks = yolo_seg_cache.setdefault('fast_actor_tracks', [])
+    next_id = int(yolo_seg_cache.get('fast_next_track_id', 1))
+    used_tracks = set()
+    assigned = []
+
+    for actor in actors:
+        best_idx = None
+        best_iou = 0.0
+        for idx, track in enumerate(tracks):
+            if idx in used_tracks or track.get('cls') != actor['cls']:
+                continue
+            iou = _actor_iou(actor['box'], track['box'])
+            if iou > best_iou:
+                best_iou = iou
+                best_idx = idx
+
+        actor = dict(actor)
+        if best_idx is not None and best_iou >= iou_threshold:
+            actor['track_id'] = int(tracks[best_idx]['track_id'])
+            used_tracks.add(best_idx)
+        else:
+            actor['track_id'] = next_id
+            next_id += 1
+        assigned.append(actor)
+
+    yolo_seg_cache['fast_next_track_id'] = next_id
+    yolo_seg_cache['fast_actor_tracks'] = [
+        {
+            'track_id': int(actor['track_id']),
+            'box': np.asarray(actor['box']).copy(),
+            'cls': actor['cls'],
+        }
+        for actor in assigned
+    ]
+    return _split_actors(assigned)
+
+
 def detect(frame, model_bbox, model_trash,
            color_dict, fg_mask, litter_tracker, vehicle_history,
            fps=30.0, vehicle_relative_speed_threshold_pct_per_s=20.0,
@@ -166,7 +285,10 @@ def detect(frame, model_bbox, model_trash,
            precomputed_persons=None,
            precomputed_vehicles=None,
            precomputed_trash_results=None,
-           fg_mask_scale=1.0):
+           fg_mask_scale=1.0,
+           stats=None,
+           actor_mode="track",
+           actor_track_iou=0.3):
     # 單幀偵測入口：負責一幀內完整 actor、litter、違規者、渲染流程。
     if violator_display_cache is None:
         violator_display_cache = {}
@@ -196,18 +318,35 @@ def detect(frame, model_bbox, model_trash,
         )
         if should_run_yolo_seg:
             # 每 N 幀才跑 YOLO tracking，其餘幀沿用快取以降低耗時。
-            with profile_block(profiler, "detect.yolo_actor_track"):
-                results = model_bbox.track(
-                    frame,
-                    persist = True,
-                    conf = bbox_conf,
-                    device = BBOX_DEVICE,
-                    half = BBOX_HALF,
-                    verbose = False,
-                    tracker = "botsort.yaml"
-                )
-            with profile_block(profiler, "detect.yolo_actor_parse"):
-                persons, vehicles = _extract_actor_tracks(results, model_bbox)
+            if actor_mode == "predict":
+                with profile_block(profiler, "detect.yolo_actor_predict"):
+                    results = model_bbox.predict(
+                        frame,
+                        conf=bbox_conf,
+                        device=BBOX_DEVICE,
+                        half=BBOX_HALF,
+                        verbose=False,
+                    )
+                with profile_block(profiler, "detect.yolo_actor_parse"):
+                    actor_detections = _extract_actor_detections(results, model_bbox)
+                    persons, vehicles = _assign_fast_actor_track_ids(
+                        actor_detections,
+                        yolo_seg_cache,
+                        iou_threshold=actor_track_iou,
+                    )
+            else:
+                with profile_block(profiler, "detect.yolo_actor_track"):
+                    results = model_bbox.track(
+                        frame,
+                        persist = True,
+                        conf = bbox_conf,
+                        device = BBOX_DEVICE,
+                        half = BBOX_HALF,
+                        verbose = False,
+                        tracker = "botsort.yaml"
+                    )
+                with profile_block(profiler, "detect.yolo_actor_parse"):
+                    persons, vehicles = _extract_actor_tracks(results, model_bbox)
             yolo_seg_cache['persons'] = _clone_actors(persons)
             yolo_seg_cache['vehicles'] = _clone_actors(vehicles)
             yolo_seg_cache['frame_index'] = frame_index
@@ -307,6 +446,9 @@ def detect(frame, model_bbox, model_trash,
                     
                     # 座標已經是全域座標，直接加入本幀候選 litter。
                     current_frame_litters.append([lx1, ly1, lx2, ly2, r_conf])
+
+    if stats is not None:
+        stats['raw_litter_candidates'] = stats.get('raw_litter_candidates', 0) + len(current_frame_litters)
                 
     # 第四段：motion + holding 前處理。只有真的在動、且不像仍被人車持有的 litter 才進 tracker。
     filtered_frame_litters = []
@@ -383,6 +525,9 @@ def detect(frame, model_bbox, model_trash,
 
             filtered_frame_litters.append(litter_box)
 
+    if stats is not None:
+        stats['filtered_litter_candidates'] = stats.get('filtered_litter_candidates', 0) + len(filtered_frame_litters)
+
     # 第五段：更新 GlobalLitterTracker，將 pending litter 依軌跡轉成 confirmed。
     with profile_block(profiler, "detect.litter_tracker_update"):
         tracked_litters, active_violators = litter_tracker.update(
@@ -392,6 +537,16 @@ def detect(frame, model_bbox, model_trash,
             frame_index=frame_index,
             frame=frame,
         )
+    if stats is not None:
+        confirmed_ids = [
+            litter_id for litter_id, litter_data in tracked_litters.items()
+            if litter_data.get('state') == 'confirmed'
+        ]
+        if confirmed_ids:
+            stats.setdefault('confirmed_litter_ids', set()).update(confirmed_ids)
+            stats['confirmed_litter_frame_hits'] = stats.get('confirmed_litter_frame_hits', 0) + 1
+            if stats.get('first_confirmed_litter_frame') is None:
+                stats['first_confirmed_litter_frame'] = frame_index
     if person_action_map:
         # STGCN 若判定 person 正在 littering，也可直接把人/車註冊成違規者。
         with profile_block(profiler, "detect.stgcn_violator_register"):
@@ -507,33 +662,72 @@ def detect(frame, model_bbox, model_trash,
     return annotated_frame
 
 
-def _run_batched_actor_track(model_bbox, frames, bbox_conf, profiler=None):
-    # 批次 YOLO actor tracking；若 backend 不支援批次，回退逐幀 tracking。
-    source = frames if len(frames) > 1 else frames[0]
+def _run_batched_actor_track(model_bbox, frames, bbox_conf, export_batch_size=1, profiler=None, stats=None):
+    # 批次 YOLO actor tracking；尾批/跳幀不足 batch 時 padding，輸出再裁回原長度。
+    export_batch_size = max(int(export_batch_size or 1), 1)
+    _add_stat(stats, "yolo_actor_infer_frames", len(frames))
+    padded_frame_count = 0
     try:
-        with profile_block(profiler, "detect.yolo_actor_track_batch"):
-            results = model_bbox.track(
-                source,
-                persist=True,
-                conf=bbox_conf,
-                device=BBOX_DEVICE,
-                half=BBOX_HALF,
-                verbose=False,
-                tracker="botsort.yaml",
-            )
-        result_list = _as_result_list(results)
-        if len(result_list) != len(frames):
-            raise RuntimeError(f"expected {len(frames)} YOLO results, got {len(result_list)}")
-        return result_list
+        result_list = []
+        chunk_size = export_batch_size if export_batch_size > 1 else 1
+        for start in range(0, len(frames), chunk_size):
+            chunk = list(frames[start:start + chunk_size])
+            keep_count = len(chunk)
+            if export_batch_size > len(chunk):
+                padded_frame_count += export_batch_size - len(chunk)
+                chunk.extend([chunk[-1]] * (export_batch_size - len(chunk)))
+            source = chunk if len(chunk) > 1 else chunk[0]
+            with profile_block(profiler, "detect.yolo_actor_track_batch"):
+                results = model_bbox.track(
+                    source,
+                    persist=True,
+                    conf=bbox_conf,
+                    device=BBOX_DEVICE,
+                    half=BBOX_HALF,
+                    verbose=False,
+                    tracker="botsort.yaml",
+                )
+            chunk_results = _as_result_list(results)
+            if len(chunk_results) < keep_count:
+                raise RuntimeError(f"expected at least {keep_count} YOLO results, got {len(chunk_results)}")
+            result_list.extend(chunk_results[:keep_count])
+        _add_stat(stats, "yolo_actor_padded_frames", padded_frame_count)
+        return result_list[:len(frames)]
     except Exception as exc:
+        if export_batch_size > len(frames):
+            padded_frames = list(frames) + [frames[-1]] * (export_batch_size - len(frames))
+            padded_source = padded_frames if len(padded_frames) > 1 else padded_frames[0]
+            with profile_block(profiler, "detect.yolo_actor_track_fallback"):
+                repair_results = model_bbox.track(
+                    padded_source,
+                    persist=True,
+                    conf=bbox_conf,
+                    device=BBOX_DEVICE,
+                    half=BBOX_HALF,
+                    verbose=False,
+                    tracker="botsort.yaml",
+                )
+            repair_list = _as_result_list(repair_results)
+            if len(repair_list) >= len(frames):
+                _warn_once(
+                    "yolo_batch_padding_repair",
+                    f"Warning: YOLO actor batch needed padded source repair: {exc}",
+                )
+                return repair_list[:len(frames)]
+
         if len(frames) <= 1:
             raise
-        print(f"Warning: batched YOLO actor tracking failed; falling back to per-frame tracking: {exc}")
+
+        _warn_once(
+            "yolo_batch_per_frame_repair",
+            f"Warning: batched YOLO actor tracking failed; falling back to per-frame tracking: {exc}",
+        )
         result_list = []
         for frame in frames:
+            repair_source = [frame] * export_batch_size if export_batch_size > 1 else frame
             with profile_block(profiler, "detect.yolo_actor_track_fallback"):
                 single_results = model_bbox.track(
-                    frame,
+                    repair_source,
                     persist=True,
                     conf=bbox_conf,
                     device=BBOX_DEVICE,
@@ -548,29 +742,150 @@ def _run_batched_actor_track(model_bbox, frames, bbox_conf, profiler=None):
         return result_list
 
 
-def _run_batched_trash_predict(model_trash, frames, trash_conf, export_batch_size, profiler=None):
+def _run_batched_actor_predict(model_bbox, frames, bbox_conf, export_batch_size=1, profiler=None, stats=None):
+    # 極速模式：YOLO predict 支援真正 batch，避開 BoT-SORT track 的 per-frame 成本。
+    export_batch_size = max(int(export_batch_size or 1), 1)
+    _add_stat(stats, "yolo_actor_infer_frames", len(frames))
+    padded_frame_count = 0
+    result_list = []
+    chunk_size = export_batch_size if export_batch_size > 1 else 1
+    for start in range(0, len(frames), chunk_size):
+        chunk = list(frames[start:start + chunk_size])
+        keep_count = len(chunk)
+        if export_batch_size > len(chunk):
+            padded_frame_count += export_batch_size - len(chunk)
+            chunk.extend([chunk[-1]] * (export_batch_size - len(chunk)))
+        source = chunk if len(chunk) > 1 else chunk[0]
+        with profile_block(profiler, "detect.yolo_actor_predict_batch"):
+            results = model_bbox.predict(
+                source,
+                conf=bbox_conf,
+                device=BBOX_DEVICE,
+                half=BBOX_HALF,
+                verbose=False,
+            )
+        chunk_results = _as_result_list(results)
+        if len(chunk_results) < keep_count:
+            raise RuntimeError(f"expected at least {keep_count} YOLO predict results, got {len(chunk_results)}")
+        result_list.extend(chunk_results[:keep_count])
+    _add_stat(stats, "yolo_actor_padded_frames", padded_frame_count)
+    if len(result_list) < len(frames):
+        raise RuntimeError(f"expected at least {len(frames)} YOLO predict results, got {len(result_list)}")
+    return result_list[:len(frames)]
+
+
+def _select_zero_repair_positions(box_counts, mode, context=None):
+    if mode == "off":
+        return []
+    zero_positions = [idx for idx, count in enumerate(box_counts) if count == 0]
+    if mode == "all":
+        return zero_positions
+    if mode != "adjacent":
+        mode = "adjacent"
+
+    selected = []
+    last_count = 0
+    if context is not None:
+        last_count = int(context.get("last_trash_box_count", 0) or 0)
+    for idx in zero_positions:
+        prev_count = box_counts[idx - 1] if idx > 0 else last_count
+        next_count = box_counts[idx + 1] if idx + 1 < len(box_counts) else 0
+        if prev_count > 0 or next_count > 0:
+            selected.append(idx)
+    return selected
+
+
+def _run_batched_trash_predict(model_trash, frames, trash_conf, export_batch_size,
+                               profiler=None, zero_repair="adjacent",
+                               zero_repair_context=None, stats=None):
     # 批次 RTDETR litter predict；尾端不足 batch 時用最後一幀 padding，輸出再裁回原長度。
     infer_frames = list(frames)
     if export_batch_size > len(infer_frames):
         infer_frames.extend([infer_frames[-1]] * (export_batch_size - len(infer_frames)))
 
     source = infer_frames if len(infer_frames) > 1 else infer_frames[0]
-    with profile_block(profiler, "detect.rtdetr_litter_predict_batch"):
-        results = model_trash.predict(
-            source,
-            conf=trash_conf,
-            device=TRASH_DEVICE,
-            half=TRASH_HALF,
-            verbose=False,
+    try:
+        with profile_block(profiler, "detect.rtdetr_litter_predict_batch"):
+            results = model_trash.predict(
+                source,
+                conf=trash_conf,
+                device=TRASH_DEVICE,
+                half=TRASH_HALF,
+                verbose=False,
+            )
+    except Exception as exc:
+        if len(frames) <= 1:
+            raise
+        _warn_once(
+            "rtdetr_batch_exception",
+            f"Warning: batched RTDETR failed; repairing frame-by-frame with padded batch source: {exc}",
         )
+        result_list = []
+        for frame in frames:
+            repair_source = [frame] * export_batch_size if export_batch_size > 1 else frame
+            with profile_block(profiler, "detect.rtdetr_litter_predict_batch_repair"):
+                repair_results = model_trash.predict(
+                    repair_source,
+                    conf=trash_conf,
+                    device=TRASH_DEVICE,
+                    half=TRASH_HALF,
+                    verbose=False,
+                )
+            repair_list = _as_result_list(repair_results)
+            if not repair_list:
+                raise RuntimeError("RTDETR repair returned no results") from exc
+            result_list.append(repair_list[0])
+        return result_list
+
     result_list = _as_result_list(results)
     if len(result_list) < len(frames):
         raise RuntimeError(f"expected at least {len(frames)} RTDETR results, got {len(result_list)}")
-    return result_list[:len(frames)]
+
+    result_list = result_list[:len(frames)]
+    box_counts = [_result_box_count(result) for result in result_list]
+    zero_positions = [idx for idx, count in enumerate(box_counts) if count == 0]
+    _add_stat(stats, "rtdetr_batch_zero_frames", len(zero_positions))
+
+    # TensorRT batch RTDETR 曾出現 mixed batch 中某些 frame 掉成 0 box。
+    # 預設只補前後有 detection 的可疑 0 frame，避免長影片空 frame 被整批雙跑。
+    if zero_positions and any(count > 0 for count in box_counts):
+        repair_positions = _select_zero_repair_positions(
+            box_counts,
+            zero_repair,
+            context=zero_repair_context,
+        )
+        _warn_once(
+            "rtdetr_batch_zero_repair",
+            f"Warning: RTDETR batch returned mixed zero-box frames; zero repair mode={zero_repair}, "
+            f"repairing {len(repair_positions)}/{len(zero_positions)} zero frames.",
+        )
+        _add_stat(stats, "rtdetr_batch_zero_repaired_frames", len(repair_positions))
+        for pos in repair_positions:
+            frame = frames[pos]
+            repair_source = [frame] * export_batch_size if export_batch_size > 1 else frame
+            with profile_block(profiler, "detect.rtdetr_litter_predict_batch_repair"):
+                repair_results = model_trash.predict(
+                    repair_source,
+                    conf=trash_conf,
+                    device=TRASH_DEVICE,
+                    half=TRASH_HALF,
+                    verbose=False,
+                )
+            repair_list = _as_result_list(repair_results)
+            if repair_list:
+                result_list[pos] = repair_list[0]
+
+    if zero_repair_context is not None and result_list:
+        zero_repair_context["last_trash_box_count"] = _result_box_count(result_list[-1])
+
+    return result_list
 
 
 def _prepare_actor_batch(frames, frame_indices, model_bbox, bbox_conf,
-                         yolo_seg_frame_skip, yolo_seg_cache, profiler=None):
+                         yolo_seg_frame_skip, yolo_seg_cache,
+                         batch_size=1, bbox_batch_size=None,
+                         actor_mode="track", actor_track_iou=0.3,
+                         profiler=None, stats=None):
     # 為 detect_batch 準備每幀 actor 結果：該跑 YOLO 的幀跑推理，其餘幀沿用快取。
     actor_pairs = [None] * len(frames)
     run_positions = []
@@ -591,14 +906,40 @@ def _prepare_actor_batch(frames, frame_indices, model_bbox, bbox_conf,
 
     run_result_map = {}
     if run_frames:
-        run_results = _run_batched_actor_track(model_bbox, run_frames, bbox_conf, profiler=profiler)
+        actor_export_batch_size = int(bbox_batch_size or batch_size)
+        if actor_mode == "predict":
+            run_results = _run_batched_actor_predict(
+                model_bbox,
+                run_frames,
+                bbox_conf,
+                export_batch_size=actor_export_batch_size,
+                profiler=profiler,
+                stats=stats,
+            )
+        else:
+            run_results = _run_batched_actor_track(
+                model_bbox,
+                run_frames,
+                bbox_conf,
+                export_batch_size=actor_export_batch_size,
+                profiler=profiler,
+                stats=stats,
+            )
         for pos, result in zip(run_positions, run_results):
             run_result_map[pos] = result
 
     for pos, frame_index in enumerate(frame_indices):
         if pos in run_result_map:
             with profile_block(profiler, "detect.yolo_actor_parse_batch"):
-                persons, vehicles = _extract_actor_tracks([run_result_map[pos]], model_bbox)
+                if actor_mode == "predict":
+                    actor_detections = _extract_actor_detections([run_result_map[pos]], model_bbox)
+                    persons, vehicles = _assign_fast_actor_track_ids(
+                        actor_detections,
+                        yolo_seg_cache,
+                        iou_threshold=actor_track_iou,
+                    )
+                else:
+                    persons, vehicles = _extract_actor_tracks([run_result_map[pos]], model_bbox)
             yolo_seg_cache['persons'] = _clone_actors(persons)
             yolo_seg_cache['vehicles'] = _clone_actors(vehicles)
             yolo_seg_cache['frame_index'] = frame_index
@@ -631,7 +972,14 @@ def detect_batch(frames, model_bbox, model_trash,
                  motion_min_component_area=4,
                  motion_min_largest_component_ratio=0.25,
                  batch_size=1,
-                 fg_mask_scale=1.0):
+                 bbox_batch_size=None,
+                 trash_batch_size=None,
+                 fg_mask_scale=1.0,
+                 stats=None,
+                 rtdetr_zero_repair="adjacent",
+                 rtdetr_batch_context=None,
+                 actor_mode="track",
+                 actor_track_iou=0.3):
     # 批次偵測入口：RTDETR 批次推理、actor 可跳幀快取，最後逐幀套用單幀後處理。
     if not frames:
         return []
@@ -643,10 +991,11 @@ def detect_batch(frames, model_bbox, model_trash,
         yolo_seg_cache = {}
 
     batch_size = max(int(batch_size or 1), 1)
+    trash_batch_size = max(int(trash_batch_size or batch_size), 1)
     frame_indices = [int(frame_start_index) + i for i in range(len(frames))]
 
-    if batch_size <= 1 or len(frames) <= 1:
-        # batch 被關閉或尾端只剩單幀時，直接走單幀流程保持行為一致。
+    if batch_size <= 1:
+        # batch 被關閉時走單幀流程；batch N 的尾批仍需走 batch path，固定 TensorRT engine 才能 padding 到 N。
         return [
             detect(
                 frame, model_bbox, model_trash, color_dict,
@@ -669,6 +1018,9 @@ def detect_batch(frames, model_bbox, model_trash,
                 motion_min_component_area=motion_min_component_area,
                 motion_min_largest_component_ratio=motion_min_largest_component_ratio,
                 fg_mask_scale=fg_mask_scale,
+                stats=stats,
+                actor_mode=actor_mode,
+                actor_track_iou=actor_track_iou,
             )
             for frame, fg_mask, frame_index in zip(frames, fg_masks, frame_indices)
         ]
@@ -681,14 +1033,22 @@ def detect_batch(frames, model_bbox, model_trash,
         bbox_conf,
         yolo_seg_frame_skip,
         yolo_seg_cache,
+        batch_size=batch_size,
+        bbox_batch_size=bbox_batch_size,
+        actor_mode=actor_mode,
+        actor_track_iou=actor_track_iou,
         profiler=profiler,
+        stats=stats,
     )
     trash_results = _run_batched_trash_predict(
         model_trash,
         frames,
         trash_conf,
-        batch_size,
+        trash_batch_size,
         profiler=profiler,
+        zero_repair=rtdetr_zero_repair,
+        zero_repair_context=rtdetr_batch_context,
+        stats=stats,
     )
 
     annotated_frames = []
@@ -722,6 +1082,9 @@ def detect_batch(frames, model_bbox, model_trash,
                 precomputed_vehicles=vehicles,
                 precomputed_trash_results=[trash_result],
                 fg_mask_scale=fg_mask_scale,
+                stats=stats,
+                actor_mode=actor_mode,
+                actor_track_iou=actor_track_iou,
             )
         )
 

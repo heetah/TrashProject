@@ -4,14 +4,19 @@ import argparse
 import os
 from pathlib import Path
 
+import cv2
 import torch
 from ultralytics import RTDETR, YOLO
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-# 預設匯出 batch 權重資料夾；main.py batch 2 會優先尋找 *_b2.engine。
-BBOX_MODEL = PROJECT_ROOT / "modules_weight" / "yolo26x-seg.pt"
-TRASH_MODEL = PROJECT_ROOT / "modules_weight" / "best-rtdetr-seg.pt"
+# 匯出預設需和 main.py 對齊：batch 1 用 root 權重，batch N 用 modules_weight/batch。
+SUPPORTED_BATCH_SIZES = (1, 2, 4, 8, 16)
+ROOT_BBOX_MODEL = PROJECT_ROOT / "modules_weight" / "best-yolo-seg_v3.pt"
+ROOT_TRASH_MODEL = PROJECT_ROOT / "modules_weight" / "best-rtdetr-seg.pt"
+BATCH_BBOX_MODEL = PROJECT_ROOT / "modules_weight" / "batch" / "best-yolo-seg_v3.pt"
+BATCH_TRASH_MODEL = PROJECT_ROOT / "modules_weight" / "batch" / "best-rtdetr-seg.pt"
+DEFAULT_SMOKE_VIDEO = PROJECT_ROOT / "resources" / "resize.mp4"
 
 
 def _device_index(device):
@@ -55,6 +60,102 @@ def _engine_path_for_batch(model_path, batch_size):
 def _temporary_backup_path(path):
     # 匯出期間暫存舊 engine，避免 Ultralytics 固定輸出名稱覆蓋錯檔。
     return path.with_name(f"{path.name}.pre_batch_export_{os.getpid()}")
+
+
+def _resolve_default_model_paths(args):
+    # CLI 未指定模型時，依 batch 選擇 main.py 實際會載入的權重。
+    if args.bbox_model is None:
+        args.bbox_model = BATCH_BBOX_MODEL if int(args.batch) > 1 else ROOT_BBOX_MODEL
+    if args.trash_model is None:
+        args.trash_model = BATCH_TRASH_MODEL if int(args.batch) > 1 else ROOT_TRASH_MODEL
+
+
+def _parse_frame_indices(value):
+    # 支援 "70,75" 或重複空白；用於 export 後 engine smoke。
+    indices = []
+    for item in str(value or "").replace(",", " ").split():
+        indices.append(int(item))
+    return indices or [70, 75]
+
+
+def _read_smoke_frames(video_path, frame_indices):
+    video_path = Path(video_path).expanduser()
+    if not video_path.exists():
+        print(f"Warning: smoke video not found: {video_path}; skip engine smoke test.")
+        return []
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        print(f"Warning: unable to open smoke video: {video_path}; skip engine smoke test.")
+        return []
+
+    frames = []
+    for frame_index in frame_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+        ok, frame = cap.read()
+        if ok:
+            frames.append(frame)
+    cap.release()
+    if not frames:
+        print(f"Warning: no smoke frames could be read from {video_path}; skip engine smoke test.")
+    return frames
+
+
+def _box_counts(results, keep_count):
+    counts = []
+    for result in list(results)[:keep_count]:
+        boxes = getattr(result, "boxes", None)
+        counts.append(0 if boxes is None else len(boxes))
+    return counts
+
+
+def _smoke_test_engine(label, engine_path, loader, task, args, conf):
+    # 使用專案 regression frame 驗證 engine 不是「可載入但輸出全 0」的壞檔。
+    if not args.smoke_test:
+        return
+
+    engine_path = Path(engine_path)
+    if engine_path.suffix != ".engine":
+        return
+
+    frames = _read_smoke_frames(args.smoke_video, _parse_frame_indices(args.smoke_frames))
+    if not frames:
+        return
+
+    model = loader(str(engine_path), task=task) if task else loader(str(engine_path))
+    batch = max(int(args.batch or 1), 1)
+    counts = []
+    if batch <= 1:
+        for frame in frames:
+            results = model.predict(
+                frame,
+                conf=conf,
+                device=args.device,
+                half=args.half,
+                verbose=False,
+            )
+            counts.extend(_box_counts(results, 1))
+    else:
+        for start in range(0, len(frames), batch):
+            chunk = list(frames[start:start + batch])
+            keep_count = len(chunk)
+            if len(chunk) < batch:
+                chunk.extend([chunk[-1]] * (batch - len(chunk)))
+            results = model.predict(
+                chunk,
+                conf=conf,
+                device=args.device,
+                half=args.half,
+                verbose=False,
+            )
+            counts.extend(_box_counts(results, keep_count))
+
+    print(f"{label}: smoke counts on {Path(args.smoke_video).name} frames {args.smoke_frames}: {counts}")
+    if not any(count > 0 for count in counts):
+        raise RuntimeError(
+            f"{label}: exported engine produced zero boxes on smoke frames; "
+            "do not use this engine for inference."
+        )
 
 
 def _export_model(label, model_path, loader, task, args):
@@ -121,22 +222,35 @@ def parse_args():
     # CLI 參數：控制 device、batch、imgsz、FP16、dynamic shape 與是否重建既有 engine。
     parser = argparse.ArgumentParser(description="Export project YOLO/RTDETR weights to TensorRT engines.")
     parser.add_argument("--device", default="0", help="CUDA device index, e.g. 0 or cuda:0")
-    parser.add_argument("--batch", type=int, default=2, choices=(1, 2), help="TensorRT optimization batch size")
+    parser.add_argument("--batch", type=int, default=8, choices=SUPPORTED_BATCH_SIZES,
+                        help="TensorRT optimization batch size")
     parser.add_argument("--workspace", type=float, default=None, help="TensorRT workspace size in GiB")
     parser.add_argument("--opset", type=int, default=19, help="ONNX opset for TensorRT export")
     parser.add_argument("--imgsz", type=int, default=None, help="Override export image size for both models")
     parser.add_argument("--bbox-imgsz", type=int, default=None, help="Override export image size for bbox model")
     parser.add_argument("--trash-imgsz", type=int, default=None, help="Override export image size for trash model")
-    parser.add_argument("--bbox-model", type=Path, default=BBOX_MODEL, help="YOLO-seg actor model path")
-    parser.add_argument("--trash-model", type=Path, default=TRASH_MODEL, help="RTDETR litter model path")
+    parser.add_argument("--bbox-model", type=Path, default=None, help="YOLO-seg actor model path")
+    parser.add_argument("--trash-model", type=Path, default=None, help="RTDETR litter model path")
     parser.add_argument("--skip-bbox", action="store_true", help="Do not export the bbox/actor model")
     parser.add_argument("--skip-trash", action="store_true", help="Do not export the trash/litter model")
     parser.add_argument("--fallback-imgsz", type=int, default=640, help="Fallback image size if a checkpoint has no imgsz")
-    parser.add_argument("--dynamic", dest="dynamic", action="store_true", default=None,
+    parser.add_argument("--dynamic", dest="dynamic", action="store_true", default=False,
                         help="Build dynamic-shape TensorRT engines")
     parser.add_argument("--static", dest="dynamic", action="store_false",
                         help="Build fixed-shape TensorRT engines")
     parser.add_argument("--no-half", dest="half", action="store_false", help="Build FP32 engines instead of FP16")
+    parser.add_argument("--smoke-test", dest="smoke_test", action="store_true", default=True,
+                        help="Smoke-test exported engines on project regression frames")
+    parser.add_argument("--no-smoke-test", dest="smoke_test", action="store_false",
+                        help="Skip post-export engine smoke test")
+    parser.add_argument("--smoke-video", type=Path, default=DEFAULT_SMOKE_VIDEO,
+                        help="Video used for post-export engine smoke test")
+    parser.add_argument("--smoke-frames", default="70,75",
+                        help="Comma/space separated frame indices for post-export smoke test")
+    parser.add_argument("--smoke-bbox-conf", type=float, default=0.45,
+                        help="BBOX confidence threshold for smoke test")
+    parser.add_argument("--smoke-trash-conf", type=float, default=0.4,
+                        help="RTDETR confidence threshold for smoke test")
     parser.add_argument("--force", action="store_true", help="Rebuild existing .engine files")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose TensorRT logs")
     parser.set_defaults(half=True)
@@ -146,18 +260,21 @@ def parse_args():
 def main():
     # 主流程：檢查 CUDA 後依參數匯出 bbox/trash engine。
     args = parse_args()
-    if args.dynamic is None:
-        args.dynamic = args.batch > 1
+    _resolve_default_model_paths(args)
     _check_cuda(args.device)
     outputs = []
     if not args.skip_bbox:
         bbox_args = argparse.Namespace(**vars(args))
         bbox_args.imgsz = args.bbox_imgsz or args.imgsz
-        outputs.append(_export_model("bbox", args.bbox_model, YOLO, "segment", bbox_args))
+        bbox_engine = _export_model("bbox", args.bbox_model, YOLO, "segment", bbox_args)
+        _smoke_test_engine("bbox", bbox_engine, YOLO, "segment", bbox_args, args.smoke_bbox_conf)
+        outputs.append(bbox_engine)
     if not args.skip_trash:
         trash_args = argparse.Namespace(**vars(args))
         trash_args.imgsz = args.trash_imgsz or args.imgsz
-        outputs.append(_export_model("trash", args.trash_model, RTDETR, None, trash_args))
+        trash_engine = _export_model("trash", args.trash_model, RTDETR, None, trash_args)
+        _smoke_test_engine("trash", trash_engine, RTDETR, None, trash_args, args.smoke_trash_conf)
+        outputs.append(trash_engine)
     if not outputs:
         raise RuntimeError("Nothing to export: both --skip-bbox and --skip-trash were set.")
     print("Export complete:")
