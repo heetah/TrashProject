@@ -8,8 +8,8 @@ import numpy as np
 ACTOR_CLASSES = ('person', 'vehicle', 'scooter')
 VEHICLE_LIKE_CLASSES = ('vehicle', 'scooter')
 
-def check_motion(fg_mask, coords, threshold, mask_scale=1.0):
-    # 檢查指定 bbox 內前景像素比例；用於排除靜止舊垃圾或雜訊框。
+def _motion_crop(fg_mask, coords, mask_scale=1.0):
+    # 依 mask scale 裁出 bbox 對應區域；check_motion 與 motion_evidence 共用。
     x1, y1, x2, y2 = coords
     scale = float(mask_scale or 1.0)
     if scale != 1.0:
@@ -24,18 +24,59 @@ def check_motion(fg_mask, coords, threshold, mask_scale=1.0):
     y1 = max(0, min(y1, h))
     x2 = max(0, min(x2, w))
     y2 = max(0, min(y2, h))
-    # 裁切 check_motion 區域
-    mask_crop = fg_mask[y1:y2, x1:x2]
-    
+    return fg_mask[y1:y2, x1:x2]
+
+
+def check_motion(fg_mask, coords, threshold, mask_scale=1.0):
+    # 檢查指定 bbox 內前景像素比例；用於排除靜止舊垃圾或雜訊框。
+    mask_crop = _motion_crop(fg_mask, coords, mask_scale=mask_scale)
     if mask_crop.size == 0:
         return False
-    
-    white_pixels = np.sum(mask_crop == 255)
+
+    white_pixels = np.count_nonzero(mask_crop == 255)
     total_pixels = mask_crop.size
 
     ratio = white_pixels / total_pixels
 
     return ratio >= threshold
+
+
+def motion_evidence(fg_mask, coords, threshold, mask_scale=1.0,
+                    min_component_area=1,
+                    min_largest_component_ratio=0.0,
+                    min_white_pixels=1):
+    # motion evidence = 像素比例 + 連通元件集中度；可濾掉 pepper 這類細碎感測器噪聲。
+    mask_crop = _motion_crop(fg_mask, coords, mask_scale=mask_scale)
+    if mask_crop.size == 0:
+        return False
+
+    binary_crop = (mask_crop == 255).astype(np.uint8)
+    white_pixels = int(np.count_nonzero(binary_crop))
+    total_pixels = int(binary_crop.size)
+    if white_pixels < max(int(min_white_pixels or 1), 1):
+        return False
+
+    ratio = white_pixels / max(total_pixels, 1)
+    if ratio < float(threshold):
+        return False
+
+    min_component_area = max(int(min_component_area or 1), 1)
+    min_largest_component_ratio = float(min_largest_component_ratio or 0.0)
+    if min_component_area <= 1 and min_largest_component_ratio <= 0.0:
+        return True
+
+    component_count, _, stats, _ = cv2.connectedComponentsWithStats(binary_crop, connectivity=8)
+    if component_count <= 1:
+        return False
+
+    component_areas = stats[1:, cv2.CC_STAT_AREA]
+    valid_areas = component_areas[component_areas >= min_component_area]
+    if valid_areas.size == 0:
+        return False
+
+    largest_area = float(np.max(valid_areas))
+    largest_ratio = largest_area / max(float(white_pixels), 1.0)
+    return largest_ratio >= min_largest_component_ratio
 
 def calculate_iou_matrix(boxes1, boxes2):
     # 計算兩組 bbox 的 IoU 矩陣，用於 person 與 vehicle 關聯。
@@ -258,6 +299,12 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
                    vehicle_release_side_min_y_ratio=0.55,
                    vehicle_release_side_min_mask_gap_px=16.0,
                    vehicle_release_side_max_mask_overlap=0.01,
+                   vehicle_release_strong_side_min_y_ratio=0.30,
+                   vehicle_release_strong_side_min_mask_gap_px=48.0,
+                   vehicle_release_strong_side_downward_threshold=18.0,
+                   vehicle_release_strong_side_horizontal_threshold=24.0,
+                   vehicle_release_strong_side_motion_threshold=42.0,
+                   vehicle_release_strong_side_max_anchor_missed=6,
                    vehicle_release_max_anchor_missed=3,
                    vehicle_bbox_gap_threshold=48.0,
                    vehicle_side_edge_ratio=0.12,
@@ -388,6 +435,20 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
                         mask_overlap_ratio <= float(vehicle_release_side_max_mask_overlap)
                     )
                 )
+                has_strong_release_side_gap = (
+                    not is_inside_actual_region and
+                    is_near_side_edge and
+                    norm_y is not None and
+                    norm_y >= float(vehicle_release_strong_side_min_y_ratio) and
+                    (
+                        mask_signed_dist is None or
+                        mask_signed_dist <= -float(vehicle_release_strong_side_min_mask_gap_px)
+                    ) and
+                    (
+                        mask_overlap_ratio is None or
+                        mask_overlap_ratio <= float(vehicle_release_side_max_mask_overlap)
+                    )
+                )
                 has_release_lower_gap = (
                     not is_inside_actual_region and
                     norm_y is not None and
@@ -405,11 +466,31 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
                     prev_litter_missed is None or
                     int(prev_litter_missed) <= int(vehicle_release_max_anchor_missed)
                 )
+                has_fresh_strong_side_anchor = (
+                    prev_litter_missed is None or
+                    int(prev_litter_missed) <= int(vehicle_release_strong_side_max_anchor_missed)
+                )
                 side_release_motion = (
                     has_fresh_litter_anchor and (
                         is_relative_release_motion or
                         (is_absolute_release_motion and not is_vehicle_moving)
                     )
+                )
+                is_strong_relative_side_release = (
+                    prev_litter_center is not None and
+                    relative_vy >= float(vehicle_release_strong_side_downward_threshold) and
+                    abs(relative_vx) >= float(vehicle_release_strong_side_horizontal_threshold) and
+                    relative_motion >= float(vehicle_release_strong_side_motion_threshold)
+                )
+                is_strong_absolute_side_release = (
+                    prev_litter_center is not None and
+                    litter_vy >= float(vehicle_release_strong_side_downward_threshold) and
+                    abs(litter_vx) >= float(vehicle_release_strong_side_horizontal_threshold) and
+                    abs_litter_motion >= float(vehicle_release_strong_side_motion_threshold)
+                )
+                strong_side_release_motion = (
+                    has_fresh_strong_side_anchor and
+                    (is_strong_relative_side_release or is_strong_absolute_side_release)
                 )
                 mask_aware_release_motion = (
                     (
@@ -418,6 +499,9 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
                     ) or (
                         side_release_motion and
                         has_release_side_gap
+                    ) or (
+                        strong_side_release_motion and
+                        has_strong_release_side_gap
                     )
                 )
                 if is_inside_actual_region:
@@ -505,7 +589,7 @@ def validate_trajectory(centroid_history):
     驗證軌跡是否符合物理拋落特性
     """
     # confirmed 前的物理軌跡驗證：排除原地閃爍、亂跳雜訊與非向下移動。
-    if len(centroid_history) < 2: # 至少需要 2 幀來確認軌跡
+    if len(centroid_history) < 2: # 至少需要 2 幀來確認軌跡；兩點確認需由 tracker 檢查近距 thrower
         return False, 0.0
 
     pts = np.array(centroid_history)
@@ -527,8 +611,10 @@ def validate_trajectory(centroid_history):
     # 3. Y 軸向下趨勢 (重力原則)
     # 畫面中 Y 軸越往下數值越大
     is_falling = end_pt[1] > start_pt[1]
+    y_steps = np.diff(pts[:, 1])
+    downward_ratio = np.count_nonzero(y_steps >= -2.0) / max(len(y_steps), 1)
 
     # 綜合判斷：軌跡夠平滑且往下掉
-    is_valid = straightness > 0.85 and is_falling
+    is_valid = straightness > 0.85 and is_falling and downward_ratio >= 0.6
     
     return is_valid, straightness

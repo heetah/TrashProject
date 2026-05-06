@@ -19,6 +19,90 @@ warnings.filterwarnings('ignore')
 WINDOW_SIZE = 30  # STGCN++ 需要固定長度的幀數
 ACTION_THRESHOLD = 0.3  # 動作判斷的信心度閾值
 STGCN_NUM_FRAMES = 30  # STGCN++ 模型輸入幀數
+DEFAULT_FG_MASK_SCALE = 0.5
+DEFAULT_MOTION_DIFF_THRESHOLD = 10
+DEFAULT_MOTION_DILATE_ITERATIONS = 2
+
+
+def _check_motion(fg_mask, coords, threshold, mask_scale=1.0):
+    # 與 main.py 相同的 motion 檢查：前景像素比例達到門檻才算有動作。
+    x1, y1, x2, y2 = coords
+    scale = float(mask_scale or 1.0)
+    if scale != 1.0:
+        x1 = int(np.floor(float(x1) * scale))
+        y1 = int(np.floor(float(y1) * scale))
+        x2 = int(np.ceil(float(x2) * scale))
+        y2 = int(np.ceil(float(y2) * scale))
+    h, w = fg_mask.shape[:2]
+
+    x1 = max(0, min(x1, w))
+    y1 = max(0, min(y1, h))
+    x2 = max(0, min(x2, w))
+    y2 = max(0, min(y2, h))
+
+    mask_crop = fg_mask[y1:y2, x1:x2]
+    if mask_crop.size == 0:
+        return False
+
+    white_pixels = np.sum(mask_crop == 255)
+    total_pixels = mask_crop.size
+    return (white_pixels / total_pixels) >= threshold
+
+
+class MotionMaskBuilder:
+    # 與 main.py 相同的前景 mask 建立器：預設用 temporal diff，必要時可切回 MOG2。
+    def __init__(self, mode="temporal", scale_factor=DEFAULT_FG_MASK_SCALE,
+                 diff_threshold=DEFAULT_MOTION_DIFF_THRESHOLD,
+                 dilate_iterations=DEFAULT_MOTION_DILATE_ITERATIONS,
+                 mog2_history=300, mog2_var_threshold=25, mog2_detect_shadows=True):
+        self.mode = str(mode or "temporal").lower()
+        self.scale_factor = float(scale_factor or 1.0)
+        self.diff_threshold = int(diff_threshold)
+        self.dilate_iterations = max(int(dilate_iterations or 0), 0)
+        self.prev_gray = None
+        self.temporal_kernel = np.ones((3, 3), dtype=np.uint8) if self.dilate_iterations > 0 else None
+        self.back_sub = None
+
+        if self.mode == "mog2":
+            self.back_sub = cv2.createBackgroundSubtractorMOG2(
+                history=int(mog2_history),
+                varThreshold=float(mog2_var_threshold),
+                detectShadows=bool(mog2_detect_shadows),
+            )
+        elif self.mode != "temporal":
+            raise ValueError(f"Unsupported motion mask mode: {mode}")
+
+    def build(self, frame):
+        if self.mode == "mog2":
+            return self._build_mog2(frame)
+        return self._build_temporal(frame)
+
+    def _scaled_frame(self, frame):
+        if self.scale_factor == 1.0:
+            return frame
+        return cv2.resize(frame, (0, 0), fx=self.scale_factor, fy=self.scale_factor)
+
+    def _build_mog2(self, frame):
+        mask_frame = self._scaled_frame(frame)
+        fg_mask = self.back_sub.apply(mask_frame, learningRate=0.005)
+        _, fg_mask = cv2.threshold(fg_mask, 254, 255, cv2.THRESH_BINARY)
+        return fg_mask
+
+    def _build_temporal(self, frame):
+        mask_frame = self._scaled_frame(frame)
+        gray = cv2.cvtColor(mask_frame, cv2.COLOR_BGR2GRAY)
+
+        if self.prev_gray is None or self.prev_gray.shape != gray.shape:
+            self.prev_gray = gray
+            return np.full(gray.shape, 255, dtype=np.uint8)
+
+        diff = cv2.absdiff(gray, self.prev_gray)
+        self.prev_gray = gray
+
+        _, motion_mask = cv2.threshold(diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
+        if self.temporal_kernel is not None:
+            motion_mask = cv2.dilate(motion_mask, self.temporal_kernel, iterations=self.dilate_iterations)
+        return motion_mask
 
 def iou_xyxy(box_a, box_b):
     """計算兩個 xyxy box 的 IoU。"""
@@ -372,6 +456,48 @@ def draw_model_boxes(frame, results, model, color, prefix, target_names=None):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
 
+def draw_motion_filtered_litter_boxes(frame, results, model, color, prefix, fg_mask,
+                                      fg_mask_scale=1.0,
+                                      motion_threshold=0.25,
+                                      core_motion_threshold=0.3):
+    kept_count = 0
+    if fg_mask is None:
+        return kept_count
+
+    for result in results or []:
+        if result.boxes is None or len(result.boxes) == 0:
+            continue
+        boxes = result.boxes.xyxy.cpu().numpy()
+        classes = result.boxes.cls.cpu().numpy().astype(int)
+        confs = result.boxes.conf.cpu().numpy() if result.boxes.conf is not None else [0.0] * len(classes)
+        for box, cls_id, conf in zip(boxes, classes, confs):
+            class_name = model_class_name(model, cls_id)
+            if class_name != 'litter':
+                continue
+
+            x1, y1, x2, y2 = map(int, box)
+            if not _check_motion(fg_mask, (x1, y1, x2, y2), motion_threshold, mask_scale=fg_mask_scale):
+                continue
+
+            width = max(1, x2 - x1)
+            height = max(1, y2 - y1)
+            if width >= 8 and height >= 8:
+                core_x1 = int(x1 + 0.2 * width)
+                core_y1 = int(y1 + 0.2 * height)
+                core_x2 = int(x2 - 0.2 * width)
+                core_y2 = int(y2 - 0.2 * height)
+                if not _check_motion(fg_mask, (core_x1, core_y1, core_x2, core_y2), core_motion_threshold, mask_scale=fg_mask_scale):
+                    continue
+
+            label = f"{prefix}:{class_name} {float(conf):.2f}"
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(frame, label, (x1, max(15, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            kept_count += 1
+
+    return kept_count
+
+
 def append_pose_skeleton_for_stgcn(track_history, track_id, skeleton, stgcn_model, box=None):
     if track_id not in track_history:
         track_history[track_id] = deque(maxlen=WINDOW_SIZE)
@@ -550,6 +676,16 @@ def main():
     parser.add_argument("--track-iou", type=float, default=0.25, help="seg person 與 pose person 對齊 IoU 閾值")
     parser.add_argument("--ocr-image", default=PADDLEOCR_IMAGE_PATH, help="PaddleOCR 獨立測試圖片")
     parser.add_argument("--ocr-lang", default="en", help="PaddleOCR 語言設定")
+    parser.add_argument("--fg-mask-scale", type=float, default=DEFAULT_FG_MASK_SCALE,
+                        help="motion mask scale; 0.5 keeps previous low-res mask behavior")
+    parser.add_argument("--motion-mask-mode", choices=("temporal", "mog2"), default="temporal",
+                        help="temporal uses fast frame differencing; mog2 uses the previous background subtractor")
+    parser.add_argument("--motion-diff-threshold", type=int, default=DEFAULT_MOTION_DIFF_THRESHOLD,
+                        help="pixel difference threshold for temporal motion mask")
+    parser.add_argument("--motion-dilate-iterations", type=int, default=DEFAULT_MOTION_DILATE_ITERATIONS,
+                        help="dilation iterations for temporal motion mask")
+    parser.add_argument("--mog2-no-shadows", action="store_true",
+                        help="disable MOG2 shadow detection when --motion-mask-mode mog2")
     parser.add_argument("--only", nargs="+", choices=MODULE_NAMES, help="只啟用指定模組，例如 --only yolo rtdetr")
     parser.add_argument("--max-frames", type=int, default=0, help="最多處理幾個取樣幀；0 代表全片")
     parser.add_argument("--frame-step", type=int, default=1, help="每 N 幀取樣一次")
@@ -603,6 +739,7 @@ def main():
     print(f"Pose      : {'ON' if args.enable_pose else 'OFF'} | {args.pose_model}")
     print(f"STGCN++   : {'ON' if args.enable_stgcn else 'OFF'} | {args.stgcn_weight}")
     print(f"PaddleOCR : {'ON' if args.enable_paddleocr else 'OFF'} | {args.ocr_image}")
+    print(f"Foreground: mode={args.motion_mask_mode}, scale={args.fg_mask_scale}, diff={args.motion_diff_threshold}, dilate={args.motion_dilate_iterations}")
     print(f"輸出目錄  : {os.path.abspath(output_dir)}")
     print("=" * 60)
 
@@ -731,6 +868,16 @@ def main():
         else:
             print("⏭️  已使用 --no-video-output，跳過標註影片輸出")
 
+        motion_masker = None
+        if rtdetr_model is not None:
+            motion_masker = MotionMaskBuilder(
+                mode=args.motion_mask_mode,
+                scale_factor=args.fg_mask_scale,
+                diff_threshold=args.motion_diff_threshold,
+                dilate_iterations=args.motion_dilate_iterations,
+                mog2_detect_shadows=not args.mog2_no_shadows,
+            )
+
         raw_frame_count = 0
         processed_sample_count = 0
         print("🔄 開始處理影片，請稍候...")
@@ -741,7 +888,10 @@ def main():
                     break
                 raw_frame_count += 1
                 pbar.update(1)
-                if (raw_frame_count - 1) % args.frame_step != 0:
+                is_sample_frame = (raw_frame_count - 1) % args.frame_step == 0
+                if not is_sample_frame:
+                    if motion_masker is not None:
+                        motion_masker.build(frame)
                     continue
                 if args.max_frames > 0 and processed_sample_count >= args.max_frames:
                     break
@@ -750,6 +900,7 @@ def main():
                 metrics["frames_total"] += 1
 
                 try:
+                    fg_mask = motion_masker.build(frame) if motion_masker is not None else None
                     yolo_results = []
                     if yolo_model is not None:
                         yolo_results = yolo_model.track(
@@ -775,12 +926,20 @@ def main():
                         )
                         rtdetr_summary = count_result_boxes(rtdetr_results, rtdetr_model, target_names={"litter"})
                         metrics["rtdetr_detections"] += rtdetr_summary["total"]
-                        metrics["rtdetr_litter_detections"] += rtdetr_summary["target_total"]
-                        if rtdetr_summary["total"] > 0:
+                        motion_litter_count = draw_motion_filtered_litter_boxes(
+                            frame,
+                            rtdetr_results,
+                            rtdetr_model,
+                            COLOR_DICT['litter'],
+                            "RTDETR",
+                            fg_mask,
+                            fg_mask_scale=args.fg_mask_scale,
+                        )
+                        metrics["rtdetr_litter_detections"] += motion_litter_count
+                        if motion_litter_count > 0:
                             metrics["rtdetr_frames_with_detection"] += 1
                         for name, count in rtdetr_summary["class_counts"].items():
                             rtdetr_class_counts[name] = rtdetr_class_counts.get(name, 0) + count
-                        draw_model_boxes(frame, rtdetr_results, rtdetr_model, COLOR_DICT['litter'], "RTDETR", {"litter"})
 
                     pose_result = None
                     pose_boxes = []
@@ -1012,6 +1171,10 @@ def main():
                 "window_size": WINDOW_SIZE,
                 "frame_step": args.frame_step,
                 "max_frames": args.max_frames,
+                    "fg_mask_scale": args.fg_mask_scale,
+                    "motion_mask_mode": args.motion_mask_mode,
+                    "motion_diff_threshold": args.motion_diff_threshold,
+                    "motion_dilate_iterations": args.motion_dilate_iterations,
             },
             "metrics": {
                 **metrics,

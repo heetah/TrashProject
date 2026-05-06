@@ -208,7 +208,9 @@ class PipelineProfiler:
                         "影片讀取/解碼",
                         [
                             "video.open_capture",
+                            "video.start_async_reader",
                             "frame.read",
+                            "frame.reader_dequeue",
                         ],
                     ),
                     (

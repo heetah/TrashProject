@@ -31,12 +31,16 @@ class GlobalLitterTracker:
         self.min_confirm_age = 2
         self.min_confirm_abs_displacement = 18.0
         self.min_confirm_downward_displacement = 10.0
+        self.min_confirm_horizontal_displacement = 8.0
 
         self.person_to_vehicle_history = {}
         # 反追蹤 thrower 時，用車輛/機車 bbox 底邊點估計地面 homography，
         # 把 2D 影像點轉成 pseudo-ground 座標後再計算距離。
         self.homography_min_depth = 25.0
         self.thrower_previous_bonus = 0.85
+        self.thrower_fallback_score_limit = 1.35
+        # 長距離丟出後，垃圾當前點會離 thrower 很遠；只在軌跡起點貼近 actor 時啟用較寬的反追蹤 fallback。
+        self.thrower_release_origin_score_limit = 4.0
 
     def update(self, detected_litters, actors, person_vehicle_map=None):
         # 主更新流程：接收本幀通過前處理的 litter，更新軌跡與違規者集合。
@@ -130,6 +134,8 @@ class GlobalLitterTracker:
                     )
                     downward_disp = float(centroid[1] - start_centroid[1])
                     is_downward_enough = downward_disp >= self.min_confirm_downward_displacement
+                    horizontal_disp = abs(float(centroid[0] - start_centroid[0]))
+                    is_horizontal_enough = horizontal_disp >= self.min_confirm_horizontal_displacement
                     
                     # 2. 使用軌跡物理特徵檢查（至少要有足夠歷史幀）
                     is_physics_valid = False
@@ -142,12 +148,15 @@ class GlobalLitterTracker:
                     can_confirm_by_trajectory = (
                         age >= self.min_confirm_age and
                         is_physics_valid and
-                        is_downward_enough
+                        is_downward_enough and
+                        is_horizontal_enough and
+                        (age >= 3 or thrower_key is not None)
                     )
                     can_confirm_by_motion = (
-                        age >= (self.min_confirm_age + 1) and
+                        age >= self.min_confirm_age and
                         is_moved_enough and
                         is_downward_enough and
+                        is_horizontal_enough and
                         thrower_key is not None
                     )
 
@@ -452,6 +461,9 @@ class GlobalLitterTracker:
         fallback_actor_key = None
         fallback_center = None
         fallback_score = float('inf')
+        release_actor_key = None
+        release_center = None
+        release_score = float('inf')
 
         litter_anchor = self._litter_ground_anchor(litter_ref)
         if litter_anchor is None:
@@ -505,16 +517,76 @@ class GlobalLitterTracker:
                 fallback_actor_key = actor_key
                 fallback_center = actor_center
 
+            if (
+                score <= self.thrower_release_origin_score_limit and
+                self._release_origin_near_actor(history, actor) and
+                score < release_score
+            ):
+                release_score = score
+                release_actor_key = actor_key
+                release_center = actor_center
+
             if score <= 1.0 and score < best_score:
                 best_score = score
                 best_actor_key = actor_key
                 best_center = actor_center
 
-        if best_actor_key is None and fallback_actor_key is not None:
+        if (
+            best_actor_key is None and
+            fallback_actor_key is not None and
+            fallback_score <= self.thrower_fallback_score_limit
+        ):
             best_actor_key = fallback_actor_key
             best_center = fallback_center
+        elif best_actor_key is None and release_actor_key is not None:
+            best_actor_key = release_actor_key
+            best_center = release_center
 
         return best_actor_key, best_center
+
+    def _release_origin_near_actor(self, history, actor):
+        # 反追蹤專用：軌跡起點要貼近 actor，終點要已離開 actor，避免把持有中物件或舊垃圾誤綁。
+        if not history or len(history) < 2:
+            return False
+
+        try:
+            box = actor['box']
+            cls_name = str(actor.get('cls', '')).lower()
+            ax1, ay1, ax2, ay2 = map(float, box[:4])
+        except (KeyError, TypeError, ValueError):
+            return False
+
+        if cls_name not in ('person', 'vehicle', 'scooter'):
+            return False
+
+        start_point = history[0]
+        end_point = history[-1]
+        dx = float(end_point[0]) - float(start_point[0])
+        dy = float(end_point[1]) - float(start_point[1])
+        if abs(dx) < self.min_confirm_horizontal_displacement or dy < self.min_confirm_downward_displacement:
+            return False
+
+        width = max(ax2 - ax1, 1.0)
+        height = max(ay2 - ay1, 1.0)
+        if cls_name in ('vehicle', 'scooter'):
+            start_margin = max(120.0, width * 0.9, height * 0.35)
+        else:
+            start_margin = max(70.0, width * 1.2, height * 0.35)
+
+        if self._point_to_box_distance(start_point, box) > start_margin:
+            return False
+
+        release_gap = max(12.0, min(45.0, start_margin * 0.18))
+        return self._point_to_box_distance(end_point, box) >= release_gap
+
+    @staticmethod
+    def _point_to_box_distance(point, box):
+        # 點到 bbox 的最短距離；點在框內時距離為 0。
+        px, py = map(float, point)
+        x1, y1, x2, y2 = map(float, box[:4])
+        dx = max(x1 - px, 0.0, px - x2)
+        dy = max(y1 - py, 0.0, py - y2)
+        return math.hypot(dx, dy)
 
     def _litter_ground_anchor(self, litter_ref):
         # litter anchor 使用 bbox 底部中心，較接近地面接觸點。
