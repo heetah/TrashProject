@@ -21,3 +21,4 @@ train-fusion.py
 train.py
 yolo26n.pt
 skills-lock.json
+scripts-old-long/

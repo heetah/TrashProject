@@ -29,7 +29,7 @@ COLORS = {
 }
 
 # 預設模型路徑：batch 1 使用一般權重；batch N 使用 batch 匯出/訓練資料夾中的權重。
-SUPPORTED_BATCH_SIZES = (1, 2, 4, 8, 16)
+SUPPORTED_BATCH_SIZES = (1, 2, 4, 8)
 POSE_MODEL_PATH = 'modules_weight/yolo26x-pose.pt'
 STGCN_WEIGHT_PATH = 'modules_weight/best_acc_top1_epoch_13.pth'
 STGCN_CONFIG_PATH = 'mmaction2/configs/skeleton/stgcnpp/custom_trash_stgcnpp.py'
@@ -761,7 +761,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-engine", action="store_true", help="Use .pt weights even when a sibling .engine exists")
     parser.add_argument("--batch", "--batch-size", dest="batch_size", type=int, default=8,
                         choices=SUPPORTED_BATCH_SIZES,
-                        help="default 1; use --batch 8 to enable batch-8 inference from modules_weight/batch")
+                        help="pipeline batch size; default 8 with fast detector path enabled")
     parser.add_argument("--actor-batch", type=int, default=None, choices=SUPPORTED_BATCH_SIZES,
                         help="YOLO actor TensorRT batch size; auto uses ceil(batch / yolo_seg_frame_skip)")
     parser.add_argument("--actor-mode", choices=("track", "predict"), default="track",
@@ -769,7 +769,7 @@ if __name__ == "__main__":
     parser.add_argument("--actor-track-iou", type=float, default=0.3,
                         help="IoU threshold for actor ids when --actor-mode predict")
     parser.add_argument("--extreme-speed-off", action="store_true",
-                        help="Enable fast detector path: actor predict and RTDETR zero repair off; STGCN/OCR stay enabled unless explicitly disabled")
+                        help="Disable default fast detector path and keep actor track plus RTDETR zero repair behavior")
     parser.add_argument("--rtdetr-zero-repair", choices=("adjacent", "off", "all"), default="adjacent",
                         help="RTDETR batch mixed-zero repair: adjacent balances speed/recall, off is fastest, all keeps old behavior")
     parser.add_argument("--bbox-conf", type=float, default=0.45, help="YOLO-seg actor confidence threshold")
@@ -1011,7 +1011,12 @@ if __name__ == "__main__":
                 litter_tracker = GlobalLitterTracker(distance_threshold=250)
 
             # 紀錄車輛歷史軌跡
-            vehicle_history = defaultdict(lambda: {'centroids': deque(maxlen=30), 'license_plate': None})
+            vehicle_history = defaultdict(lambda: {
+                'centroids': deque(maxlen=30),
+                'license_plate': None,
+                'plate_search_until_found': False,
+                'plate_blocked_since_litter': False,
+            })
             # 違規顯示快取：僅用於畫面標註持續時間
             violator_display_cache = {}
             detection_stats = {

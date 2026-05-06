@@ -302,6 +302,15 @@ def detect(frame, model_bbox, model_trash,
     # UI 顯示層快取：每幀倒數，讓違規框可持續顯示
     with profile_block(profiler, "detect.violator_cache_decay"):
         for actor_key in list(violator_display_cache.keys()):
+            cache_entry = violator_display_cache[actor_key]
+            if (
+                cache_entry.get('until_plate_found', False) and
+                actor_key[0] in VEHICLE_LIKE_CLASSES and
+                vehicle_history.get(actor_key[1], {}).get('license_plate') is None
+            ):
+                cache_entry['ttl'] = max(int(cache_entry.get('ttl', 0)), int(violator_display_ttl))
+                continue
+            cache_entry['until_plate_found'] = False
             violator_display_cache[actor_key]['ttl'] -= 1
             if violator_display_cache[actor_key]['ttl'] <= 0:
                 del violator_display_cache[actor_key]
@@ -536,6 +545,7 @@ def detect(frame, model_bbox, model_trash,
             person_vehicle_map=person_vehicle_map,
             frame_index=frame_index,
             frame=frame,
+            vehicle_history=vehicle_history,
         )
     if stats is not None:
         confirmed_ids = [
@@ -564,7 +574,9 @@ def detect(frame, model_bbox, model_trash,
         if hasattr(litter_tracker, "consume_backward_plate_roi_items"):
             backward_plate_roi_items = litter_tracker.consume_backward_plate_roi_items()
         if backward_plate_roi_items:
-            dispatch_license_plate_rois(backward_plate_roi_items, vehicle_history, profiler=profiler)
+            dispatched = dispatch_license_plate_rois(backward_plate_roi_items, vehicle_history, profiler=profiler)
+            if not dispatched and hasattr(litter_tracker, "restore_backward_plate_roi_items"):
+                litter_tracker.restore_backward_plate_roi_items(backward_plate_roi_items)
 
         plate_target_keys = set(active_violators)
         plate_target_keys.update(
@@ -583,9 +595,21 @@ def detect(frame, model_bbox, model_trash,
             if actor_key in active_violators:
                 x1, y1, x2, y2 = map(float, obj['box'])
                 center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+                tracker_info = (
+                    litter_tracker.get_violator_info(actor_key)
+                    if hasattr(litter_tracker, "get_violator_info")
+                    else {}
+                )
+                until_plate_found = bool(tracker_info.get('until_plate_found', False))
+                if actor_key[0] in VEHICLE_LIKE_CLASSES:
+                    until_plate_found = until_plate_found or bool(
+                        vehicle_history[obj['track_id']].get('plate_search_until_found', False) and
+                        vehicle_history[obj['track_id']].get('license_plate') is None
+                    )
                 violator_display_cache[actor_key] = {
                     'ttl': int(violator_display_ttl),
                     'center': center,
+                    'until_plate_found': until_plate_found,
                 }
 
         # 已鎖定違規者即使被速度過濾暫時排除，也要保留渲染框。

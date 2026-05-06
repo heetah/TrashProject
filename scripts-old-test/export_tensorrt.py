@@ -11,7 +11,7 @@ from ultralytics import RTDETR, YOLO
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # 匯出預設需和 main.py 對齊：batch 1 用 root 權重，batch N 用 modules_weight/batch。
-SUPPORTED_BATCH_SIZES = (1, 2, 4, 8, 16)
+SUPPORTED_BATCH_SIZES = (1, 2, 4, 8, 12, 16, 24)
 ROOT_BBOX_MODEL = PROJECT_ROOT / "modules_weight" / "best-yolo-seg_v3.pt"
 ROOT_TRASH_MODEL = PROJECT_ROOT / "modules_weight" / "best-rtdetr-seg.pt"
 BATCH_BBOX_MODEL = PROJECT_ROOT / "modules_weight" / "batch" / "best-yolo-seg_v3.pt"
