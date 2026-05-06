@@ -230,6 +230,43 @@ def detect_license_plates(frame, vehicles, vehicle_history, skip=10, profiler=No
     t.start()
 
 
+def dispatch_license_plate_rois(roi_items, vehicle_history, profiler=None):
+    """從 backward resolver 的歷史 vehicle ROI 直接派工 OCR，不依賴車輛仍在當前畫面。"""
+    global _plate_thread
+    if _plate_disabled:
+        return
+
+    prepared_items = []
+    for vehicle, vehicle_roi in roi_items or []:
+        if vehicle_roi is None or getattr(vehicle_roi, "size", 0) == 0:
+            continue
+        try:
+            track_id = int(vehicle['track_id'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if vehicle_history[track_id].get('license_plate') is not None:
+            continue
+        prepared_vehicle = dict(vehicle)
+        prepared_vehicle['track_id'] = track_id
+        prepared_items.append((prepared_vehicle, vehicle_roi.copy()))
+
+    if not prepared_items:
+        return
+
+    # 與一般 plate worker 共用鎖，避免兩條 OCR/YOLO plate 任務互搶 GPU/CPU。
+    if not _plate_lock.acquire(blocking=False):
+        return
+
+    print("creating background thread for backward license plate detection + OCR...")
+    t = threading.Thread(
+        target=_plate_worker,
+        args=(prepared_items, vehicle_history, profiler),
+        daemon=True,
+    )
+    _plate_thread = t
+    t.start()
+
+
 def legal_license_plate(plate_number):
     # 車牌字元正規化：常見 OCR 混淆字轉換並移除標點空白。
     new_plate_number = plate_number.replace("O", "0").replace("I", "1")

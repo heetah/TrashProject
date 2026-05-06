@@ -73,6 +73,8 @@ def _load_pipeline(script_dir):
         return None
 
     detect_mod.detect_license_plates = _skip_plate_detection
+    if hasattr(detect_mod, "dispatch_license_plate_rois"):
+        detect_mod.dispatch_license_plate_rois = _skip_plate_detection
     return detect_mod, tracker_mod
 
 
@@ -206,6 +208,8 @@ def _run_video(args, detect_mod, tracker_mod, model_bbox, model_trash, video_nam
         frame_index += 1
 
     cap.release()
+    if hasattr(litter_tracker, "close"):
+        litter_tracker.close()
     return {
         "video": video_name,
         "frames": processed_frames,

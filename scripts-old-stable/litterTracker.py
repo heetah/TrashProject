@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 # 全域垃圾追蹤器：把 RTDETR 候選 litter 串成軌跡，判斷 pending/confirmed，並反推丟擲者。
 import math
+import queue
+import threading
 import numpy as np
+from collections import deque
 from scipy.spatial import distance
 from smallFunction import validate_trajectory
 
@@ -31,15 +34,48 @@ class GlobalLitterTracker:
         self.min_confirm_age = 2
         self.min_confirm_abs_displacement = 18.0
         self.min_confirm_downward_displacement = 10.0
+        self.min_confirm_horizontal_displacement = 8.0
 
         self.person_to_vehicle_history = {}
         # 反追蹤 thrower 時，用車輛/機車 bbox 底邊點估計地面 homography，
         # 把 2D 影像點轉成 pseudo-ground 座標後再計算距離。
         self.homography_min_depth = 25.0
         self.thrower_previous_bonus = 0.85
+        self.thrower_fallback_score_limit = 1.35
+        # 長距離丟出後，垃圾當前點會離 thrower 很遠；只在軌跡起點貼近 actor 時啟用較寬的反追蹤 fallback。
+        self.thrower_release_origin_score_limit = 4.0
+        # backward resolver：confirmed 後回推到 litter 出生幀，用 actor ring buffer 找 thrower。
+        self.backward_actor_history_len = 120
+        self.backward_pre_birth_frames = 24
+        self.backward_post_birth_frames = 18
+        self.backward_score_limit = 2.30
+        self.backward_release_score_limit = 3.60
+        self.backward_plate_roi_per_result = 3
+        self.actor_frame_history = deque(maxlen=self.backward_actor_history_len)
+        self.backward_plate_roi_items = []
+        self._actor_history_lock = threading.Lock()
+        self._backward_plate_lock = threading.Lock()
+        self._backward_tasks = queue.Queue(maxsize=64)
+        self._backward_results = queue.Queue()
+        self._backward_stop = object()
+        self._backward_thread = threading.Thread(
+            target=self._backward_worker,
+            name="litter-backward-resolver",
+            daemon=True,
+        )
+        self._backward_thread.start()
+        self._fallback_frame_index = 0
 
-    def update(self, detected_litters, actors, person_vehicle_map=None):
+    def update(self, detected_litters, actors, person_vehicle_map=None, frame_index=None, frame=None):
         # 主更新流程：接收本幀通過前處理的 litter，更新軌跡與違規者集合。
+        if frame_index is None:
+            frame_index = self._fallback_frame_index
+            self._fallback_frame_index += 1
+        frame_index = int(frame_index)
+
+        self._record_actor_frame(actors, frame_index, frame=frame)
+        self._drain_backward_results()
+
         if person_vehicle_map:
             for p_id, vehicle_key_or_id in person_vehicle_map.items():
                 self.person_to_vehicle_history[int(p_id)] = self._normalize_vehicle_like_key(vehicle_key_or_id)
@@ -130,6 +166,8 @@ class GlobalLitterTracker:
                     )
                     downward_disp = float(centroid[1] - start_centroid[1])
                     is_downward_enough = downward_disp >= self.min_confirm_downward_displacement
+                    horizontal_disp = abs(float(centroid[0] - start_centroid[0]))
+                    is_horizontal_enough = horizontal_disp >= self.min_confirm_horizontal_displacement
                     
                     # 2. 使用軌跡物理特徵檢查（至少要有足夠歷史幀）
                     is_physics_valid = False
@@ -142,17 +180,29 @@ class GlobalLitterTracker:
                     can_confirm_by_trajectory = (
                         age >= self.min_confirm_age and
                         is_physics_valid and
-                        is_downward_enough
+                        is_downward_enough and
+                        is_horizontal_enough and
+                        (age >= 3 or thrower_key is not None)
                     )
                     can_confirm_by_motion = (
-                        age >= (self.min_confirm_age + 1) and
+                        age >= self.min_confirm_age and
                         is_moved_enough and
                         is_downward_enough and
+                        is_horizontal_enough and
                         thrower_key is not None
                     )
 
                     if can_confirm_by_trajectory or can_confirm_by_motion:
                         state = 'confirmed' # 確認為垃圾！
+                        if not l_data.get('backward_submitted', False):
+                            self._submit_backward_resolution(
+                                litter_id=best_id,
+                                litter_data=l_data,
+                                current_bbox=litter_box,
+                                current_centroid=centroid,
+                                confirm_frame=frame_index,
+                                prev_thrower_key=thrower_key,
+                            )
                         
                         if thrower_key is not None:
                             # confirmed 後標記 thrower；若該人綁定車輛，也同步標記車輛。
@@ -189,6 +239,12 @@ class GlobalLitterTracker:
                     'age': age,
                     'state': state,
                     'init_shape': l_data['init_shape'],
+                    'birth_frame': l_data.get('birth_frame', frame_index),
+                    'birth_centroid': l_data.get('birth_centroid', l_data['history'][0]),
+                    'birth_bbox': l_data.get('birth_bbox', l_data.get('bbox')),
+                    'history_frames': (l_data.get('history_frames', []) + [frame_index])[-self.trajectory_history_len:],
+                    'backward_submitted': l_data.get('backward_submitted', False) or state == 'confirmed',
+                    'backward_result': l_data.get('backward_result'),
                     'ref_shape': (
                         0.7 * float(l_data.get('ref_shape', l_data['init_shape'])[0]) + 0.3 * float(curr_w),
                         0.7 * float(l_data.get('ref_shape', l_data['init_shape'])[1]) + 0.3 * float(curr_h),
@@ -214,6 +270,12 @@ class GlobalLitterTracker:
                     'state': 'pending',
                     'init_shape': (curr_w, curr_h),
                     'ref_shape': (curr_w, curr_h),
+                    'birth_frame': frame_index,
+                    'birth_centroid': centroid,
+                    'birth_bbox': litter_box,
+                    'history_frames': [frame_index],
+                    'backward_submitted': False,
+                    'backward_result': None,
                 }
 
                 self.next_id += 1
@@ -224,6 +286,7 @@ class GlobalLitterTracker:
                 new_active_litters[l_id] = l_data
         
         self.active_litters = new_active_litters
+        self._drain_backward_results()
 
         # 第五段：僅回傳本幀中位置連續的違規者；允許短暫 miss 與同類別近距離 rebind。
         active_violator_keys = set()
@@ -281,6 +344,402 @@ class GlobalLitterTracker:
                 del self.violators[violator_key]
 
         return self.active_litters, active_violator_keys
+
+    def close(self, timeout=2.0):
+        # 結束 backward worker；daemon 可兜底，但正常釋放可避免測試殘留 thread。
+        try:
+            self._backward_tasks.put(self._backward_stop, timeout=timeout)
+        except queue.Full:
+            pass
+        if self._backward_thread.is_alive():
+            self._backward_thread.join(timeout=timeout)
+        self._drain_backward_results()
+
+    def consume_backward_plate_roi_items(self):
+        # detect.py 取走 backward worker 找到的歷史車輛 ROI，交給車牌 OCR 背景任務。
+        with self._backward_plate_lock:
+            items = list(self.backward_plate_roi_items)
+            self.backward_plate_roi_items.clear()
+        return items
+
+    def _record_actor_frame(self, actors, frame_index, frame=None):
+        # 每幀保留 actor 快照。confirmed 延遲出現時，backward worker 可回看出生幀附近。
+        actor_snapshots = []
+        frame_h = frame.shape[0] if frame is not None else 0
+        frame_w = frame.shape[1] if frame is not None else 0
+
+        for actor in actors or []:
+            try:
+                cls_name = str(actor.get('cls', '')).lower()
+                if cls_name not in ('person', 'vehicle', 'scooter'):
+                    continue
+                track_id = int(actor['track_id'])
+                box = tuple(map(float, actor['box'][:4]))
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            snapshot = {
+                'cls': cls_name,
+                'track_id': track_id,
+                'box': box,
+                'center': self._box_center(box),
+            }
+
+            if frame is not None and cls_name in ('vehicle', 'scooter'):
+                roi = self._crop_actor_roi(frame, box, frame_w, frame_h)
+                if roi is not None:
+                    snapshot['plate_roi'] = roi
+
+            actor_snapshots.append(snapshot)
+
+        with self._actor_history_lock:
+            self.actor_frame_history.append({
+                'frame_index': int(frame_index),
+                'actors': actor_snapshots,
+            })
+
+    def _submit_backward_resolution(self, litter_id, litter_data, current_bbox,
+                                    current_centroid, confirm_frame, prev_thrower_key=None):
+        # task 用 immutable snapshot，worker 不碰 main thread 追蹤狀態。
+        birth_frame = int(litter_data.get('birth_frame', confirm_frame))
+        birth_centroid = tuple(litter_data.get('birth_centroid', litter_data['history'][0]))
+        birth_bbox = litter_data.get('birth_bbox', litter_data.get('bbox', current_bbox))
+        history = [tuple(p) for p in litter_data.get('history', [])]
+        if not history or history[-1] != tuple(current_centroid):
+            history.append(tuple(current_centroid))
+
+        with self._actor_history_lock:
+            actor_frames = [
+                {
+                    'frame_index': item['frame_index'],
+                    'actors': [dict(actor) for actor in item.get('actors', [])],
+                }
+                for item in self.actor_frame_history
+                if (
+                    birth_frame - self.backward_pre_birth_frames
+                    <= int(item.get('frame_index', -1))
+                    <= int(confirm_frame) + self.backward_post_birth_frames
+                )
+            ]
+
+        if not actor_frames:
+            return False
+
+        task = {
+            'litter_id': int(litter_id),
+            'birth_frame': birth_frame,
+            'confirm_frame': int(confirm_frame),
+            'birth_centroid': birth_centroid,
+            'birth_bbox': birth_bbox,
+            'current_bbox': current_bbox,
+            'current_centroid': tuple(current_centroid),
+            'history': history,
+            'prev_thrower_key': prev_thrower_key,
+            'actor_frames': actor_frames,
+        }
+
+        try:
+            self._backward_tasks.put_nowait(task)
+            return True
+        except queue.Full:
+            return False
+
+    def _backward_worker(self):
+        # 第三條 worker thread：只做 CPU 幾何評分，不阻塞主推論 thread。
+        while True:
+            task = self._backward_tasks.get()
+            try:
+                if task is self._backward_stop:
+                    return
+                result = self._resolve_backward_task(task)
+                if result is not None:
+                    self._backward_results.put(result)
+            except Exception as exc:
+                self._backward_results.put({
+                    'litter_id': task.get('litter_id') if isinstance(task, dict) else None,
+                    'error': str(exc),
+                })
+            finally:
+                try:
+                    self._backward_tasks.task_done()
+                except ValueError:
+                    pass
+
+    def _resolve_backward_task(self, task):
+        birth_ref = task.get('birth_bbox')
+        if birth_ref is None:
+            birth_ref = task.get('birth_centroid')
+        birth_anchor = self._litter_ground_anchor(birth_ref)
+        if birth_anchor is None:
+            return None
+
+        history = task.get('history') or []
+        prev_thrower_key = task.get('prev_thrower_key')
+        birth_frame = int(task.get('birth_frame', 0))
+        actor_candidates = {}
+
+        for frame_snapshot in task.get('actor_frames', []):
+            frame_index = int(frame_snapshot.get('frame_index', birth_frame))
+            actors = []
+            for actor_snapshot in frame_snapshot.get('actors', []):
+                actor = self._snapshot_to_actor(actor_snapshot)
+                if actor is not None:
+                    actors.append(actor)
+            if not actors:
+                continue
+
+            homography = self._estimate_ground_homography(actors, birth_anchor)
+            birth_world = self._project_point(birth_anchor, homography)
+            start_world = self._project_point(history[0], homography) if history else None
+            end_world = self._project_point(history[-1], homography) if history else None
+
+            for actor_snapshot in frame_snapshot.get('actors', []):
+                actor = self._snapshot_to_actor(actor_snapshot)
+                if actor is None:
+                    continue
+
+                score, release_like = self._score_backward_actor(
+                    actor=actor,
+                    birth_anchor=birth_anchor,
+                    birth_world=birth_world,
+                    start_world=start_world,
+                    end_world=end_world,
+                    homography=homography,
+                    history=history,
+                    frame_index=frame_index,
+                    birth_frame=birth_frame,
+                    prev_thrower_key=prev_thrower_key,
+                )
+                if score is None:
+                    continue
+                if score > self.backward_score_limit and not (
+                    release_like and score <= self.backward_release_score_limit
+                ):
+                    continue
+
+                actor_key = self._actor_key(actor)
+                candidate = actor_candidates.setdefault(actor_key, {
+                    'best_score': float('inf'),
+                    'evidence_count': 0,
+                    'best_center': None,
+                    'best_frame': None,
+                    'best_frame_actors': None,
+                })
+                candidate['evidence_count'] += 1
+                if score < candidate['best_score']:
+                    candidate['best_score'] = score
+                    candidate['best_center'] = self._actor_center(actor)
+                    candidate['best_frame'] = frame_index
+                    candidate['best_frame_actors'] = frame_snapshot.get('actors', [])
+
+        if not actor_candidates:
+            return None
+
+        best_key = None
+        best_data = None
+        best_final_score = float('inf')
+        for actor_key, data in actor_candidates.items():
+            continuity_bonus = 1.0 - min(int(data.get('evidence_count', 1)), 6) * 0.035
+            class_bonus = 0.92 if actor_key[0] in ('vehicle', 'scooter') else 1.0
+            final_score = float(data['best_score']) * continuity_bonus * class_bonus
+            if final_score < best_final_score:
+                best_key = actor_key
+                best_data = data
+                best_final_score = final_score
+
+        if best_key is None or best_data is None:
+            return None
+
+        mark_items = [{'actor_key': best_key, 'center': best_data.get('best_center')}]
+        linked_vehicle_key = self._linked_vehicle_key(best_key, best_data.get('best_frame_actors') or [])
+        if linked_vehicle_key is not None and linked_vehicle_key != best_key:
+            linked_center = self._snapshot_center_for_key(linked_vehicle_key, best_data.get('best_frame_actors') or [])
+            mark_items.append({'actor_key': linked_vehicle_key, 'center': linked_center or best_data.get('best_center')})
+
+        plate_key = linked_vehicle_key if linked_vehicle_key is not None else (
+            best_key if best_key[0] in ('vehicle', 'scooter') else None
+        )
+
+        return {
+            'litter_id': int(task.get('litter_id')),
+            'actor_key': best_key,
+            'score': best_final_score,
+            'birth_frame': birth_frame,
+            'confirm_frame': int(task.get('confirm_frame', birth_frame)),
+            'mark_items': mark_items,
+            'plate_roi_items': self._plate_roi_items_for_key(
+                plate_key,
+                task.get('actor_frames', []),
+                birth_frame,
+            ) if plate_key is not None else [],
+        }
+
+    def _score_backward_actor(self, actor, birth_anchor, birth_world,
+                              start_world, end_world, homography, history,
+                              frame_index, birth_frame, prev_thrower_key=None):
+        cls_name = str(actor.get('cls', '')).lower()
+        if cls_name not in ('person', 'vehicle', 'scooter') or birth_world is None:
+            return None, False
+
+        try:
+            actor_key = self._actor_key(actor)
+            ax1, ay1, ax2, ay2 = map(float, actor['box'])
+        except (KeyError, TypeError, ValueError):
+            return None, False
+
+        actor_anchor = self._actor_ground_anchor(actor)
+        actor_world = self._project_point(actor_anchor, homography)
+        if actor_world is None:
+            return None, False
+
+        world_dist = math.hypot(
+            birth_world[0] - actor_world[0],
+            birth_world[1] - actor_world[1],
+        )
+        world_width = self._projected_actor_width((ax1, ay1, ax2, ay2), homography)
+        if cls_name in ('vehicle', 'scooter'):
+            threshold = max(160.0, world_width * 0.85)
+            origin_margin = max(130.0, (ax2 - ax1) * 1.05, (ay2 - ay1) * 0.45)
+        else:
+            threshold = max(85.0, world_width * 1.9)
+            origin_margin = max(75.0, (ax2 - ax1) * 1.25, (ay2 - ay1) * 0.45)
+
+        score = world_dist / max(threshold, 1e-6)
+        if actor_key == prev_thrower_key:
+            score *= self.thrower_previous_bonus
+
+        if start_world is not None and end_world is not None:
+            score *= self._trajectory_direction_factor(actor_world, start_world, end_world)
+
+        frame_gap = abs(int(frame_index) - int(birth_frame))
+        score *= (1.0 + min(frame_gap, 45) * 0.025)
+
+        release_like = self._release_origin_near_actor(history, actor)
+        if release_like:
+            score *= 0.82
+
+        if self._point_to_box_distance(birth_anchor, actor['box']) <= origin_margin:
+            score *= 0.88
+
+        return score, release_like
+
+    def _drain_backward_results(self):
+        # worker 結果只能在 main/update thread 套用，避免 shared dict 競爭。
+        while True:
+            try:
+                result = self._backward_results.get_nowait()
+            except queue.Empty:
+                break
+
+            if result.get('error'):
+                continue
+
+            litter_id = result.get('litter_id')
+            actor_key = result.get('actor_key')
+            if actor_key is None:
+                continue
+
+            if litter_id in self.active_litters:
+                self.active_litters[litter_id]['thrower_key'] = actor_key
+                self.active_litters[litter_id]['thrower_center'] = result.get('mark_items', [{}])[0].get('center')
+                self.active_litters[litter_id]['backward_result'] = {
+                    'actor_key': actor_key,
+                    'score': result.get('score'),
+                    'birth_frame': result.get('birth_frame'),
+                    'confirm_frame': result.get('confirm_frame'),
+                }
+
+            for mark in result.get('mark_items', []):
+                self._mark_violator(
+                    mark.get('actor_key'),
+                    mark.get('center'),
+                    ttl=self.confirmed_violator_ttl,
+                )
+
+            plate_items = result.get('plate_roi_items') or []
+            if plate_items:
+                with self._backward_plate_lock:
+                    self.backward_plate_roi_items.extend(plate_items)
+
+    @staticmethod
+    def _box_center(box):
+        x1, y1, x2, y2 = map(float, box[:4])
+        return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+    @staticmethod
+    def _crop_actor_roi(frame, box, frame_w, frame_h):
+        x1, y1, x2, y2 = map(float, box[:4])
+        pad = max(4.0, 0.04 * max(x2 - x1, y2 - y1, 1.0))
+        ix1 = max(0, min(int(math.floor(x1 - pad)), int(frame_w)))
+        iy1 = max(0, min(int(math.floor(y1 - pad)), int(frame_h)))
+        ix2 = max(0, min(int(math.ceil(x2 + pad)), int(frame_w)))
+        iy2 = max(0, min(int(math.ceil(y2 + pad)), int(frame_h)))
+        if ix2 <= ix1 or iy2 <= iy1:
+            return None
+        roi = frame[iy1:iy2, ix1:ix2].copy()
+        return roi if roi.size > 0 else None
+
+    @staticmethod
+    def _snapshot_to_actor(snapshot):
+        try:
+            return {
+                'cls': str(snapshot.get('cls', '')).lower(),
+                'track_id': int(snapshot['track_id']),
+                'box': np.asarray(snapshot['box'], dtype=np.float32),
+            }
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _linked_vehicle_key(self, actor_key, frame_actors):
+        if actor_key is None:
+            return None
+        if actor_key[0] in ('vehicle', 'scooter'):
+            return actor_key
+
+        actors = []
+        for snapshot in frame_actors:
+            actor = self._snapshot_to_actor(snapshot)
+            if actor is not None:
+                actors.append(actor)
+        return self._find_vehicle_for_person(actor_key[1], actors)
+
+    @staticmethod
+    def _snapshot_center_for_key(actor_key, frame_actors):
+        for snapshot in frame_actors:
+            try:
+                key = (str(snapshot.get('cls', '')).lower(), int(snapshot['track_id']))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if key == actor_key:
+                return snapshot.get('center')
+        return None
+
+    def _plate_roi_items_for_key(self, actor_key, actor_frames, birth_frame):
+        if actor_key is None or actor_key[0] not in ('vehicle', 'scooter'):
+            return []
+
+        items = []
+        sorted_frames = sorted(
+            actor_frames,
+            key=lambda frame: abs(int(frame.get('frame_index', birth_frame)) - int(birth_frame)),
+        )
+        for frame_snapshot in sorted_frames:
+            for snapshot in frame_snapshot.get('actors', []):
+                try:
+                    key = (str(snapshot.get('cls', '')).lower(), int(snapshot['track_id']))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if key != actor_key or snapshot.get('plate_roi') is None:
+                    continue
+                vehicle = {
+                    'cls': key[0],
+                    'track_id': key[1],
+                    'box': np.asarray(snapshot.get('box'), dtype=np.float32),
+                }
+                items.append((vehicle, snapshot['plate_roi']))
+                if len(items) >= self.backward_plate_roi_per_result:
+                    return items
+        return items
 
     def register_action_violators(self, person_action_map, actors, person_vehicle_map=None, ttl=None):
         # STGCN 旁路：動作模型已判定 littering 時，直接註冊 person 與其對應車輛。
@@ -452,6 +911,9 @@ class GlobalLitterTracker:
         fallback_actor_key = None
         fallback_center = None
         fallback_score = float('inf')
+        release_actor_key = None
+        release_center = None
+        release_score = float('inf')
 
         litter_anchor = self._litter_ground_anchor(litter_ref)
         if litter_anchor is None:
@@ -505,16 +967,76 @@ class GlobalLitterTracker:
                 fallback_actor_key = actor_key
                 fallback_center = actor_center
 
+            if (
+                score <= self.thrower_release_origin_score_limit and
+                self._release_origin_near_actor(history, actor) and
+                score < release_score
+            ):
+                release_score = score
+                release_actor_key = actor_key
+                release_center = actor_center
+
             if score <= 1.0 and score < best_score:
                 best_score = score
                 best_actor_key = actor_key
                 best_center = actor_center
 
-        if best_actor_key is None and fallback_actor_key is not None:
+        if (
+            best_actor_key is None and
+            fallback_actor_key is not None and
+            fallback_score <= self.thrower_fallback_score_limit
+        ):
             best_actor_key = fallback_actor_key
             best_center = fallback_center
+        elif best_actor_key is None and release_actor_key is not None:
+            best_actor_key = release_actor_key
+            best_center = release_center
 
         return best_actor_key, best_center
+
+    def _release_origin_near_actor(self, history, actor):
+        # 反追蹤專用：軌跡起點要貼近 actor，終點要已離開 actor，避免把持有中物件或舊垃圾誤綁。
+        if not history or len(history) < 2:
+            return False
+
+        try:
+            box = actor['box']
+            cls_name = str(actor.get('cls', '')).lower()
+            ax1, ay1, ax2, ay2 = map(float, box[:4])
+        except (KeyError, TypeError, ValueError):
+            return False
+
+        if cls_name not in ('person', 'vehicle', 'scooter'):
+            return False
+
+        start_point = history[0]
+        end_point = history[-1]
+        dx = float(end_point[0]) - float(start_point[0])
+        dy = float(end_point[1]) - float(start_point[1])
+        if abs(dx) < self.min_confirm_horizontal_displacement or dy < self.min_confirm_downward_displacement:
+            return False
+
+        width = max(ax2 - ax1, 1.0)
+        height = max(ay2 - ay1, 1.0)
+        if cls_name in ('vehicle', 'scooter'):
+            start_margin = max(120.0, width * 0.9, height * 0.35)
+        else:
+            start_margin = max(70.0, width * 1.2, height * 0.35)
+
+        if self._point_to_box_distance(start_point, box) > start_margin:
+            return False
+
+        release_gap = max(12.0, min(45.0, start_margin * 0.18))
+        return self._point_to_box_distance(end_point, box) >= release_gap
+
+    @staticmethod
+    def _point_to_box_distance(point, box):
+        # 點到 bbox 的最短距離；點在框內時距離為 0。
+        px, py = map(float, point)
+        x1, y1, x2, y2 = map(float, box[:4])
+        dx = max(x1 - px, 0.0, px - x2)
+        dy = max(y1 - py, 0.0, py - y2)
+        return math.hypot(dx, dy)
 
     def _litter_ground_anchor(self, litter_ref):
         # litter anchor 使用 bbox 底部中心，較接近地面接觸點。

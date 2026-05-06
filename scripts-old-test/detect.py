@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import math
 import os
-from licensePlate import detect_license_plates, get_plate_number
+from licensePlate import detect_license_plates, dispatch_license_plate_rois, get_plate_number
 from timeUtils import profile_block
 from smallFunction import (
     calculate_iou_matrix,
@@ -388,7 +388,9 @@ def detect(frame, model_bbox, model_trash,
         tracked_litters, active_violators = litter_tracker.update(
             filtered_frame_litters,
             tracking_objects,
-            person_vehicle_map=person_vehicle_map
+            person_vehicle_map=person_vehicle_map,
+            frame_index=frame_index,
+            frame=frame,
         )
     if person_action_map:
         # STGCN 若判定 person 正在 littering，也可直接把人/車註冊成違規者。
@@ -403,6 +405,12 @@ def detect(frame, model_bbox, model_trash,
 
     # 車牌辨識只對已鎖定違規者派工；避免每 10 幀掃描所有車輛造成不必要延遲。
     with profile_block(profiler, "detect.plate_dispatch"):
+        backward_plate_roi_items = []
+        if hasattr(litter_tracker, "consume_backward_plate_roi_items"):
+            backward_plate_roi_items = litter_tracker.consume_backward_plate_roi_items()
+        if backward_plate_roi_items:
+            dispatch_license_plate_rois(backward_plate_roi_items, vehicle_history, profiler=profiler)
+
         plate_target_keys = set(active_violators)
         plate_target_keys.update(
             key for key in violator_display_cache.keys()

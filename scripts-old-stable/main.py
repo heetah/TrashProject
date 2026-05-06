@@ -28,7 +28,7 @@ COLORS = {
     'scooter': (0, 255, 255) # 黃色
 }
 
-# 預設模型路徑：batch 1 使用一般權重；batch 8 使用 batch 匯出/訓練資料夾中的權重。
+# 預設模型路徑：batch 1 使用一般權重；batch 2 使用 batch 匯出/訓練資料夾中的權重。
 POSE_MODEL_PATH = 'modules_weight/yolo26x-pose.pt'
 STGCN_WEIGHT_PATH = 'modules_weight/best_acc_top1_epoch_13.pth'
 STGCN_CONFIG_PATH = 'mmaction2/configs/skeleton/stgcnpp/custom_trash_stgcnpp.py'
@@ -40,6 +40,15 @@ MODEL_TRASH_PATH_BATCH_2 = 'modules_weight/batch/best-rtdetr-seg.pt'
 DEFAULT_FG_MASK_SCALE = 0.5
 DEFAULT_MOTION_DIFF_THRESHOLD = 10
 DEFAULT_MOTION_DILATE_ITERATIONS = 2
+DEFAULT_MOTION_BLUR_KERNEL = 0
+DEFAULT_MOTION_OPEN_KERNEL = 3
+DEFAULT_MOTION_OPEN_ITERATIONS = 0
+DEFAULT_MOTION_CLOSE_KERNEL = 0
+DEFAULT_MOTION_CLOSE_ITERATIONS = 0
+DEFAULT_MOTION_MIN_COMPONENT_AREA = 4
+DEFAULT_MOTION_MIN_LARGEST_COMPONENT_RATIO = 0.25
+DEFAULT_READER_QUEUE_SIZE = 32
+DEFAULT_CAPTURE_BUFFER_SIZE = 8
 
 # torch 是選用依賴：若不可用，TensorRT engine 檢查會自動略過。
 try:
@@ -52,6 +61,85 @@ def _set_env_if_present(name, value):
     # CLI 有傳值才寫入環境變數，避免覆蓋使用者原本的設定。
     if value is not None:
         os.environ[name] = str(value)
+
+
+def _odd_kernel_size(value):
+    # OpenCV morphology / blur kernel 需要正奇數；小於 3 視為關閉。
+    value = int(value or 0)
+    if value < 3:
+        return 0
+    return value if value % 2 == 1 else value + 1
+
+
+def _video_accel_value(name):
+    # OpenCV VideoCapture 硬解參數；平台/編譯不支援時回傳 None 走 fallback。
+    accel_name = str(name or "any").strip().lower()
+    if accel_name in ("none", "off", "false", "0"):
+        return getattr(cv2, "VIDEO_ACCELERATION_NONE", 0)
+    if accel_name in ("any", "auto", "on", "true", "1"):
+        return getattr(cv2, "VIDEO_ACCELERATION_ANY", None)
+    if accel_name == "vaapi":
+        return getattr(cv2, "VIDEO_ACCELERATION_VAAPI", None)
+    if accel_name in ("mfx", "qsv"):
+        return getattr(cv2, "VIDEO_ACCELERATION_MFX", None)
+    if accel_name == "d3d11":
+        return getattr(cv2, "VIDEO_ACCELERATION_D3D11", None)
+    raise ValueError(f"Unsupported video hardware acceleration mode: {name}")
+
+
+def _append_capture_param(params, prop_name, value):
+    prop = getattr(cv2, prop_name, None)
+    if prop is None or value is None:
+        return
+    params.extend([int(prop), int(value)])
+
+
+def _open_video_capture(video_path, hw_accel="any", hw_device=None,
+                        buffer_size=DEFAULT_CAPTURE_BUFFER_SIZE,
+                        read_threads=0, profiler=None):
+    # OpenCV FFmpeg backend 可用硬體解碼時先試；失敗保留軟解，frame 順序與數量不變。
+    api_preference = getattr(cv2, "CAP_FFMPEG", 0)
+    params = []
+    accel_value = _video_accel_value(hw_accel)
+    if accel_value is not None:
+        _append_capture_param(params, "CAP_PROP_HW_ACCELERATION", accel_value)
+        if hw_device is not None and int(hw_device) >= 0:
+            _append_capture_param(params, "CAP_PROP_HW_DEVICE", int(hw_device))
+    if read_threads and int(read_threads) > 0:
+        _append_capture_param(params, "CAP_PROP_N_THREADS", int(read_threads))
+
+    cap = None
+    open_error = None
+    if params:
+        try:
+            with profiler.time_block("video.open_capture_hw"):
+                cap = cv2.VideoCapture(str(video_path), api_preference, params)
+        except Exception as exc:
+            open_error = exc
+            cap = None
+
+    if cap is None or not cap.isOpened():
+        if cap is not None:
+            cap.release()
+        if open_error is not None:
+            print(f"Warning: hardware VideoCapture open failed; fallback to software decode: {open_error}")
+        with profiler.time_block("video.open_capture_fallback"):
+            cap = cv2.VideoCapture(str(video_path), api_preference)
+        if not cap.isOpened():
+            cap.release()
+            with profiler.time_block("video.open_capture_fallback"):
+                cap = cv2.VideoCapture(str(video_path))
+
+    if buffer_size and int(buffer_size) > 0:
+        buffer_prop = getattr(cv2, "CAP_PROP_BUFFERSIZE", None)
+        if buffer_prop is not None:
+            cap.set(buffer_prop, int(buffer_size))
+
+    try:
+        backend_name = cap.getBackendName()
+    except Exception:
+        backend_name = "unknown"
+    return cap, backend_name
 
 
 def _can_try_tensorrt_engine(engine_path):
@@ -128,10 +216,116 @@ def _load_model_with_warmup(label, candidates, model_factory, warmup_func, profi
     raise RuntimeError(f"{label}: all model candidates failed: {candidates}") from last_error
 
 
+_FFMPEG_ENCODER_CACHE = None
+
+
+def _ffmpeg_available_encoders():
+    # 只探測一次 ffmpeg 支援的 encoder，避免每次開 writer 都重跑清單。
+    global _FFMPEG_ENCODER_CACHE
+    if _FFMPEG_ENCODER_CACHE is not None:
+        return _FFMPEG_ENCODER_CACHE
+
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-encoders'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=True,
+        )
+    except Exception:
+        _FFMPEG_ENCODER_CACHE = set()
+        return _FFMPEG_ENCODER_CACHE
+
+    encoders = set()
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and len(parts[0]) == 6 and parts[0][0] in 'VASD':
+            encoders.add(parts[1])
+
+    _FFMPEG_ENCODER_CACHE = encoders
+    return _FFMPEG_ENCODER_CACHE
+
+
+def _ffmpeg_encoder_available(encoder_name):
+    # 讓 writer 可以先選可用 encoder，再決定要不要退回 x264。
+    return str(encoder_name or '').strip() in _ffmpeg_available_encoders()
+
+
+def _resolve_video_encoder(preferred="auto", frame_width=None, frame_height=None):
+    # auto 優先用 NVENC，若 ffmpeg 沒有或使用者指定其他值，就回退到 libx264。
+    preferred_name = str(preferred or 'auto').strip().lower()
+
+    width = int(frame_width or 0)
+    height = int(frame_height or 0)
+    nvenc_supported = min(width, height) >= 128 if width > 0 and height > 0 else True
+
+    if preferred_name in ('h264_nvenc', 'hevc_nvenc', 'libx264'):
+        if preferred_name in ('h264_nvenc', 'hevc_nvenc') and not nvenc_supported:
+            print(
+                f"Warning: Frame size {width}x{height} is too small for NVENC; fallback to libx264."
+            )
+            return 'libx264'
+        if _ffmpeg_encoder_available(preferred_name):
+            return preferred_name
+        print(f"Warning: FFmpeg encoder {preferred_name} unavailable; fallback to libx264.")
+        return 'libx264'
+
+    if preferred_name not in ('', 'auto'):
+        print(f"Warning: Unsupported video encoder {preferred_name}; fallback to auto selection.")
+
+    for candidate in ('h264_nvenc', 'hevc_nvenc', 'libx264'):
+        if candidate in ('h264_nvenc', 'hevc_nvenc') and not nvenc_supported:
+            continue
+        if _ffmpeg_encoder_available(candidate):
+            return candidate
+
+    print("Warning: No preferred FFmpeg encoder found; fallback to libx264.")
+    return 'libx264'
+
+
+def _nvenc_preset_from_generic(preset_name):
+    # 將原本 x264-style preset 名稱映射成 NVENC 可接受的 p1~p7。
+    preset = str(preset_name or '').strip().lower()
+    if preset in ('p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7'):
+        return preset
+    preset_map = {
+        'ultrafast': 'p1',
+        'superfast': 'p1',
+        'veryfast': 'p1',
+        'faster': 'p2',
+        'fast': 'p2',
+        'medium': 'p4',
+        'slow': 'p5',
+        'slower': 'p6',
+        'veryslow': 'p7',
+    }
+    return preset_map.get(preset, 'p1')
+
+
+def _build_ffmpeg_video_encoder_args(encoder_name, preset="fast", crf=23):
+    # 依 encoder 類型組出參數；只改輸出編碼，不動前面偵測與渲染流程。
+    quality = max(0, min(int(crf), 51))
+    if encoder_name in ('h264_nvenc', 'hevc_nvenc'):
+        return [
+            '-vcodec', encoder_name,
+            '-preset', _nvenc_preset_from_generic(preset),
+            '-rc', 'vbr',
+            '-cq', str(quality),
+            '-b:v', '0',
+        ]
+
+    return [
+        '-vcodec', 'libx264',
+        '-preset', str(preset),
+        '-crf', str(quality),
+    ]
+
+
 class AsyncFFmpegVideoWriter:
     # 背景 FFmpeg writer：主執行緒只排隊 frame，編碼與 muxing 由背景 thread 處理。
     def __init__(self, output_path, width, height, fps, profiler=None,
-                 queue_size=16, preset="fast", crf=23):
+                 queue_size=16, preset="fast", crf=23, encoder="auto"):
         self.output_path = str(output_path)
         self.width = int(width)
         self.height = int(height)
@@ -142,6 +336,10 @@ class AsyncFFmpegVideoWriter:
         self._error = None
         self._closed = False
         self._process = None
+        self.encoder_name = _resolve_video_encoder(encoder, frame_width=self.width, frame_height=self.height)
+        encoder_args = _build_ffmpeg_video_encoder_args(self.encoder_name, preset=preset, crf=crf)
+
+        print(f"FFmpeg video encoder selected: {self.encoder_name}")
 
         ffmpeg_cmd = [
             'ffmpeg', '-y',
@@ -152,9 +350,7 @@ class AsyncFFmpegVideoWriter:
             '-r', str(self.fps),
             '-i', '-',
             '-an',
-            '-vcodec', 'libx264',
-            '-preset', str(preset),
-            '-crf', str(int(crf)),
+            *encoder_args,
             '-pix_fmt', 'yuv420p',
             '-movflags', '+faststart',
             self.output_path,
@@ -180,7 +376,8 @@ class AsyncFFmpegVideoWriter:
             raise ValueError(f"Frame size mismatch: got {frame.shape[1]}x{frame.shape[0]}, expected {self.width}x{self.height}")
 
         # 確保傳給 FFmpeg 的資料是連續 BGR buffer，避免 stdin.write 時產生格式問題。
-        frame = np.ascontiguousarray(frame)
+        if not frame.flags.c_contiguous:
+            frame = np.ascontiguousarray(frame)
         with self.profiler.time_block("frame.queue_output_frame"):
             self._queue.put(frame)
 
@@ -207,7 +404,7 @@ class AsyncFFmpegVideoWriter:
                     if frame is self._stop_token:
                         break
                     with self.profiler.time_block("frame.ffmpeg_stdin_write"):
-                        self._process.stdin.write(frame.tobytes())
+                        self._process.stdin.write(memoryview(frame))
                 finally:
                     self._queue.task_done()
         except Exception as exc:
@@ -226,13 +423,33 @@ class MotionMaskBuilder:
     def __init__(self, mode="temporal", scale_factor=DEFAULT_FG_MASK_SCALE,
                  diff_threshold=DEFAULT_MOTION_DIFF_THRESHOLD,
                  dilate_iterations=DEFAULT_MOTION_DILATE_ITERATIONS,
+                 blur_kernel_size=DEFAULT_MOTION_BLUR_KERNEL,
+                 open_kernel_size=DEFAULT_MOTION_OPEN_KERNEL,
+                 open_iterations=DEFAULT_MOTION_OPEN_ITERATIONS,
+                 close_kernel_size=DEFAULT_MOTION_CLOSE_KERNEL,
+                 close_iterations=DEFAULT_MOTION_CLOSE_ITERATIONS,
                  mog2_history=300, mog2_var_threshold=25, mog2_detect_shadows=True):
         self.mode = str(mode or "temporal").lower()
         self.scale_factor = float(scale_factor or 1.0)
         self.diff_threshold = int(diff_threshold)
         self.dilate_iterations = max(int(dilate_iterations or 0), 0)
+        self.blur_kernel_size = _odd_kernel_size(blur_kernel_size)
+        self.open_iterations = max(int(open_iterations or 0), 0)
+        self.close_iterations = max(int(close_iterations or 0), 0)
         self.prev_gray = None
         self.temporal_kernel = np.ones((3, 3), dtype=np.uint8) if self.dilate_iterations > 0 else None
+        open_kernel_size = _odd_kernel_size(open_kernel_size)
+        close_kernel_size = _odd_kernel_size(close_kernel_size)
+        self.open_kernel = (
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_kernel_size, open_kernel_size))
+            if self.open_iterations > 0 and open_kernel_size > 0
+            else None
+        )
+        self.close_kernel = (
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel_size, close_kernel_size))
+            if self.close_iterations > 0 and close_kernel_size > 0
+            else None
+        )
         self.back_sub = None
 
         if self.mode == "mog2":
@@ -262,6 +479,7 @@ class MotionMaskBuilder:
             fg_mask = self.back_sub.apply(mask_frame, learningRate=0.005)
         with profiler.time_block("frame.foreground_threshold"):
             _, fg_mask = cv2.threshold(fg_mask, 254, 255, cv2.THRESH_BINARY)
+        fg_mask = self._cleanup_mask(fg_mask, profiler)
         return fg_mask
 
     def _build_temporal(self, frame, profiler):
@@ -269,6 +487,9 @@ class MotionMaskBuilder:
         mask_frame = self._scaled_frame(frame, profiler)
         with profiler.time_block("frame.motion_gray"):
             gray = cv2.cvtColor(mask_frame, cv2.COLOR_BGR2GRAY)
+        if self.blur_kernel_size > 0:
+            with profiler.time_block("frame.motion_blur"):
+                gray = cv2.GaussianBlur(gray, (self.blur_kernel_size, self.blur_kernel_size), 0)
 
         if self.prev_gray is None or self.prev_gray.shape != gray.shape:
             self.prev_gray = gray
@@ -280,10 +501,105 @@ class MotionMaskBuilder:
 
         with profiler.time_block("frame.motion_threshold"):
             _, motion_mask = cv2.threshold(diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
+        motion_mask = self._cleanup_mask(motion_mask, profiler)
         if self.temporal_kernel is not None:
             with profiler.time_block("frame.motion_dilate"):
                 motion_mask = cv2.dilate(motion_mask, self.temporal_kernel, iterations=self.dilate_iterations)
         return motion_mask
+
+    def _cleanup_mask(self, motion_mask, profiler):
+        # 先 opening 去掉孤立亮點，再視需要 closing 補小洞；典型監視器噪聲濾波。
+        if self.open_kernel is not None:
+            with profiler.time_block("frame.motion_open"):
+                motion_mask = cv2.morphologyEx(
+                    motion_mask,
+                    cv2.MORPH_OPEN,
+                    self.open_kernel,
+                    iterations=self.open_iterations,
+                )
+        if self.close_kernel is not None:
+            with profiler.time_block("frame.motion_close"):
+                motion_mask = cv2.morphologyEx(
+                    motion_mask,
+                    cv2.MORPH_CLOSE,
+                    self.close_kernel,
+                    iterations=self.close_iterations,
+                )
+        return motion_mask
+
+
+class AsyncVideoFrameReader:
+    # 背景讀取/解碼/前景 mask thread：主流程跑推理時，下一批 frame 已先準備好。
+    def __init__(self, cap, motion_masker, profiler, queue_size=DEFAULT_READER_QUEUE_SIZE):
+        self.cap = cap
+        self.motion_masker = motion_masker
+        self.profiler = profiler
+        self._queue = queue.Queue(maxsize=max(int(queue_size or 1), 1))
+        self._stop_event = threading.Event()
+        self._sentinel = object()
+        self._error = None
+        self._done = False
+        self._thread = threading.Thread(target=self._worker, name="video-reader", daemon=True)
+        self._thread.start()
+
+    def read_batch(self, batch_size):
+        if self._done:
+            if self._error is not None:
+                raise RuntimeError("Async video reader failed.") from self._error
+            return [], []
+
+        frames = []
+        fg_masks = []
+        target = max(int(batch_size or 1), 1)
+        while len(frames) < target:
+            with self.profiler.time_block("frame.reader_dequeue"):
+                item = self._queue.get()
+            try:
+                if item is self._sentinel:
+                    self._done = True
+                    break
+                frame, fg_mask = item
+                frames.append(frame)
+                fg_masks.append(fg_mask)
+            finally:
+                self._queue.task_done()
+
+        if self._done and self._error is not None and not frames:
+            raise RuntimeError("Async video reader failed.") from self._error
+        return frames, fg_masks
+
+    def close(self):
+        self._stop_event.set()
+        self._thread.join(timeout=2.0)
+
+    def _put(self, item):
+        while not self._stop_event.is_set():
+            try:
+                self._queue.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _worker(self):
+        try:
+            while not self._stop_event.is_set():
+                with self.profiler.time_block("frame.read"):
+                    ret, frame = self.cap.read()
+                if not ret:
+                    break
+
+                with self.profiler.time_block("frame.foreground_mask"):
+                    fg_mask = self.motion_masker.build(frame, self.profiler)
+                if not self._put((frame, fg_mask)):
+                    break
+        except Exception as exc:
+            self._error = exc
+        finally:
+            try:
+                self.cap.release()
+            finally:
+                self._put(self._sentinel)
 
 
 def _batched_dummy_frame(batch_size):
@@ -380,8 +696,36 @@ if __name__ == "__main__":
                         help="pixel difference threshold for temporal motion mask")
     parser.add_argument("--motion-dilate-iterations", type=int, default=DEFAULT_MOTION_DILATE_ITERATIONS,
                         help="dilation iterations for temporal motion mask")
+    parser.add_argument("--motion-blur-kernel", type=int, default=DEFAULT_MOTION_BLUR_KERNEL,
+                        help="odd Gaussian blur kernel before frame differencing; <3 disables")
+    parser.add_argument("--motion-open-kernel", type=int, default=DEFAULT_MOTION_OPEN_KERNEL,
+                        help="odd morphology opening kernel for motion noise removal; <3 disables")
+    parser.add_argument("--motion-open-iterations", type=int, default=DEFAULT_MOTION_OPEN_ITERATIONS,
+                        help="morphology opening iterations for motion noise removal")
+    parser.add_argument("--motion-close-kernel", type=int, default=DEFAULT_MOTION_CLOSE_KERNEL,
+                        help="odd morphology closing kernel for motion mask hole filling; <3 disables")
+    parser.add_argument("--motion-close-iterations", type=int, default=DEFAULT_MOTION_CLOSE_ITERATIONS,
+                        help="morphology closing iterations for motion mask")
+    parser.add_argument("--motion-min-component-area", type=int, default=DEFAULT_MOTION_MIN_COMPONENT_AREA,
+                        help="minimum connected motion component area inside litter bbox")
+    parser.add_argument("--motion-min-largest-component-ratio", type=float,
+                        default=DEFAULT_MOTION_MIN_LARGEST_COMPONENT_RATIO,
+                        help="minimum largest-component / motion-pixels ratio inside litter bbox")
     parser.add_argument("--mog2-no-shadows", action="store_true",
                         help="disable MOG2 shadow detection when --motion-mask-mode mog2")
+    parser.add_argument("--video-hw-accel", default="any",
+                        choices=("any", "none", "vaapi", "mfx", "qsv", "d3d11"),
+                        help="OpenCV FFmpeg hardware decode hint; falls back to software if unsupported")
+    parser.add_argument("--video-hw-device", type=int, default=None,
+                        help="hardware decode device index when backend supports CAP_PROP_HW_DEVICE")
+    parser.add_argument("--video-read-threads", type=int, default=0,
+                        help="FFmpeg decode thread hint when backend supports CAP_PROP_N_THREADS; 0 keeps backend default")
+    parser.add_argument("--capture-buffer-size", type=int, default=DEFAULT_CAPTURE_BUFFER_SIZE,
+                        help="VideoCapture buffer hint")
+    parser.add_argument("--disable-async-reader", action="store_true",
+                        help="read/decode frames synchronously instead of using background prefetch")
+    parser.add_argument("--reader-queue-size", type=int, default=DEFAULT_READER_QUEUE_SIZE,
+                        help="background decoded-frame queue size")
     parser.add_argument("--writer-queue-size", type=int, default=16,
                         help="number of annotated frames buffered before FFmpeg writer blocks")
     args = parser.parse_args()
@@ -390,8 +734,10 @@ if __name__ == "__main__":
     profiler = PipelineProfiler(enabled=True)
     cap = None
     out = None
+    frame_reader = None
     final_output = None
     processed_frames = 0
+    litter_tracker = None
 
     try:
         with profiler.time_block("pipeline.total_wall"):
@@ -401,7 +747,7 @@ if __name__ == "__main__":
             _set_env_if_present("ACTION_POSE_IMGSZ", args.action_pose_imgsz)
 
             prefer_engine = not args.no_engine
-            # 若使用者未指定 --bbox-model/--trash-model，依 batch 1/8 自動選擇預設權重。
+            # 若使用者未指定 --bbox-model/--trash-model，依 batch size 自動選擇預設權重。
             default_bbox_model_path, default_trash_model_path = _default_model_paths_for_batch(args.batch_size)
             bbox_model_path_arg = args.bbox_model or default_bbox_model_path
             trash_model_path_arg = args.trash_model or default_trash_model_path
@@ -466,6 +812,11 @@ if __name__ == "__main__":
                     scale_factor=args.fg_mask_scale,
                     diff_threshold=args.motion_diff_threshold,
                     dilate_iterations=args.motion_dilate_iterations,
+                    blur_kernel_size=args.motion_blur_kernel,
+                    open_kernel_size=args.motion_open_kernel,
+                    open_iterations=args.motion_open_iterations,
+                    close_kernel_size=args.motion_close_kernel,
+                    close_iterations=args.motion_close_iterations,
                     mog2_detect_shadows=not args.mog2_no_shadows,
                 )
 
@@ -478,7 +829,14 @@ if __name__ == "__main__":
 
             with profiler.time_block("video.open_capture"):
                 # 讀取影片屬性；fps 無效時用 30 避免 writer 初始化失敗。
-                cap = cv2.VideoCapture(video_path)
+                cap, capture_backend = _open_video_capture(
+                    video_path,
+                    hw_accel=args.video_hw_accel,
+                    hw_device=args.video_hw_device,
+                    buffer_size=args.capture_buffer_size,
+                    read_threads=args.video_read_threads,
+                    profiler=profiler,
+                )
                 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -488,6 +846,12 @@ if __name__ == "__main__":
                 raise FileNotFoundError(f"Unable to open video: {video_path}")
             if width <= 0 or height <= 0:
                 raise RuntimeError(f"Invalid video size for {video_path}: {width}x{height}")
+            print(
+                f"VideoCapture backend: {capture_backend}; "
+                f"hw_accel={args.video_hw_accel}; "
+                f"async_reader={not args.disable_async_reader}; "
+                f"reader_queue={args.reader_queue_size}"
+            )
 
             with profiler.time_block("video.open_writer"):
                 # 直接將 BGR raw frame 串流到 FFmpeg，避免先寫 AVI 再二次壓縮。
@@ -512,17 +876,29 @@ if __name__ == "__main__":
             violator_display_cache = {}
             yolo_seg_cache = {}
             frame_index = 0
+            if not args.disable_async_reader:
+                with profiler.time_block("video.start_async_reader"):
+                    frame_reader = AsyncVideoFrameReader(
+                        cap,
+                        motion_masker,
+                        profiler,
+                        queue_size=args.reader_queue_size,
+                    )
+                cap = None
 
-            # 影片主迴圈：batch 1 走 detect；batch 8 走 detect_batch。
+            # 影片主迴圈：batch 1 走 detect；batch N 走 detect_batch。
             with profiler.time_block("process.video_loop_total"):
                 with tqdm(total = total_frames, desc = "Processing Video... ", unit="frame") as pbar:
-                    while cap.isOpened():
-                        frames, fg_masks = _read_frame_batch(
-                            cap,
-                            motion_masker,
-                            args.batch_size,
-                            profiler,
-                        )
+                    while True:
+                        if frame_reader is not None:
+                            frames, fg_masks = frame_reader.read_batch(args.batch_size)
+                        else:
+                            frames, fg_masks = _read_frame_batch(
+                                cap,
+                                motion_masker,
+                                args.batch_size,
+                                profiler,
+                            )
                         if not frames:
                             break
 
@@ -546,6 +922,8 @@ if __name__ == "__main__":
                                     profiler=profiler,
                                     moving_threshold=0.25,
                                     core_moving_threshold=0.3,
+                                    motion_min_component_area=args.motion_min_component_area,
+                                    motion_min_largest_component_ratio=args.motion_min_largest_component_ratio,
                                     batch_size=args.batch_size,
                                     fg_mask_scale=args.fg_mask_scale,
                                 )
@@ -569,6 +947,8 @@ if __name__ == "__main__":
                                         profiler=profiler,
                                         moving_threshold=0.25,
                                         core_moving_threshold=0.3,
+                                        motion_min_component_area=args.motion_min_component_area,
+                                        motion_min_largest_component_ratio=args.motion_min_largest_component_ratio,
                                         fg_mask_scale=args.fg_mask_scale,
                                     )
                                 ]
@@ -582,19 +962,30 @@ if __name__ == "__main__":
                         processed_frames += len(annotated_frames)
 
             with profiler.time_block("cleanup.release_video_io"):
-                cap.release()
-                cap = None
+                if frame_reader is not None:
+                    frame_reader.close()
+                    frame_reader = None
+                if cap is not None:
+                    cap.release()
+                    cap = None
                 out.close()
                 out = None
             print(f"Video saved to {final_output}")
 
+            if litter_tracker is not None:
+                litter_tracker.close()
+                litter_tracker = None
             wait_for_plate_jobs(profiler=profiler)
     finally:
         # 任一階段拋錯時仍釋放 OpenCV 句柄。
+        if frame_reader is not None:
+            frame_reader.close()
         if cap is not None:
             cap.release()
         if out is not None:
             out.close()
+        if litter_tracker is not None:
+            litter_tracker.close()
 
     # 最後統一印出模型載入、影片處理、寫檔與瓶頸排行。
     profiler.print_compact_summary(frame_count=processed_frames)

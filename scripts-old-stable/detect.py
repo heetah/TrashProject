@@ -4,12 +4,12 @@ import cv2
 import numpy as np
 import math
 import os
-from licensePlate import detect_license_plates, get_plate_number
+from licensePlate import detect_license_plates, dispatch_license_plate_rois, get_plate_number
 from timeUtils import profile_block
 from smallFunction import (
     calculate_iou_matrix,
-    check_motion,
     litter_holding,
+    motion_evidence,
 )
 
 # 類別顏色與名稱正規化：避免不同模型 label-space 造成 actor 解析錯誤。
@@ -161,6 +161,8 @@ def detect(frame, model_bbox, model_trash,
            profiler=None,
            moving_threshold=0.25,
            core_moving_threshold=0.3,
+           motion_min_component_area=4,
+           motion_min_largest_component_ratio=0.25,
            precomputed_persons=None,
            precomputed_vehicles=None,
            precomputed_trash_results=None,
@@ -315,11 +317,13 @@ def detect(frame, model_bbox, model_trash,
             litter_h = max(int(ly2 - ly1), 1)
 
             # 檢查整個 litter bbox 的前景像素比例，先排除靜止舊垃圾。
-            is_moving = check_motion(
+            is_moving = motion_evidence(
                 fg_mask,
                 (int(lx1), int(ly1), int(lx2), int(ly2)),
                 threshold=moving_threshold,
                 mask_scale=fg_mask_scale,
+                min_component_area=motion_min_component_area,
+                min_largest_component_ratio=motion_min_largest_component_ratio,
             )
             if not is_moving:
                 continue
@@ -331,11 +335,13 @@ def detect(frame, model_bbox, model_trash,
                 core_x2 = int(lx2 - 0.2 * litter_w)
                 core_y2 = int(ly2 - 0.2 * litter_h)
 
-                is_core_moving = check_motion(
+                is_core_moving = motion_evidence(
                     fg_mask,
                     (core_x1, core_y1, core_x2, core_y2),
                     threshold=core_moving_threshold,
                     mask_scale=fg_mask_scale,
+                    min_component_area=motion_min_component_area,
+                    min_largest_component_ratio=motion_min_largest_component_ratio,
                 )
                 if not is_core_moving:
                     continue
@@ -382,7 +388,9 @@ def detect(frame, model_bbox, model_trash,
         tracked_litters, active_violators = litter_tracker.update(
             filtered_frame_litters,
             tracking_objects,
-            person_vehicle_map=person_vehicle_map
+            person_vehicle_map=person_vehicle_map,
+            frame_index=frame_index,
+            frame=frame,
         )
     if person_action_map:
         # STGCN 若判定 person 正在 littering，也可直接把人/車註冊成違規者。
@@ -397,6 +405,12 @@ def detect(frame, model_bbox, model_trash,
 
     # 車牌辨識只對已鎖定違規者派工；避免每 10 幀掃描所有車輛造成不必要延遲。
     with profile_block(profiler, "detect.plate_dispatch"):
+        backward_plate_roi_items = []
+        if hasattr(litter_tracker, "consume_backward_plate_roi_items"):
+            backward_plate_roi_items = litter_tracker.consume_backward_plate_roi_items()
+        if backward_plate_roi_items:
+            dispatch_license_plate_rois(backward_plate_roi_items, vehicle_history, profiler=profiler)
+
         plate_target_keys = set(active_violators)
         plate_target_keys.update(
             key for key in violator_display_cache.keys()
@@ -614,6 +628,8 @@ def detect_batch(frames, model_bbox, model_trash,
                  profiler=None,
                  moving_threshold=0.25,
                  core_moving_threshold=0.3,
+                 motion_min_component_area=4,
+                 motion_min_largest_component_ratio=0.25,
                  batch_size=1,
                  fg_mask_scale=1.0):
     # 批次偵測入口：RTDETR 批次推理、actor 可跳幀快取，最後逐幀套用單幀後處理。
@@ -650,6 +666,8 @@ def detect_batch(frames, model_bbox, model_trash,
                 profiler=profiler,
                 moving_threshold=moving_threshold,
                 core_moving_threshold=core_moving_threshold,
+                motion_min_component_area=motion_min_component_area,
+                motion_min_largest_component_ratio=motion_min_largest_component_ratio,
                 fg_mask_scale=fg_mask_scale,
             )
             for frame, fg_mask, frame_index in zip(frames, fg_masks, frame_indices)
@@ -698,6 +716,8 @@ def detect_batch(frames, model_bbox, model_trash,
                 profiler=profiler,
                 moving_threshold=moving_threshold,
                 core_moving_threshold=core_moving_threshold,
+                motion_min_component_area=motion_min_component_area,
+                motion_min_largest_component_ratio=motion_min_largest_component_ratio,
                 precomputed_persons=persons,
                 precomputed_vehicles=vehicles,
                 precomputed_trash_results=[trash_result],

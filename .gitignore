@@ -10,7 +10,7 @@ resources/
 runs/
 scripts-fusion-heetah/
 scripts-fusion-stable/
-scripts-speed-compare/
+scripts-old-test-longrunning/
 test_ocr/
 work_dirs/
 .codex

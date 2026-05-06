@@ -123,14 +123,16 @@ class PipelineProfiler:
                     (
                         "模型前置載入時間",
                         [
-                            "model_load.action_module_total",
+                            "model_load.stgcn_recognizer",
+                            "model_load.pose_yolo",
                             "model_warmup.pose_yolo",
                             "model_warmup.stgcn_predict",
                             "model_load.bbox_yolo",
                             "model_warmup.bbox_yolo",
                             "model_load.trash_rtdetr",
                             "model_warmup.trash_rtdetr",
-                            "model_load.plate_models_total",
+                            "model_load.plate_yolo",
+                            "model_load.plate_ocr",
                             "model_warmup.plate_yolo",
                             "model_warmup.plate_ocr",
                         ],
@@ -140,10 +142,6 @@ class PipelineProfiler:
             (
                 "2. 影像處理",
                 [
-                    (
-                        "影片處理總長度",
-                        ["process.video_loop_total"],
-                    ),
                     (
                         "YOLO",
                         [
@@ -208,7 +206,9 @@ class PipelineProfiler:
                         "影片讀取/解碼",
                         [
                             "video.open_capture",
+                            "video.start_async_reader",
                             "frame.read",
+                            "frame.reader_dequeue",
                         ],
                     ),
                     (
@@ -265,12 +265,13 @@ class PipelineProfiler:
         print(f"\n{'=' * line_width}")
         print(title)
         print("-" * line_width)
-        print(f"Frames: {int(frame_count):>8d} | Total: {wall_total:>8.3f}s | Avg: {total_avg_ms:>8.2f} ms/frame")
+        print(f"Frames: {int(frame_count):>8d} | Wall: {wall_total:>8.3f}s | Avg: {total_avg_ms:>8.2f} ms/frame")
         print("=" * line_width)
+        print("註：下列為累積耗時；非同步 reader / writer / OCR 可能與主流程重疊，不能直接相加。")
 
         header = (
             f"{_pad_display('項目', name_width)}  "
-            f"{'總秒數':>10s}  "
+            f"{'累積秒數':>10s}  "
             f"{'每幀ms':>10s}  "
             f"{'佔比':>8s}"
         )

@@ -216,10 +216,116 @@ def _load_model_with_warmup(label, candidates, model_factory, warmup_func, profi
     raise RuntimeError(f"{label}: all model candidates failed: {candidates}") from last_error
 
 
+_FFMPEG_ENCODER_CACHE = None
+
+
+def _ffmpeg_available_encoders():
+    # 只探測一次 ffmpeg 支援的 encoder，避免每次開 writer 都重跑清單。
+    global _FFMPEG_ENCODER_CACHE
+    if _FFMPEG_ENCODER_CACHE is not None:
+        return _FFMPEG_ENCODER_CACHE
+
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-encoders'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=True,
+        )
+    except Exception:
+        _FFMPEG_ENCODER_CACHE = set()
+        return _FFMPEG_ENCODER_CACHE
+
+    encoders = set()
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and len(parts[0]) == 6 and parts[0][0] in 'VASD':
+            encoders.add(parts[1])
+
+    _FFMPEG_ENCODER_CACHE = encoders
+    return _FFMPEG_ENCODER_CACHE
+
+
+def _ffmpeg_encoder_available(encoder_name):
+    # 讓 writer 可以先選可用 encoder，再決定要不要退回 x264。
+    return str(encoder_name or '').strip() in _ffmpeg_available_encoders()
+
+
+def _resolve_video_encoder(preferred="auto", frame_width=None, frame_height=None):
+    # auto 優先用 NVENC，若 ffmpeg 沒有或使用者指定其他值，就回退到 libx264。
+    preferred_name = str(preferred or 'auto').strip().lower()
+
+    width = int(frame_width or 0)
+    height = int(frame_height or 0)
+    nvenc_supported = min(width, height) >= 128 if width > 0 and height > 0 else True
+
+    if preferred_name in ('h264_nvenc', 'hevc_nvenc', 'libx264'):
+        if preferred_name in ('h264_nvenc', 'hevc_nvenc') and not nvenc_supported:
+            print(
+                f"Warning: Frame size {width}x{height} is too small for NVENC; fallback to libx264."
+            )
+            return 'libx264'
+        if _ffmpeg_encoder_available(preferred_name):
+            return preferred_name
+        print(f"Warning: FFmpeg encoder {preferred_name} unavailable; fallback to libx264.")
+        return 'libx264'
+
+    if preferred_name not in ('', 'auto'):
+        print(f"Warning: Unsupported video encoder {preferred_name}; fallback to auto selection.")
+
+    for candidate in ('h264_nvenc', 'hevc_nvenc', 'libx264'):
+        if candidate in ('h264_nvenc', 'hevc_nvenc') and not nvenc_supported:
+            continue
+        if _ffmpeg_encoder_available(candidate):
+            return candidate
+
+    print("Warning: No preferred FFmpeg encoder found; fallback to libx264.")
+    return 'libx264'
+
+
+def _nvenc_preset_from_generic(preset_name):
+    # 將原本 x264-style preset 名稱映射成 NVENC 可接受的 p1~p7。
+    preset = str(preset_name or '').strip().lower()
+    if preset in ('p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7'):
+        return preset
+    preset_map = {
+        'ultrafast': 'p1',
+        'superfast': 'p1',
+        'veryfast': 'p1',
+        'faster': 'p2',
+        'fast': 'p2',
+        'medium': 'p4',
+        'slow': 'p5',
+        'slower': 'p6',
+        'veryslow': 'p7',
+    }
+    return preset_map.get(preset, 'p1')
+
+
+def _build_ffmpeg_video_encoder_args(encoder_name, preset="fast", crf=23):
+    # 依 encoder 類型組出參數；只改輸出編碼，不動前面偵測與渲染流程。
+    quality = max(0, min(int(crf), 51))
+    if encoder_name in ('h264_nvenc', 'hevc_nvenc'):
+        return [
+            '-vcodec', encoder_name,
+            '-preset', _nvenc_preset_from_generic(preset),
+            '-rc', 'vbr',
+            '-cq', str(quality),
+            '-b:v', '0',
+        ]
+
+    return [
+        '-vcodec', 'libx264',
+        '-preset', str(preset),
+        '-crf', str(quality),
+    ]
+
+
 class AsyncFFmpegVideoWriter:
     # 背景 FFmpeg writer：主執行緒只排隊 frame，編碼與 muxing 由背景 thread 處理。
     def __init__(self, output_path, width, height, fps, profiler=None,
-                 queue_size=16, preset="fast", crf=23):
+                 queue_size=16, preset="fast", crf=23, encoder="auto"):
         self.output_path = str(output_path)
         self.width = int(width)
         self.height = int(height)
@@ -230,6 +336,10 @@ class AsyncFFmpegVideoWriter:
         self._error = None
         self._closed = False
         self._process = None
+        self.encoder_name = _resolve_video_encoder(encoder, frame_width=self.width, frame_height=self.height)
+        encoder_args = _build_ffmpeg_video_encoder_args(self.encoder_name, preset=preset, crf=crf)
+
+        print(f"FFmpeg video encoder selected: {self.encoder_name}")
 
         ffmpeg_cmd = [
             'ffmpeg', '-y',
@@ -240,9 +350,7 @@ class AsyncFFmpegVideoWriter:
             '-r', str(self.fps),
             '-i', '-',
             '-an',
-            '-vcodec', 'libx264',
-            '-preset', str(preset),
-            '-crf', str(int(crf)),
+            *encoder_args,
             '-pix_fmt', 'yuv420p',
             '-movflags', '+faststart',
             self.output_path,
@@ -268,7 +376,8 @@ class AsyncFFmpegVideoWriter:
             raise ValueError(f"Frame size mismatch: got {frame.shape[1]}x{frame.shape[0]}, expected {self.width}x{self.height}")
 
         # 確保傳給 FFmpeg 的資料是連續 BGR buffer，避免 stdin.write 時產生格式問題。
-        frame = np.ascontiguousarray(frame)
+        if not frame.flags.c_contiguous:
+            frame = np.ascontiguousarray(frame)
         with self.profiler.time_block("frame.queue_output_frame"):
             self._queue.put(frame)
 
@@ -295,7 +404,7 @@ class AsyncFFmpegVideoWriter:
                     if frame is self._stop_token:
                         break
                     with self.profiler.time_block("frame.ffmpeg_stdin_write"):
-                        self._process.stdin.write(frame.tobytes())
+                        self._process.stdin.write(memoryview(frame))
                 finally:
                     self._queue.task_done()
         except Exception as exc:
@@ -628,6 +737,7 @@ if __name__ == "__main__":
     frame_reader = None
     final_output = None
     processed_frames = 0
+    litter_tracker = None
 
     try:
         with profiler.time_block("pipeline.total_wall"):
@@ -862,6 +972,9 @@ if __name__ == "__main__":
                 out = None
             print(f"Video saved to {final_output}")
 
+            if litter_tracker is not None:
+                litter_tracker.close()
+                litter_tracker = None
             wait_for_plate_jobs(profiler=profiler)
     finally:
         # 任一階段拋錯時仍釋放 OpenCV 句柄。
@@ -871,6 +984,8 @@ if __name__ == "__main__":
             cap.release()
         if out is not None:
             out.close()
+        if litter_tracker is not None:
+            litter_tracker.close()
 
     # 最後統一印出模型載入、影片處理、寫檔與瓶頸排行。
     profiler.print_compact_summary(frame_count=processed_frames)
