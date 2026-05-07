@@ -17,6 +17,10 @@ BLACK = (0, 0, 0)
 WARN = (0, 0, 255)
 ACTOR_CLASSES = ('person', 'scooter', 'vehicle')
 VEHICLE_LIKE_CLASSES = ('scooter', 'vehicle')
+ACTION_WARNING_LABELS = {
+    'littering': 'LITTERING',
+    'urination': 'URINATING',
+}
 CLASS_ALIASES = {
     'motorcycle': 'scooter',
     'motorbike': 'scooter',
@@ -127,6 +131,11 @@ def _result_box_count(result):
 def _add_stat(stats, key, amount=1):
     if stats is not None:
         stats[key] = stats.get(key, 0) + amount
+
+
+def _warning_label_for_action(action):
+    action_key = str(action or '').strip().lower()
+    return ACTION_WARNING_LABELS.get(action_key, 'LITTERING')
 
 
 def _actor_iou(box_a, box_b):
@@ -398,7 +407,7 @@ def detect(frame, model_bbox, model_trash,
     person_action_map = {}
     if action_module is not None:
         with profile_block(profiler, "detect.action_update"):
-            person_action_map = action_module.update(frame, persons, profiler=profiler)
+            person_action_map = action_module.update(frame, persons, profiler=profiler, stats=stats)
 
     filtererd_objects = []
 
@@ -561,14 +570,17 @@ def detect(frame, model_bbox, model_trash,
             if stats.get('first_confirmed_litter_frame') is None:
                 stats['first_confirmed_litter_frame'] = frame_index
     if person_action_map:
-        # STGCN 若判定 person 正在 littering，也可直接把人/車註冊成違規者。
+        # STGCN 若判定 person 正在違規動作，也可直接把人/車註冊成違規者。
         with profile_block(profiler, "detect.stgcn_violator_register"):
             stgcn_violators = litter_tracker.register_action_violators(
                 person_action_map,
                 tracking_objects,
                 person_vehicle_map=person_vehicle_map,
                 ttl=violator_display_ttl,
+                frame_index=frame_index,
+                vehicle_history=vehicle_history,
             )
+        _add_stat(stats, "stgcn_registered_violators", len(stgcn_violators))
         active_violators = set(active_violators) | stgcn_violators
 
     # 車牌辨識只對已鎖定違規者派工；避免每 10 幀掃描所有車輛造成不必要延遲。
@@ -603,6 +615,9 @@ def detect(frame, model_bbox, model_trash,
                     if hasattr(litter_tracker, "get_violator_info")
                     else {}
                 )
+                action_name = tracker_info.get('action')
+                if not action_name and actor_key[0] == 'person':
+                    action_name = person_action_map.get(actor_key[1], {}).get('action')
                 until_plate_found = bool(tracker_info.get('until_plate_found', False))
                 if actor_key[0] in VEHICLE_LIKE_CLASSES:
                     until_plate_found = until_plate_found or bool(
@@ -613,6 +628,7 @@ def detect(frame, model_bbox, model_trash,
                     'ttl': int(violator_display_ttl),
                     'center': center,
                     'until_plate_found': until_plate_found,
+                    'action': action_name,
                 }
 
         # 已鎖定違規者即使被速度過濾暫時排除，也要保留渲染框。
@@ -651,7 +667,8 @@ def detect(frame, model_bbox, model_trash,
                 # 丟擲者確認：畫上紅色 BBox 
                 cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), WARN, box_thickness + 2)
                 plate_str = get_plate_number(vehicle_history, track_id) if cls_name in VEHICLE_LIKE_CLASSES else ""
-                label_text = f"{cls_name} -LITTERING- {plate_str}".strip()
+                warning_label = _warning_label_for_action(cache_entry.get('action'))
+                label_text = f"{cls_name} -{warning_label}- {plate_str}".strip()
                 
                 cv2.putText(annotated_frame, label_text, (x1, max(10, y1 - 35)),
                             cv2.FONT_HERSHEY_SIMPLEX, font_scale, WARN, text_thickness)
@@ -665,9 +682,10 @@ def detect(frame, model_bbox, model_trash,
                     action_info = person_action_map[track_id]
                     stgcn_conf = action_info.get('stgcn_conf', action_info.get('conf', 0.0))
                     if action_info.get('alert', False):
+                        action_name = _warning_label_for_action(action_info.get('action'))
                         color = WARN
                         cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, box_thickness + 2)
-                        label_text = f"person LITTERING STGCN {stgcn_conf:.2f}"
+                        label_text = f"person {action_name} STGCN {stgcn_conf:.2f}"
                     else:
                         label_text = f"person {action_info.get('action', 'normal')} STGCN {stgcn_conf:.2f}"
 

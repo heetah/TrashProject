@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# TensorRT 匯出工具：將 YOLO actor 與 RTDETR litter 權重匯出成對應 batch 的 .engine。
+# TensorRT 匯出工具：將 YOLO actor、RTDETR litter、YOLO pose 權重匯出成對應 batch 的 .engine。
 import argparse
 import os
 from pathlib import Path
@@ -14,6 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SUPPORTED_BATCH_SIZES = (1, 2, 4, 8, 12, 16, 24)
 ROOT_BBOX_MODEL = PROJECT_ROOT / "modules_weight" / "best-yolo-seg_v3.pt"
 ROOT_TRASH_MODEL = PROJECT_ROOT / "modules_weight" / "best-rtdetr-seg.pt"
+ROOT_POSE_MODEL = PROJECT_ROOT / "modules_weight" / "yolo26x-pose.pt"
 BATCH_BBOX_MODEL = PROJECT_ROOT / "modules_weight" / "batch" / "best-yolo-seg_v3.pt"
 BATCH_TRASH_MODEL = PROJECT_ROOT / "modules_weight" / "batch" / "best-rtdetr-seg.pt"
 DEFAULT_SMOKE_VIDEO = PROJECT_ROOT / "resources" / "resize.mp4"
@@ -68,6 +69,8 @@ def _resolve_default_model_paths(args):
         args.bbox_model = BATCH_BBOX_MODEL if int(args.batch) > 1 else ROOT_BBOX_MODEL
     if args.trash_model is None:
         args.trash_model = BATCH_TRASH_MODEL if int(args.batch) > 1 else ROOT_TRASH_MODEL
+    if args.pose_model is None:
+        args.pose_model = ROOT_POSE_MODEL
 
 
 def _parse_frame_indices(value):
@@ -109,6 +112,20 @@ def _box_counts(results, keep_count):
     return counts
 
 
+def _keypoint_counts(results, keep_count):
+    counts = []
+    for result in list(results)[:keep_count]:
+        keypoints = getattr(result, "keypoints", None)
+        if keypoints is None or getattr(keypoints, "xy", None) is None:
+            counts.append(0)
+            continue
+        try:
+            counts.append(len(keypoints.xy))
+        except TypeError:
+            counts.append(0)
+    return counts
+
+
 def _smoke_test_engine(label, engine_path, loader, task, args, conf):
     # 使用專案 regression frame 驗證 engine 不是「可載入但輸出全 0」的壞檔。
     if not args.smoke_test:
@@ -125,6 +142,7 @@ def _smoke_test_engine(label, engine_path, loader, task, args, conf):
     model = loader(str(engine_path), task=task) if task else loader(str(engine_path))
     batch = max(int(args.batch or 1), 1)
     counts = []
+    keypoint_counts = []
     if batch <= 1:
         for frame in frames:
             results = model.predict(
@@ -134,7 +152,10 @@ def _smoke_test_engine(label, engine_path, loader, task, args, conf):
                 half=args.half,
                 verbose=False,
             )
-            counts.extend(_box_counts(results, 1))
+            result_list = list(results)
+            counts.extend(_box_counts(result_list, 1))
+            if task == "pose":
+                keypoint_counts.extend(_keypoint_counts(result_list, 1))
     else:
         for start in range(0, len(frames), batch):
             chunk = list(frames[start:start + batch])
@@ -148,13 +169,23 @@ def _smoke_test_engine(label, engine_path, loader, task, args, conf):
                 half=args.half,
                 verbose=False,
             )
-            counts.extend(_box_counts(results, keep_count))
+            result_list = list(results)
+            counts.extend(_box_counts(result_list, keep_count))
+            if task == "pose":
+                keypoint_counts.extend(_keypoint_counts(result_list, keep_count))
 
     print(f"{label}: smoke counts on {Path(args.smoke_video).name} frames {args.smoke_frames}: {counts}")
+    if task == "pose":
+        print(f"{label}: smoke keypoint person counts: {keypoint_counts}")
     if not any(count > 0 for count in counts):
         raise RuntimeError(
             f"{label}: exported engine produced zero boxes on smoke frames; "
             "do not use this engine for inference."
+        )
+    if task == "pose" and not any(count > 0 for count in keypoint_counts):
+        raise RuntimeError(
+            f"{label}: exported engine produced zero pose keypoints on smoke frames; "
+            "do not use this engine for STGCN."
         )
 
 
@@ -229,10 +260,15 @@ def parse_args():
     parser.add_argument("--imgsz", type=int, default=None, help="Override export image size for both models")
     parser.add_argument("--bbox-imgsz", type=int, default=None, help="Override export image size for bbox model")
     parser.add_argument("--trash-imgsz", type=int, default=None, help="Override export image size for trash model")
+    parser.add_argument("--pose-imgsz", type=int, default=None, help="Override export image size for pose model")
     parser.add_argument("--bbox-model", type=Path, default=None, help="YOLO-seg actor model path")
     parser.add_argument("--trash-model", type=Path, default=None, help="RTDETR litter model path")
+    parser.add_argument("--pose-model", type=Path, default=None, help="YOLO pose model path")
     parser.add_argument("--skip-bbox", action="store_true", help="Do not export the bbox/actor model")
     parser.add_argument("--skip-trash", action="store_true", help="Do not export the trash/litter model")
+    parser.add_argument("--include-pose", action="store_true", help="Export YOLO pose model for STGCN acceleration")
+    parser.add_argument("--pose-batch", type=int, default=1, choices=SUPPORTED_BATCH_SIZES,
+                        help="TensorRT optimization batch size for pose model")
     parser.add_argument("--fallback-imgsz", type=int, default=640, help="Fallback image size if a checkpoint has no imgsz")
     parser.add_argument("--dynamic", dest="dynamic", action="store_true", default=False,
                         help="Build dynamic-shape TensorRT engines")
@@ -251,6 +287,8 @@ def parse_args():
                         help="BBOX confidence threshold for smoke test")
     parser.add_argument("--smoke-trash-conf", type=float, default=0.4,
                         help="RTDETR confidence threshold for smoke test")
+    parser.add_argument("--smoke-pose-conf", type=float, default=0.3,
+                        help="YOLO pose confidence threshold for smoke test")
     parser.add_argument("--force", action="store_true", help="Rebuild existing .engine files")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose TensorRT logs")
     parser.set_defaults(half=True)
@@ -258,7 +296,7 @@ def parse_args():
 
 
 def main():
-    # 主流程：檢查 CUDA 後依參數匯出 bbox/trash engine。
+    # 主流程：檢查 CUDA 後依參數匯出 bbox/trash/pose engine。
     args = parse_args()
     _resolve_default_model_paths(args)
     _check_cuda(args.device)
@@ -275,8 +313,15 @@ def main():
         trash_engine = _export_model("trash", args.trash_model, RTDETR, None, trash_args)
         _smoke_test_engine("trash", trash_engine, RTDETR, None, trash_args, args.smoke_trash_conf)
         outputs.append(trash_engine)
+    if args.include_pose:
+        pose_args = argparse.Namespace(**vars(args))
+        pose_args.batch = args.pose_batch
+        pose_args.imgsz = args.pose_imgsz or args.imgsz
+        pose_engine = _export_model("pose", args.pose_model, YOLO, "pose", pose_args)
+        _smoke_test_engine("pose", pose_engine, YOLO, "pose", pose_args, args.smoke_pose_conf)
+        outputs.append(pose_engine)
     if not outputs:
-        raise RuntimeError("Nothing to export: both --skip-bbox and --skip-trash were set.")
+        raise RuntimeError("Nothing to export: enable bbox/trash or pass --include-pose.")
     print("Export complete:")
     for output in outputs:
         print(f"  {output}")

@@ -31,7 +31,7 @@ COLORS = {
 # 預設模型路徑：batch 1 使用一般權重；batch N 使用 batch 匯出/訓練資料夾中的權重。
 SUPPORTED_BATCH_SIZES = (1, 2, 4, 8)
 POSE_MODEL_PATH = 'modules_weight/yolo26x-pose.pt'
-STGCN_WEIGHT_PATH = 'modules_weight/best_acc_top1_epoch_13.pth'
+STGCN_WEIGHT_PATH = 'modules_weight/stgcnpp_garbage_3class_best.pth'
 STGCN_CONFIG_PATH = 'mmaction2/configs/skeleton/stgcnpp/custom_trash_stgcnpp.py'
 
 MODEL_BBOX_PATH = 'modules_weight/best-yolo-seg_v3.pt'
@@ -870,6 +870,7 @@ if __name__ == "__main__":
                 bbox_candidate_batches,
             )
             trash_model_candidates = _model_path_candidates(trash_model_path_arg, prefer_engine, args.batch_size)
+            pose_model_candidates = _model_path_candidates(args.pose_model, prefer_engine, 1)
 
             print("Preloading all configured models before video processing...")
             print(f"Pipeline batch size: {args.batch_size}")
@@ -879,17 +880,18 @@ if __name__ == "__main__":
             print(f"Default Trash model for batch {args.batch_size}: {default_trash_model_path}")
             print(f"BBOX candidates: {bbox_model_candidates}")
             print(f"Trash candidates: {trash_model_candidates}")
+            print(f"Pose candidates: {pose_model_candidates}")
             print(f"RTDETR batch zero repair: {args.rtdetr_zero_repair}")
             if not args.extreme_speed_off:
                 print("Extreme speed: detector fast path enabled; STGCN/OCR keep their normal enable flags.")
             action_module = None
             if not args.disable_action:
                 # STGCN 先載入 pose model 與 skeleton classifier，後續只在偵測到 person 時更新。
-                print(f"Pose model: {args.pose_model}")
+                print(f"Pose model candidates: {pose_model_candidates}")
                 print(f"STGCN weight: {args.stgcn_weight}")
                 with profiler.time_block("model_load.action_module_total"):
                     action_module = STGCNActionModule(
-                        pose_model_path=args.pose_model,
+                        pose_model_path=pose_model_candidates,
                         stgcn_weight_path=args.stgcn_weight,
                         stgcn_config_path=args.stgcn_config,
                         action_threshold=args.action_threshold,
@@ -1029,6 +1031,14 @@ if __name__ == "__main__":
                 'rtdetr_batch_zero_repaired_frames': 0,
                 'yolo_actor_infer_frames': 0,
                 'yolo_actor_padded_frames': 0,
+                'stgcn_person_frames': 0,
+                'stgcn_pose_boxes': 0,
+                'stgcn_pose_matches': 0,
+                'stgcn_pose_unmatched': 0,
+                'stgcn_window_ready': 0,
+                'stgcn_predict_calls': 0,
+                'stgcn_alerts': 0,
+                'stgcn_registered_violators': 0,
             }
             yolo_seg_cache = {}
             rtdetr_batch_context = {}
@@ -1163,7 +1173,15 @@ if __name__ == "__main__":
                 f"rtdetr_zero_frames={detection_stats.get('rtdetr_batch_zero_frames', 0)}, "
                 f"rtdetr_zero_repaired={detection_stats.get('rtdetr_batch_zero_repaired_frames', 0)}, "
                 f"yolo_actor_infer_frames={detection_stats.get('yolo_actor_infer_frames', 0)}, "
-                f"yolo_actor_padded_frames={detection_stats.get('yolo_actor_padded_frames', 0)}"
+                f"yolo_actor_padded_frames={detection_stats.get('yolo_actor_padded_frames', 0)}, "
+                f"stgcn_person_frames={detection_stats.get('stgcn_person_frames', 0)}, "
+                f"stgcn_pose_matches={detection_stats.get('stgcn_pose_matches', 0)}, "
+                f"stgcn_window_ready={detection_stats.get('stgcn_window_ready', 0)}, "
+                f"stgcn_predicts={detection_stats.get('stgcn_predict_calls', 0)}, "
+                f"stgcn_littering={detection_stats.get('stgcn_pred_littering', 0)}, "
+                f"stgcn_urination={detection_stats.get('stgcn_pred_urination', 0)}, "
+                f"stgcn_alerts={detection_stats.get('stgcn_alerts', 0)}, "
+                f"stgcn_registered_violators={detection_stats.get('stgcn_registered_violators', 0)}"
             )
 
             if litter_tracker is not None:

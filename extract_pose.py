@@ -19,7 +19,9 @@ The output ``garbage_final.pkl`` follows MMACTION2 ``PoseDataset`` format:
     }
 
 Labels are intentionally aligned with scripts-old-test/action.py:
-0 = normal, 1 = littering.
+0 = normal, 1 = littering, 2 = urination.
+The class-2 folder on disk may be named ``urinate`` while the exported label
+name stays ``urination`` for runtime compatibility.
 """
 
 from __future__ import annotations
@@ -38,9 +40,15 @@ import cv2
 import numpy as np
 
 
+CLASS_SPECS = [
+    {"folder": "normal", "label_name": "normal", "label": 0},
+    {"folder": "littering", "label_name": "littering", "label": 1},
+    {"folder": "urinate", "label_name": "urination", "label": 2},
+]
+
 LABEL_TO_ID = {
-    "normal": 0,
-    "littering": 1,
+    spec["label_name"]: int(spec["label"])
+    for spec in CLASS_SPECS
 }
 
 
@@ -74,8 +82,10 @@ def load_pickle(path: Path) -> object:
 
 def collect_videos(dataset_dir: Path, limit: int | None = None) -> list[dict]:
     samples = []
-    for label_name, label_id in LABEL_TO_ID.items():
-        class_dir = dataset_dir / label_name
+    for spec in CLASS_SPECS:
+        label_name = str(spec["label_name"])
+        label_id = int(spec["label"])
+        class_dir = dataset_dir / str(spec["folder"])
         if not class_dir.is_dir():
             raise FileNotFoundError(f"Missing class directory: {class_dir}")
         for video_path in sorted(class_dir.glob("*.mp4"), key=natural_key):
