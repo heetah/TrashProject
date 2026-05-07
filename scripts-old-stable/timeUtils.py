@@ -148,6 +148,8 @@ class PipelineProfiler:
                             "detect.yolo_actor_track",
                             "detect.yolo_actor_track_batch",
                             "detect.yolo_actor_track_fallback",
+                            "detect.yolo_actor_predict",
+                            "detect.yolo_actor_predict_batch",
                             "detect.yolo_actor_parse",
                             "detect.yolo_actor_parse_batch",
                             "detect.yolo_actor_cache_reuse",

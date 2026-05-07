@@ -150,11 +150,18 @@ def _plate_worker(roi_items, vehicle_history, profiler=None):
                                 legal_license_plate(plate_ocr_results['rec_text']),
                                 plate_ocr_results['rec_score']
                             )
-                            vehicle_history[vehicle['track_id']]['license_plate'] = {
+                            history_entry = vehicle_history[vehicle['track_id']]
+                            history_entry['license_plate'] = {
                                 'number': legal_license_plate(plate_ocr_results['rec_text']),
                                 'conf': plate_ocr_results['rec_score'],
                             }
+                            history_entry['plate_search_until_found'] = False
+                            history_entry['plate_blocked_since_litter'] = False
                             break
+                    else:
+                        vehicle_history[vehicle['track_id']]['plate_ocr_misses'] = (
+                            vehicle_history[vehicle['track_id']].get('plate_ocr_misses', 0) + 1
+                        )
     except Exception as exc:
         print(f"License plate detector/OCR worker failed: {exc}")
     finally:
@@ -182,10 +189,15 @@ def detect_license_plates(frame, vehicles, vehicle_history, skip=10, profiler=No
     if not vehicles:
         return
 
+    force_search = any(
+        vehicle_history[vehicle['track_id']].get('plate_search_until_found', False)
+        for vehicle in vehicles
+    )
+
     if not hasattr(detect_license_plates, "counter"):
         detect_license_plates.counter = 0
 
-    if detect_license_plates.counter < skip:
+    if detect_license_plates.counter < skip and not force_search:
         detect_license_plates.counter += 1
         return
 
@@ -234,7 +246,7 @@ def dispatch_license_plate_rois(roi_items, vehicle_history, profiler=None):
     """從 backward resolver 的歷史 vehicle ROI 直接派工 OCR，不依賴車輛仍在當前畫面。"""
     global _plate_thread
     if _plate_disabled:
-        return
+        return True
 
     prepared_items = []
     for vehicle, vehicle_roi in roi_items or []:
@@ -246,16 +258,18 @@ def dispatch_license_plate_rois(roi_items, vehicle_history, profiler=None):
             continue
         if vehicle_history[track_id].get('license_plate') is not None:
             continue
+        vehicle_history[track_id]['plate_search_until_found'] = True
+        vehicle_history[track_id]['plate_search_source'] = 'backward'
         prepared_vehicle = dict(vehicle)
         prepared_vehicle['track_id'] = track_id
         prepared_items.append((prepared_vehicle, vehicle_roi.copy()))
 
     if not prepared_items:
-        return
+        return True
 
     # 與一般 plate worker 共用鎖，避免兩條 OCR/YOLO plate 任務互搶 GPU/CPU。
     if not _plate_lock.acquire(blocking=False):
-        return
+        return False
 
     print("creating background thread for backward license plate detection + OCR...")
     t = threading.Thread(
@@ -265,6 +279,7 @@ def dispatch_license_plate_rois(roi_items, vehicle_history, profiler=None):
     )
     _plate_thread = t
     t.start()
+    return True
 
 
 def legal_license_plate(plate_number):
@@ -278,4 +293,6 @@ def get_plate_number(vehicle_history, id):
     # 渲染階段讀取已辨識車牌；尚未辨識則顯示 Unknown。
     if vehicle_history.get(id, {}).get('license_plate') is not None:
         return vehicle_history[id]['license_plate']['number']
+    if vehicle_history.get(id, {}).get('plate_search_until_found', False):
+        return "PlateSearching"
     return "Unknown"

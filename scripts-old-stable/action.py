@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# STGCN++ 動作辨識模組：從 person bbox 對應 pose keypoints，累積序列後判斷 normal/littering。
+# STGCN++ 動作辨識模組：從 person bbox 對應 pose keypoints，累積序列後判斷 normal/littering/urination。
 import os
 import sys
 import traceback
@@ -9,6 +9,15 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 from timeUtils import profile_block
+
+
+ACTION_CLASSES = {0: "normal", 1: "littering", 2: "urination"}
+VIOLATION_ACTIONS = {"littering", "urination"}
+
+
+def _add_stat(stats, key, amount=1):
+    if stats is not None:
+        stats[key] = stats.get(key, 0) + amount
 
 
 def _int_env(name, default):
@@ -71,7 +80,7 @@ class STGCNActionModule:
         pose_model_path,
         stgcn_weight_path,
         stgcn_config_path,
-        # STGCN 判定為 littering 後，conf 需 >= 0.5（預設值）才會啟動違規警報。
+        # STGCN 判定為 littering/urination 後，conf 需 >= 0.5（預設值）才會啟動違規警報。
         action_threshold=0.5,
         track_iou_threshold=0.2,
         window_size=25,
@@ -96,21 +105,50 @@ class STGCNActionModule:
         self.alert_counter = {}
         self.last_action = {}
         self._logged_error = False
-        self.action_classes = {0: "normal", 1: "littering"}
+        self.action_classes = dict(ACTION_CLASSES)
+        self.violation_actions = set(VIOLATION_ACTIONS)
 
         self.model = None
         self.pose_model = None
+        self.pose_model_path = None
+        if isinstance(pose_model_path, (list, tuple)):
+            self.pose_model_candidates = [str(path) for path in pose_model_path if path]
+        else:
+            self.pose_model_candidates = [str(pose_model_path)] if pose_model_path else []
+        self._pose_candidate_index = 0
         self.inference_skeleton = None
         self.loaded = False
         self._load_stgcn(stgcn_weight_path, stgcn_config_path, profiler=profiler)
         if self.loaded:
             # STGCN 成功後才載入 pose model，避免 action 不可用時浪費額外模型成本。
+            if not self._load_pose_model(start_index=0, profiler=profiler):
+                self.loaded = False
+
+    def _load_pose_model(self, start_index=0, profiler=None):
+        # TensorRT engine 若不可用，依候選順序自動回退到 .pt，避免加速失敗時整個 action 掛掉。
+        last_error = None
+        for idx in range(int(start_index), len(self.pose_model_candidates)):
+            pose_model_path = self.pose_model_candidates[idx]
             try:
+                if idx > int(start_index):
+                    print(f"YOLO pose model retry fallback: {pose_model_path}")
                 with profile_block(profiler, "model_load.pose_yolo"):
                     self.pose_model = YOLO(pose_model_path)
+                self.pose_model_path = pose_model_path
+                self._pose_candidate_index = idx
+                print(f"YOLO pose model loaded: {pose_model_path}")
+                return True
             except Exception as e:
-                self.loaded = False
-                print(f"YOLO pose model load failed: {e}")
+                last_error = e
+                print(f"YOLO pose model load failed: {pose_model_path}: {e}")
+
+        self.pose_model = None
+        self.pose_model_path = None
+        if last_error is not None:
+            print(f"YOLO pose model load failed for all candidates: {last_error}")
+        else:
+            print("YOLO pose model load failed: no candidate path")
+        return False
 
     def _load_stgcn(self, weight_path, config_path, profiler=None):
         # 載入 MMACTION2 recognizer；若缺檔或 import 失敗，action 自動退回 normal。
@@ -183,11 +221,20 @@ class STGCNActionModule:
         except Exception:
             return None
 
-    def _predict_action(self, skeleton_sequence, profiler=None, profile_name="action.stgcn_predict"):
+    def _predict_action(
+        self,
+        skeleton_sequence,
+        img_shape=None,
+        profiler=None,
+        profile_name="action.stgcn_predict",
+    ):
         # 將骨架序列轉成 MMACTION2 inference_skeleton 格式並取得分類分數。
         if not self.loaded or self.model is None:
             return "normal", 0.0
         try:
+            if img_shape is None:
+                img_shape = (1080, 1920)
+            img_shape = (int(img_shape[0]), int(img_shape[1]))
             active_profiler = profiler if profiler is not None else self.profiler
             with profile_block(active_profiler, profile_name):
                 pose_results = []
@@ -198,7 +245,7 @@ class STGCNActionModule:
                             "keypoint_scores": skeleton_sequence[i : i + 1, :, 2].astype(np.float32),
                         }
                     )
-                result = self.inference_skeleton(self.model, pose_results, img_shape=(1080, 1920))
+                result = self.inference_skeleton(self.model, pose_results, img_shape=img_shape)
                 pred_score = result.pred_score.detach().cpu().numpy()
                 action_idx = int(np.argmax(pred_score))
                 conf = float(pred_score[action_idx])
@@ -234,15 +281,22 @@ class STGCNActionModule:
                 dummy_skeleton = np.zeros((self.window_size, 17, 3), dtype=np.float32)
                 self._predict_action(
                     dummy_skeleton,
+                    img_shape=dummy_frame.shape[:2],
                     profiler=active_profiler,
                     profile_name="model_warmup.stgcn_predict",
                 )
             print("STGCN action module warmed up.")
         except Exception as exc:
+            next_index = int(self._pose_candidate_index) + 1
+            if next_index < len(self.pose_model_candidates):
+                print(f"STGCN pose warmup failed on {self.pose_model_path}; retry fallback: {exc}")
+                if self._load_pose_model(start_index=next_index, profiler=active_profiler):
+                    self.warmup(profiler=active_profiler)
+                    return
             self.loaded = False
             print(f"STGCN action module warmup failed; action disabled: {exc}")
 
-    def update(self, frame, persons, profiler=None):
+    def update(self, frame, persons, profiler=None, stats=None):
         """
         persons：格式為 {'box': xyxy, 'track_id': int, ...} 的 list。
         回傳：{track_id: {'action': str, 'conf': float, 'stgcn_conf': float, 'alert': bool}}。
@@ -254,8 +308,10 @@ class STGCNActionModule:
             self.frame_index += 1
             if not persons:
                 return action_map
+            _add_stat(stats, "stgcn_person_frames", len(persons))
             if not self.loaded or self.model is None or self.pose_model is None:
                 # action 模組不可用時仍回傳 normal 結果，讓主流程不用分支處理。
+                _add_stat(stats, "stgcn_disabled_frames")
                 for person in persons:
                     track_id = person.get("track_id")
                     if track_id is None or int(track_id) < 0:
@@ -287,6 +343,7 @@ class STGCNActionModule:
                 if pose_result is not None and pose_result.boxes is not None and len(pose_result.boxes) > 0:
                     for pxyxy in pose_result.boxes.xyxy:
                         pose_boxes.append([int(c) for c in pxyxy])
+            _add_stat(stats, "stgcn_pose_boxes", len(pose_boxes))
 
             with profile_block(active_profiler, "action.track_match_and_state"):
                 # 逐一更新每個 tracked person 的骨架序列與最近一次動作結果。
@@ -314,22 +371,31 @@ class STGCNActionModule:
                         skeleton = self._extract_skeleton(pose_result, best_idx)
                         if skeleton is not None:
                             self.track_history[track_id].append(skeleton)
+                            _add_stat(stats, "stgcn_pose_matches")
+                    else:
+                        _add_stat(stats, "stgcn_pose_unmatched")
 
                     should_predict = (
                         len(self.track_history[track_id]) == self.window_size and
                         (self.frame_index % self.predict_interval) == 0
                     )
+                    if len(self.track_history[track_id]) == self.window_size:
+                        _add_stat(stats, "stgcn_window_ready")
                     if should_predict:
                         # 序列滿窗且到達推理間隔時才跑 STGCN，降低每幀推理成本。
+                        _add_stat(stats, "stgcn_predict_calls")
                         with torch.inference_mode():
                             action, conf = self._predict_action(
                                 np.array(list(self.track_history[track_id])),
+                                img_shape=frame.shape[:2],
                                 profiler=active_profiler,
                             )
                             self.last_action[track_id] = (action, conf)
-                            # 違規成立門檻：模型動作必須是 littering，且 conf >= self.action_threshold。
-                            if action == "littering" and conf >= self.action_threshold:
+                            _add_stat(stats, f"stgcn_pred_{action}")
+                            # 違規成立門檻：模型動作必須是 littering/urination，且 conf >= self.action_threshold。
+                            if action in self.violation_actions and conf >= self.action_threshold:
                                 self.alert_counter[track_id] = self.alert_frames
+                                _add_stat(stats, "stgcn_alerts")
 
                     action, conf = self.last_action[track_id]
                     action_result = {

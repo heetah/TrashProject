@@ -12,7 +12,7 @@ class GlobalLitterTracker:
     def __init__(self, distance_threshold=250):
         # active_litters 保存仍在追蹤中的垃圾；violators 保存已確認違規者與顯示 TTL。
         self.active_litters = {}
-        # violators 結構：{(類別, track_id): {'ttl': int, 'center': (x, y)}}。
+        # violators 結構：{(類別, track_id): {'ttl': int, 'center': (x, y), 'action': str}}。
         self.violators = {}
         self.next_id = 0
         self.distance_threshold = distance_threshold
@@ -51,6 +51,8 @@ class GlobalLitterTracker:
         self.backward_score_limit = 2.30
         self.backward_release_score_limit = 3.60
         self.backward_plate_roi_per_result = 3
+        # STGCN 判定 person 違規時，往回看 actor history 找曾經重疊的 vehicle/scooter。
+        self.action_vehicle_backtrack_frames = 90
         self.actor_frame_history = deque(maxlen=self.backward_actor_history_len)
         self.backward_plate_roi_items = []
         self._actor_history_lock = threading.Lock()
@@ -66,7 +68,8 @@ class GlobalLitterTracker:
         self._backward_thread.start()
         self._fallback_frame_index = 0
 
-    def update(self, detected_litters, actors, person_vehicle_map=None, frame_index=None, frame=None):
+    def update(self, detected_litters, actors, person_vehicle_map=None, frame_index=None,
+               frame=None, vehicle_history=None):
         # 主更新流程：接收本幀通過前處理的 litter，更新軌跡與違規者集合。
         if frame_index is None:
             frame_index = self._fallback_frame_index
@@ -74,13 +77,25 @@ class GlobalLitterTracker:
         frame_index = int(frame_index)
 
         self._record_actor_frame(actors, frame_index, frame=frame)
-        self._drain_backward_results()
+        self._drain_backward_results(vehicle_history=vehicle_history)
 
         if person_vehicle_map:
             for p_id, vehicle_key_or_id in person_vehicle_map.items():
                 self.person_to_vehicle_history[int(p_id)] = self._normalize_vehicle_like_key(vehicle_key_or_id)
 
         for actor_key in list(self.violators.keys()):
+            v_data = self.violators[actor_key]
+            if (
+                v_data.get('until_plate_found', False) and
+                actor_key[0] in ('vehicle', 'scooter') and
+                vehicle_history is not None
+            ):
+                plate_entry = vehicle_history.get(actor_key[1], {})
+                if plate_entry.get('license_plate') is None:
+                    v_data['ttl'] = max(v_data.get('ttl', 0), self.confirmed_violator_ttl)
+                    continue
+                v_data['until_plate_found'] = False
+
             self.violators[actor_key]['ttl'] -= 1
             if self.violators[actor_key]['ttl'] <= 0:
                 del self.violators[actor_key]
@@ -214,7 +229,12 @@ class GlobalLitterTracker:
                                     current_actor_center = self._actor_center(actor)
                                     break
                                     
-                            self._mark_violator(thrower_key, current_actor_center, ttl=self.confirmed_violator_ttl)
+                            self._mark_violator(
+                                thrower_key,
+                                current_actor_center,
+                                ttl=self.confirmed_violator_ttl,
+                                action='littering',
+                            )
 
                             cls_name, track_id = thrower_key
                             if cls_name == 'person' and track_id in self.person_to_vehicle_history:
@@ -228,7 +248,12 @@ class GlobalLitterTracker:
                                         break
                                         
                                 # 同時將該車輛標記為違規！(讓畫面畫紅框並抓取車牌)
-                                self._mark_violator(veh_key, veh_center, ttl=self.confirmed_violator_ttl)
+                                self._mark_violator(
+                                    veh_key,
+                                    veh_center,
+                                    ttl=self.confirmed_violator_ttl,
+                                    action='littering',
+                                )
                 
                 new_active_litters[best_id] = {
                     'bbox': litter_box, 
@@ -329,6 +354,8 @@ class GlobalLitterTracker:
                     'ttl': v_data.get('ttl', self.confirmed_violator_ttl),
                     'center': rebound_center,
                     'missed': 0,
+                    'until_plate_found': bool(v_data.get('until_plate_found', False)),
+                    'action': v_data.get('action'),
                 }
                 self.violators[rebound_key] = rebound_data
                 if rebound_key != violator_key:
@@ -361,6 +388,17 @@ class GlobalLitterTracker:
             items = list(self.backward_plate_roi_items)
             self.backward_plate_roi_items.clear()
         return items
+
+    def restore_backward_plate_roi_items(self, items):
+        # OCR worker 忙碌時不可丟掉 backward 歷史 ROI；留到下一幀再派工。
+        if not items:
+            return
+        with self._backward_plate_lock:
+            self.backward_plate_roi_items = list(items) + list(self.backward_plate_roi_items)
+
+    def get_violator_info(self, actor_key):
+        # detect.py 讀取 backward resolver 附加狀態，例如車牌遮擋時的無限警示。
+        return dict(self.violators.get(actor_key, {}))
 
     def _record_actor_frame(self, actors, frame_index, frame=None):
         # 每幀保留 actor 快照。confirmed 延遲出現時，backward worker 可回看出生幀附近。
@@ -560,6 +598,12 @@ class GlobalLitterTracker:
             best_key if best_key[0] in ('vehicle', 'scooter') else None
         )
 
+        plate_roi_items = self._plate_roi_items_for_key(
+            plate_key,
+            task.get('actor_frames', []),
+            birth_frame,
+        ) if plate_key is not None else []
+
         return {
             'litter_id': int(task.get('litter_id')),
             'actor_key': best_key,
@@ -567,11 +611,9 @@ class GlobalLitterTracker:
             'birth_frame': birth_frame,
             'confirm_frame': int(task.get('confirm_frame', birth_frame)),
             'mark_items': mark_items,
-            'plate_roi_items': self._plate_roi_items_for_key(
-                plate_key,
-                task.get('actor_frames', []),
-                birth_frame,
-            ) if plate_key is not None else [],
+            'plate_key': plate_key,
+            'plate_roi_items': plate_roi_items,
+            'plate_blocked_since_litter': plate_key is not None and not plate_roi_items,
         }
 
     def _score_backward_actor(self, actor, birth_anchor, birth_world,
@@ -623,7 +665,7 @@ class GlobalLitterTracker:
 
         return score, release_like
 
-    def _drain_backward_results(self):
+    def _drain_backward_results(self, vehicle_history=None):
         # worker 結果只能在 main/update thread 套用，避免 shared dict 競爭。
         while True:
             try:
@@ -649,11 +691,33 @@ class GlobalLitterTracker:
                     'confirm_frame': result.get('confirm_frame'),
                 }
 
+            plate_key = result.get('plate_key')
+            plate_blocked_since_litter = bool(result.get('plate_blocked_since_litter', False))
+
+            if (
+                plate_blocked_since_litter and
+                plate_key is not None and
+                plate_key[0] in ('vehicle', 'scooter') and
+                vehicle_history is not None
+            ):
+                plate_entry = vehicle_history[plate_key[1]]
+                if plate_entry.get('license_plate') is None:
+                    plate_entry['plate_search_until_found'] = True
+                    plate_entry['plate_blocked_since_litter'] = True
+                    plate_entry['plate_search_birth_frame'] = result.get('birth_frame')
+                    plate_entry['plate_search_litter_id'] = litter_id
+
             for mark in result.get('mark_items', []):
+                mark_key = mark.get('actor_key')
                 self._mark_violator(
-                    mark.get('actor_key'),
+                    mark_key,
                     mark.get('center'),
                     ttl=self.confirmed_violator_ttl,
+                    until_plate_found=(
+                        plate_blocked_since_litter and
+                        mark_key == plate_key
+                    ),
+                    action='littering',
                 )
 
             plate_items = result.get('plate_roi_items') or []
@@ -741,8 +805,96 @@ class GlobalLitterTracker:
                     return items
         return items
 
-    def register_action_violators(self, person_action_map, actors, person_vehicle_map=None, ttl=None):
-        # STGCN 旁路：動作模型已判定 littering 時，直接註冊 person 與其對應車輛。
+    def _action_actor_frames(self, frame_index=None):
+        # STGCN action 沒有 litter birth frame；用最近一段 actor ring buffer 反查人車關聯。
+        with self._actor_history_lock:
+            if not self.actor_frame_history:
+                return []
+            latest_frame = (
+                int(frame_index)
+                if frame_index is not None
+                else int(self.actor_frame_history[-1].get('frame_index', 0))
+            )
+            start_frame = latest_frame - int(self.action_vehicle_backtrack_frames)
+            return [
+                {
+                    'frame_index': item['frame_index'],
+                    'actors': [dict(actor) for actor in item.get('actors', [])],
+                }
+                for item in self.actor_frame_history
+                if start_frame <= int(item.get('frame_index', -1)) <= latest_frame
+            ]
+
+    def _find_action_vehicle_for_person(self, person_id, actor_frames):
+        # 從最新幀往前找同一 person 曾經重疊過的 vehicle/scooter。
+        person_key = ('person', int(person_id))
+        fallback_person_center = None
+
+        for frame_snapshot in sorted(
+            actor_frames,
+            key=lambda item: int(item.get('frame_index', -1)),
+            reverse=True,
+        ):
+            frame_actors = frame_snapshot.get('actors', [])
+            person_center = self._snapshot_center_for_key(person_key, frame_actors)
+            if person_center is not None and fallback_person_center is None:
+                fallback_person_center = person_center
+
+            vehicle_key = self._linked_vehicle_key(person_key, frame_actors)
+            if vehicle_key is None:
+                continue
+
+            vehicle_center = (
+                self._snapshot_center_for_key(vehicle_key, frame_actors) or
+                person_center or
+                fallback_person_center
+            )
+            return vehicle_key, vehicle_center, fallback_person_center
+
+        return None, None, fallback_person_center
+
+    def _queue_action_vehicle_plate_lookup(self, vehicle_key, actor_frames, frame_index, vehicle_history=None):
+        # 歷史 vehicle/scooter 不一定還在當前畫面；若有歷史 ROI，直接交給車牌 OCR。
+        if vehicle_key is None or vehicle_key[0] not in ('vehicle', 'scooter'):
+            return
+
+        history_entry = None
+        if vehicle_history is not None:
+            history_entry = vehicle_history[vehicle_key[1]]
+            if history_entry.get('stgcn_action_plate_submitted', False):
+                return
+            if history_entry.get('license_plate') is not None:
+                return
+
+        plate_items = self._plate_roi_items_for_key(
+            vehicle_key,
+            actor_frames,
+            int(frame_index) if frame_index is not None else 0,
+        )
+        if plate_items:
+            with self._backward_plate_lock:
+                self.backward_plate_roi_items.extend(plate_items)
+
+        if history_entry is not None:
+            history_entry['stgcn_action_plate_submitted'] = True
+            history_entry['plate_search_until_found'] = True
+            history_entry['plate_search_source'] = 'stgcn_action_backtrack'
+            history_entry['plate_search_birth_frame'] = frame_index
+            history_entry['plate_blocked_since_litter'] = history_entry.get(
+                'plate_blocked_since_litter',
+                False,
+            ) or not bool(plate_items)
+
+    def register_action_violators(
+        self,
+        person_action_map,
+        actors,
+        person_vehicle_map=None,
+        ttl=None,
+        frame_index=None,
+        vehicle_history=None,
+    ):
+        # STGCN 旁路：動作模型已判定違規動作時，直接註冊 person，並反追蹤其 vehicle/scooter。
         if not person_action_map:
             return set()
 
@@ -754,11 +906,16 @@ class GlobalLitterTracker:
         actor_center_map = {}
         for actor in actors:
             actor_center_map[self._actor_key(actor)] = self._actor_center(actor)
+        action_actor_frames = self._action_actor_frames(frame_index)
 
         marked_violators = set()
         for raw_person_id, action_info in person_action_map.items():
             if not isinstance(action_info, dict) or not action_info.get('alert', False):
                 continue
+
+            action_name = str(action_info.get('action', '')).strip().lower()
+            if action_name not in ('littering', 'urination'):
+                action_name = None
 
             try:
                 person_id = int(raw_person_id)
@@ -767,10 +924,15 @@ class GlobalLitterTracker:
 
             person_key = ('person', person_id)
             person_center = actor_center_map.get(person_key)
+            historical_vehicle_key, historical_vehicle_center, historical_person_center = (
+                self._find_action_vehicle_for_person(person_id, action_actor_frames)
+            )
+            if person_center is None:
+                person_center = historical_person_center
             if person_center is None:
                 continue
 
-            self._mark_violator(person_key, person_center, ttl=ttl)
+            self._mark_violator(person_key, person_center, ttl=ttl, action=action_name)
             marked_violators.add(person_key)
 
             vehicle_key = self.person_to_vehicle_history.get(person_id)
@@ -778,10 +940,23 @@ class GlobalLitterTracker:
                 vehicle_key = self._find_vehicle_for_person(person_id, actors)
                 if vehicle_key is not None:
                     self.person_to_vehicle_history[person_id] = vehicle_key
+            if vehicle_key is None and historical_vehicle_key is not None:
+                vehicle_key = historical_vehicle_key
+                self.person_to_vehicle_history[person_id] = vehicle_key
 
             if vehicle_key is not None:
-                vehicle_center = actor_center_map.get(vehicle_key, person_center)
-                self._mark_violator(vehicle_key, vehicle_center, ttl=ttl)
+                vehicle_center = actor_center_map.get(vehicle_key)
+                if vehicle_center is None and vehicle_key == historical_vehicle_key:
+                    vehicle_center = historical_vehicle_center
+                if vehicle_center is None:
+                    vehicle_center = person_center
+                self._mark_violator(vehicle_key, vehicle_center, ttl=ttl, action=action_name)
+                self._queue_action_vehicle_plate_lookup(
+                    vehicle_key,
+                    action_actor_frames,
+                    frame_index,
+                    vehicle_history=vehicle_history,
+                )
                 marked_violators.add(vehicle_key)
 
         return marked_violators
@@ -806,17 +981,28 @@ class GlobalLitterTracker:
         ax1, ay1, ax2, ay2 = actor['box']
         return ((ax1 + ax2) / 2.0, (ay1 + ay2) / 2.0)
 
-    def _mark_violator(self, actor_key, center, ttl):
+    def _mark_violator(self, actor_key, center, ttl, until_plate_found=False, action=None):
         # 寫入或延長違規者 TTL；center 用來避免 ID 重用造成誤標。
         if actor_key is None:
             return
 
         prev = self.violators.get(actor_key)
         if prev is None:
-            self.violators[actor_key] = {'ttl': ttl, 'center': center, 'missed': 0}
+            self.violators[actor_key] = {
+                'ttl': ttl,
+                'center': center,
+                'missed': 0,
+                'until_plate_found': bool(until_plate_found),
+                'action': action,
+            }
             return
 
         prev['ttl'] = max(prev['ttl'], ttl)
+        prev['until_plate_found'] = (
+            bool(prev.get('until_plate_found', False)) or bool(until_plate_found)
+        )
+        if action:
+            prev['action'] = action
         if center is not None:
             prev['center'] = center
         prev['missed'] = 0
