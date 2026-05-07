@@ -851,6 +851,12 @@ def main():
 
         temp_output_path = os.path.join(output_dir, f"temp_{args.file}")
         output_path = os.path.join(output_dir, f"detection_{args.file}")
+        temp_output_parent = os.path.dirname(temp_output_path)
+        output_parent = os.path.dirname(output_path)
+        if temp_output_parent:
+            os.makedirs(temp_output_parent, exist_ok=True)
+        if output_parent:
+            os.makedirs(output_parent, exist_ok=True)
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))

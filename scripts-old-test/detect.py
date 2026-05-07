@@ -500,6 +500,7 @@ def detect(frame, model_bbox, model_trash,
             # 從 tracker 取最近上一幀中心，供 holding 判斷相對位移與釋放方向。
             prev_litter_center = None
             prev_litter_missed = None
+            prev_litter_history = None
             min_prev_dist = float('inf')
             curr_center = ((lx1 + lx2) / 2.0, (ly1 + ly2) / 2.0)
             for l_data in litter_tracker.active_litters.values():
@@ -515,6 +516,7 @@ def detect(frame, model_bbox, model_trash,
                     min_prev_dist = dist
                     prev_litter_center = prev_center
                     prev_litter_missed = int(l_data.get('missed', 0))
+                    prev_litter_history = list(l_data.get('history', []))
 
             # 新出現目標先進 tracker 建立一個 history anchor；第二幀起才能判斷它
             # 是否相對車輛真的往下分離，避免把 resize.mp4 這類剛丟出的垃圾第一點擋掉。
@@ -527,6 +529,7 @@ def detect(frame, model_bbox, model_trash,
                 tracking_objects,
                 prev_litter_center=prev_litter_center,
                 prev_litter_missed=prev_litter_missed,
+                prev_litter_history=prev_litter_history,
                 vehicle_history=vehicle_history,
             )
             if is_holding_like:

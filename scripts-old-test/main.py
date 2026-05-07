@@ -770,7 +770,7 @@ if __name__ == "__main__":
                         help="IoU threshold for actor ids when --actor-mode predict")
     parser.add_argument("--extreme-speed-off", action="store_true",
                         help="Disable default fast detector path and keep actor track plus RTDETR zero repair behavior")
-    parser.add_argument("--rtdetr-zero-repair", choices=("adjacent", "off", "all"), default="adjacent",
+    parser.add_argument("--rtdetr-zero-repair", choices=("adjacent", "off", "all"), default="all",
                         help="RTDETR batch mixed-zero repair: adjacent balances speed/recall, off is fastest, all keeps old behavior")
     parser.add_argument("--bbox-conf", type=float, default=0.45, help="YOLO-seg actor confidence threshold")
     parser.add_argument("--trash-conf", type=float, default=0.4, help="RTDETR litter confidence threshold")

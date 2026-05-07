@@ -272,6 +272,53 @@ def _same_actor(prev_actor_id, cls_name, track_id):
         return False
 
 
+def _motion_points(prev_litter_history, prev_litter_center, current_point):
+    # holding release 需要軌跡形狀；支援「先往上拋、再往下落」。
+    points = []
+    for point in prev_litter_history or []:
+        resolved = _resolve_litter_anchor(point)
+        if resolved is not None:
+            points.append(resolved)
+
+    prev_center = _resolve_litter_anchor(prev_litter_center)
+    if prev_center is not None:
+        if not points or math.hypot(points[-1][0] - prev_center[0], points[-1][1] - prev_center[1]) >= 0.75:
+            points.append(prev_center)
+
+    curr = _resolve_litter_anchor(current_point)
+    if curr is not None:
+        if not points or math.hypot(points[-1][0] - curr[0], points[-1][1] - curr[1]) >= 0.75:
+            points.append(curr)
+    return points
+
+
+def _has_up_then_down_release(points, min_vertical, min_horizontal, min_motion):
+    # y 越小代表越上方；最高點若出現在中間，且後段往下，視為拋物線 release。
+    if points is None or len(points) < 3:
+        return False
+
+    start = points[0]
+    end = points[-1]
+    highest_idx = min(range(len(points)), key=lambda idx: float(points[idx][1]))
+    if highest_idx <= 0 or highest_idx >= len(points) - 1:
+        return False
+
+    highest = points[highest_idx]
+    upward_disp = float(start[1]) - float(highest[1])
+    downward_disp = float(end[1]) - float(highest[1])
+    horizontal_disp = abs(float(end[0]) - float(start[0]))
+    path_motion = 0.0
+    for prev, curr in zip(points, points[1:]):
+        path_motion += math.hypot(float(curr[0]) - float(prev[0]), float(curr[1]) - float(prev[1]))
+
+    return (
+        upward_disp >= float(min_vertical) and
+        downward_disp >= float(min_vertical) and
+        horizontal_disp >= float(min_horizontal) and
+        path_motion >= float(min_motion)
+    )
+
+
 def litter_holding(litter_box, actors, prev_actor_id=None,
                    person_dist_threshold=55.0,
                    vehicle_dist_threshold=90.0,
@@ -280,6 +327,7 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
                    min_mask_overlap_for_vehicle_distance=0.08,
                    prev_litter_center=None,
                    prev_litter_missed=None,
+                   prev_litter_history=None,
                    vehicle_history=None,
                    person_mask_dilation_px=10.0,
                    vehicle_mask_dilation_px=16.0,
@@ -330,6 +378,7 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
         # 垃圾靜止特徵：X 與 Y 軸位移極小
         if abs(litter_vx) < 1.0 and abs(litter_vy) < 1.0:
             is_litter_static = True
+    litter_motion_points = _motion_points(prev_litter_history, prev_litter_center, anchor_point)
     best_actor_key = None
     best_distance = float('inf')
 
@@ -363,17 +412,44 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
             relative_vy = litter_vy - veh_vy
             relative_motion = math.hypot(relative_vx, relative_vy)
             abs_litter_motion = math.hypot(litter_vx, litter_vy)
-            is_absolute_release_motion = (
+            is_absolute_downward_release_motion = (
                 prev_litter_center is not None and
                 litter_vy >= float(vehicle_release_abs_downward_threshold) and
                 abs(litter_vx) >= float(vehicle_release_abs_horizontal_threshold) and
                 abs_litter_motion >= float(vehicle_release_abs_motion_threshold)
             )
-            is_relative_release_motion = (
+            is_absolute_upward_release_motion = (
+                prev_litter_center is not None and
+                litter_vy <= -float(vehicle_release_abs_downward_threshold) and
+                abs(litter_vx) >= float(vehicle_release_abs_horizontal_threshold) and
+                abs_litter_motion >= float(vehicle_release_abs_motion_threshold)
+            )
+            is_absolute_arc_release_motion = _has_up_then_down_release(
+                litter_motion_points,
+                min_vertical=vehicle_release_abs_downward_threshold,
+                min_horizontal=vehicle_release_abs_horizontal_threshold,
+                min_motion=vehicle_release_abs_motion_threshold,
+            )
+            is_absolute_release_motion = (
+                is_absolute_downward_release_motion or
+                is_absolute_upward_release_motion or
+                is_absolute_arc_release_motion
+            )
+            is_relative_downward_release_motion = (
                 prev_litter_center is not None and
                 relative_vy >= float(vehicle_release_downward_threshold) and
                 abs(relative_vx) >= float(vehicle_release_horizontal_threshold) and
                 relative_motion >= float(vehicle_release_relative_motion_threshold)
+            )
+            is_relative_upward_release_motion = (
+                prev_litter_center is not None and
+                relative_vy <= -float(vehicle_release_downward_threshold) and
+                abs(relative_vx) >= float(vehicle_release_horizontal_threshold) and
+                relative_motion >= float(vehicle_release_relative_motion_threshold)
+            )
+            is_relative_release_motion = (
+                is_relative_downward_release_motion or
+                is_relative_upward_release_motion
             )
             is_vehicle_release_motion = is_relative_release_motion or is_absolute_release_motion
 
@@ -478,19 +554,29 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
                 )
                 is_strong_relative_side_release = (
                     prev_litter_center is not None and
-                    relative_vy >= float(vehicle_release_strong_side_downward_threshold) and
+                    abs(relative_vy) >= float(vehicle_release_strong_side_downward_threshold) and
                     abs(relative_vx) >= float(vehicle_release_strong_side_horizontal_threshold) and
                     relative_motion >= float(vehicle_release_strong_side_motion_threshold)
                 )
                 is_strong_absolute_side_release = (
                     prev_litter_center is not None and
-                    litter_vy >= float(vehicle_release_strong_side_downward_threshold) and
+                    abs(litter_vy) >= float(vehicle_release_strong_side_downward_threshold) and
                     abs(litter_vx) >= float(vehicle_release_strong_side_horizontal_threshold) and
                     abs_litter_motion >= float(vehicle_release_strong_side_motion_threshold)
                 )
+                is_strong_arc_side_release = _has_up_then_down_release(
+                    litter_motion_points,
+                    min_vertical=vehicle_release_strong_side_downward_threshold,
+                    min_horizontal=vehicle_release_strong_side_horizontal_threshold,
+                    min_motion=vehicle_release_strong_side_motion_threshold,
+                )
                 strong_side_release_motion = (
                     has_fresh_strong_side_anchor and
-                    (is_strong_relative_side_release or is_strong_absolute_side_release)
+                    (
+                        is_strong_relative_side_release or
+                        is_strong_absolute_side_release or
+                        is_strong_arc_side_release
+                    )
                 )
                 mask_aware_release_motion = (
                     (
@@ -508,7 +594,7 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
                     if norm_x is not None and (
                         norm_x <= float(vehicle_side_edge_ratio) or
                         norm_x >= (1.0 - float(vehicle_side_edge_ratio))
-                    ):
+                    ) and not mask_aware_release_motion:
                         return True, (cls_name, track_id)
 
                 is_lower_side_gap = (
