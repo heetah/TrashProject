@@ -914,7 +914,7 @@ class GlobalLitterTracker:
                 continue
 
             action_name = str(action_info.get('action', '')).strip().lower()
-            if action_name not in ('littering', 'urination'):
+            if action_name not in ('littering', 'urination', 'urinating'):
                 action_name = None
 
             try:

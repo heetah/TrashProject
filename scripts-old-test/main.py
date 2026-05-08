@@ -749,8 +749,12 @@ if __name__ == "__main__":
     parser.add_argument("--pose-model", default=POSE_MODEL_PATH, help="YOLO pose model path")
     parser.add_argument("--stgcn-weight", default=STGCN_WEIGHT_PATH, help="STGCN++ checkpoint path")
     parser.add_argument("--stgcn-config", default=STGCN_CONFIG_PATH, help="STGCN++ config path")
-    parser.add_argument("--action-threshold", type=float, default=0.5, help="littering action threshold")
+    parser.add_argument("--action-threshold", type=float, default=0.5, help="raw STGCN violation confidence threshold")
     parser.add_argument("--action-window", type=int, default=30, help="STGCN sequence window size")
+    parser.add_argument("--urination-window-sec", type=float, default=10.0,
+                        help="lookback seconds for sustained urination confirmation")
+    parser.add_argument("--urination-min-sec", type=float, default=8.0,
+                        help="required urination seconds inside --urination-window-sec before alert")
     parser.add_argument("--action-device", default=os.environ.get("ACTION_DEVICE"), help="ACTION_DEVICE override, e.g. cuda:0 or cpu")
     parser.add_argument("--action-predict-interval", type=int, default=None, help="run STGCN every N frames after the sequence window is full")
     parser.add_argument("--action-pose-imgsz", type=int, default=None, help="optional YOLO pose imgsz override")
@@ -824,6 +828,8 @@ if __name__ == "__main__":
                         choices=("auto", "h264_nvenc", "hevc_nvenc", "libx264"),
                         help="FFmpeg video encoder for annotated output")
     args = parser.parse_args()
+    if args.urination_min_sec > args.urination_window_sec:
+        parser.error("--urination-min-sec cannot be greater than --urination-window-sec")
     if not args.extreme_speed_off:
         args.actor_mode = "predict"
         args.rtdetr_zero_repair = "off"
@@ -896,6 +902,8 @@ if __name__ == "__main__":
                         stgcn_config_path=args.stgcn_config,
                         action_threshold=args.action_threshold,
                         window_size=args.action_window,
+                        urination_window_sec=args.urination_window_sec,
+                        urination_min_sec=args.urination_min_sec,
                         device=args.action_device,
                         profiler=profiler,
                     )
@@ -1180,6 +1188,7 @@ if __name__ == "__main__":
                 f"stgcn_predicts={detection_stats.get('stgcn_predict_calls', 0)}, "
                 f"stgcn_littering={detection_stats.get('stgcn_pred_littering', 0)}, "
                 f"stgcn_urination={detection_stats.get('stgcn_pred_urination', 0)}, "
+                f"stgcn_urination_confirmed={detection_stats.get('stgcn_urination_confirmed', 0)}, "
                 f"stgcn_alerts={detection_stats.get('stgcn_alerts', 0)}, "
                 f"stgcn_registered_violators={detection_stats.get('stgcn_registered_violators', 0)}"
             )

@@ -20,6 +20,7 @@ VEHICLE_LIKE_CLASSES = ('scooter', 'vehicle')
 ACTION_WARNING_LABELS = {
     'littering': 'LITTERING',
     'urination': 'URINATING',
+    'urinating': 'URINATING',
 }
 CLASS_ALIASES = {
     'motorcycle': 'scooter',
@@ -407,7 +408,7 @@ def detect(frame, model_bbox, model_trash,
     person_action_map = {}
     if action_module is not None:
         with profile_block(profiler, "detect.action_update"):
-            person_action_map = action_module.update(frame, persons, profiler=profiler, stats=stats)
+            person_action_map = action_module.update(frame, persons, fps=fps, profiler=profiler, stats=stats)
 
     filtererd_objects = []
 
