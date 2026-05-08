@@ -320,6 +320,30 @@ class STGCNActionModule:
     def _is_urination_action(self, action):
         return str(action or "").strip().lower() in self.urination_actions
 
+    @staticmethod
+    def _normalize_track_id_set(track_ids):
+        normalized = set()
+        if track_ids is None:
+            return normalized
+        for track_id in track_ids:
+            try:
+                normalized.add(int(track_id))
+            except (TypeError, ValueError):
+                continue
+        return normalized
+
+    def _clear_urination_state(self, track_id):
+        history = self.urination_history.get(track_id)
+        if history is not None:
+            history.clear()
+        self.urination_positive_counts[track_id] = 0
+        action, _ = self.last_action.get(track_id, ("normal", 0.0))
+        if self._is_urination_action(action):
+            self.last_action[track_id] = ("normal", 0.0)
+        if self.alert_action.get(track_id) == "urination":
+            self.alert_counter[track_id] = 0
+            self.alert_action[track_id] = None
+
     def _record_urination_evidence(self, track_id, action, conf, fps, stats=None):
         # urinating/urination 需在最近 10 秒內累積至少 8 秒 positive，避免單次 STGCN 閃爍誤報。
         fps_value = _safe_fps(fps)
@@ -351,13 +375,22 @@ class STGCNActionModule:
         )
         return confirmed, positive_sec, observed_sec
 
-    def update(self, frame, persons, fps=30.0, profiler=None, stats=None):
+    def update(
+        self,
+        frame,
+        persons,
+        fps=30.0,
+        blocked_urination_track_ids=None,
+        profiler=None,
+        stats=None,
+    ):
         """
         persons：格式為 {'box': xyxy, 'track_id': int, ...} 的 list。
         回傳：{track_id: {'action': str, 'conf': float, 'stgcn_conf': float, 'alert': bool}}。
         """
         # 每幀更新入口：追蹤每個 person 的骨架 history，視 interval 決定是否跑 STGCN。
         active_profiler = profiler if profiler is not None else self.profiler
+        blocked_urination_track_ids = self._normalize_track_id_set(blocked_urination_track_ids)
         with profile_block(active_profiler, "action.update_total"):
             action_map = {}
             self.frame_index += 1
@@ -417,6 +450,10 @@ class STGCNActionModule:
                         self.urination_history[track_id] = deque()
                         self.urination_positive_counts[track_id] = 0
 
+                    urination_blocked = track_id in blocked_urination_track_ids
+                    if urination_blocked:
+                        self._clear_urination_state(track_id)
+
                     best_idx = -1
                     best_iou = 0.0
                     for idx, pbox in enumerate(pose_boxes):
@@ -448,8 +485,11 @@ class STGCNActionModule:
                                 img_shape=frame.shape[:2],
                                 profiler=active_profiler,
                             )
-                            self.last_action[track_id] = (action, conf)
                             _add_stat(stats, f"stgcn_pred_{action}")
+                            if urination_blocked and self._is_urination_action(action):
+                                _add_stat(stats, "stgcn_urination_blocked_on_vehicle")
+                                action, conf = "normal", 0.0
+                            self.last_action[track_id] = (action, conf)
                             # littering 仍採即時門檻；urination 另走 10 秒內至少 8 秒的持續性確認。
                             if action == "littering" and conf >= self.action_threshold:
                                 self.alert_counter[track_id] = self.alert_frames

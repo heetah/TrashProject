@@ -7,7 +7,7 @@ import os
 from licensePlate import detect_license_plates, dispatch_license_plate_rois, get_plate_number
 from timeUtils import profile_block
 from smallFunction import (
-    calculate_iou_matrix,
+    calculate_iom_matrix,
     litter_holding,
     motion_evidence,
 )
@@ -392,14 +392,15 @@ def detect(frame, model_bbox, model_trash,
             # 將 vehicle 的 (cls, track_id) 組合成一個 list，方便後續建立對應關係
             detected_vehicle_keys = [(v['cls'], int(v['track_id'])) for v in vehicles]
 
-            # 計算所有 person 與 vehicle 之間的 IoU，得到一個 shape 為 (num_persons, num_vehicles) 的矩陣
-            iou_matrix = calculate_iou_matrix(person_boxes, vehicle_boxes)
+            # 計算所有 person 與 vehicle 之間的 IoM (Intersection over Minimum)
+            # 解決 IoU 在 person 完全包含在巨大 vehicle 框內時數值過低的問題
+            iom_matrix = calculate_iom_matrix(person_boxes, vehicle_boxes)
 
-            overlap_mask = np.any(iou_matrix > 0.2, axis=1)
+            overlap_mask = np.any(iom_matrix > 0.7, axis=1)
 
             for i, has_overlap in enumerate(overlap_mask):
                 if has_overlap:
-                    max_veh_idx = np.argmax(iou_matrix[i])
+                    max_veh_idx = np.argmax(iom_matrix[i])
                     person_vehicle_map[person_ids[i]] = detected_vehicle_keys[max_veh_idx]
 
     all_objects = persons + vehicles
@@ -408,7 +409,14 @@ def detect(frame, model_bbox, model_trash,
     person_action_map = {}
     if action_module is not None:
         with profile_block(profiler, "detect.action_update"):
-            person_action_map = action_module.update(frame, persons, fps=fps, profiler=profiler, stats=stats)
+            person_action_map = action_module.update(
+                frame,
+                persons,
+                fps=fps,
+                blocked_urination_track_ids=person_vehicle_map.keys(),
+                profiler=profiler,
+                stats=stats,
+            )
 
     filtererd_objects = []
 

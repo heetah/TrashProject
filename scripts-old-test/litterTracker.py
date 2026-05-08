@@ -32,9 +32,9 @@ class GlobalLitterTracker:
         self.confirmed_shape_change_ratio = 1.20
         # pending 轉 confirmed 的最低觀測幀數與位移條件
         self.min_confirm_age = 2
-        self.min_confirm_abs_displacement = 18.0
-        self.min_confirm_downward_displacement = 10.0
-        self.min_confirm_horizontal_displacement = 8.0
+        self.min_confirm_abs_displacement = 14.0
+        self.min_confirm_downward_displacement = 7.0
+        self.min_confirm_horizontal_displacement = 5.0
 
         self.person_to_vehicle_history = {}
         # 反追蹤 thrower 時，用車輛/機車 bbox 底邊點估計地面 homography，
@@ -511,6 +511,14 @@ class GlobalLitterTracker:
         if birth_anchor is None:
             return None
 
+        # 取得最後確認時的地面點，作為真實世界座標的基準 (避免空中的 birth_anchor 投影出錯)
+        ground_ref = task.get('current_bbox')
+        if ground_ref is None:
+            ground_ref = task.get('current_centroid')
+        ground_anchor = self._litter_ground_anchor(ground_ref)
+        if ground_anchor is None:
+            ground_anchor = birth_anchor
+
         history = task.get('history') or []
         prev_thrower_key = task.get('prev_thrower_key')
         birth_frame = int(task.get('birth_frame', 0))
@@ -526,10 +534,10 @@ class GlobalLitterTracker:
             if not actors:
                 continue
 
-            homography = self._estimate_ground_homography(actors, birth_anchor)
-            birth_world = self._project_point(birth_anchor, homography)
-            start_world = self._project_point(history[0], homography) if history else None
-            end_world = self._project_point(history[-1], homography) if history else None
+            homography = self._estimate_ground_homography(actors, ground_anchor)
+            ground_world = self._project_point(ground_anchor, homography)
+            start_2d = history[0] if history else None
+            end_2d = history[-1] if history else None
 
             for actor_snapshot in frame_snapshot.get('actors', []):
                 actor = self._snapshot_to_actor(actor_snapshot)
@@ -539,9 +547,9 @@ class GlobalLitterTracker:
                 score, release_like = self._score_backward_actor(
                     actor=actor,
                     birth_anchor=birth_anchor,
-                    birth_world=birth_world,
-                    start_world=start_world,
-                    end_world=end_world,
+                    ground_world=ground_world,
+                    start_2d=start_2d,
+                    end_2d=end_2d,
                     homography=homography,
                     history=history,
                     frame_index=frame_index,
@@ -616,11 +624,11 @@ class GlobalLitterTracker:
             'plate_blocked_since_litter': plate_key is not None and not plate_roi_items,
         }
 
-    def _score_backward_actor(self, actor, birth_anchor, birth_world,
-                              start_world, end_world, homography, history,
+    def _score_backward_actor(self, actor, birth_anchor, ground_world,
+                              start_2d, end_2d, homography, history,
                               frame_index, birth_frame, prev_thrower_key=None):
         cls_name = str(actor.get('cls', '')).lower()
-        if cls_name not in ('person', 'vehicle', 'scooter') or birth_world is None:
+        if cls_name not in ('person', 'vehicle', 'scooter') or ground_world is None:
             return None, False
 
         try:
@@ -635,8 +643,8 @@ class GlobalLitterTracker:
             return None, False
 
         world_dist = math.hypot(
-            birth_world[0] - actor_world[0],
-            birth_world[1] - actor_world[1],
+            ground_world[0] - actor_world[0],
+            ground_world[1] - actor_world[1],
         )
         world_width = self._projected_actor_width((ax1, ay1, ax2, ay2), homography)
         if cls_name in ('vehicle', 'scooter'):
@@ -647,20 +655,26 @@ class GlobalLitterTracker:
             origin_margin = max(75.0, (ax2 - ax1) * 1.25, (ay2 - ay1) * 0.45)
 
         score = world_dist / max(threshold, 1e-6)
+        
+        box_dist = self._point_to_box_distance(birth_anchor, actor['box'])
+        if box_dist == 0.0:
+            score = min(score, 1.8)
+
         if actor_key == prev_thrower_key:
             score *= self.thrower_previous_bonus
 
-        if start_world is not None and end_world is not None:
-            score *= self._trajectory_direction_factor(actor_world, start_world, end_world)
+        if start_2d is not None and end_2d is not None:
+            score *= self._trajectory_direction_factor_2d(actor_anchor, start_2d, end_2d)
 
         frame_gap = abs(int(frame_index) - int(birth_frame))
         score *= (1.0 + min(frame_gap, 45) * 0.025)
 
         release_like = self._release_origin_near_actor(history, actor)
         if release_like:
+            score = min(score, 2.2)
             score *= 0.82
 
-        if self._point_to_box_distance(birth_anchor, actor['box']) <= origin_margin:
+        if box_dist <= origin_margin:
             score *= 0.88
 
         return score, release_like
@@ -1107,11 +1121,11 @@ class GlobalLitterTracker:
 
         homography = self._estimate_ground_homography(actors, litter_anchor)
         litter_world = self._project_point(litter_anchor, homography)
-        start_world = None
-        end_world = None
+        start_2d = None
+        end_2d = None
         if history and len(history) >= 2:
-            start_world = self._project_point(history[0], homography)
-            end_world = self._project_point(history[-1], homography)
+            start_2d = history[0]
+            end_2d = history[-1]
 
         for actor in actors:
             cls_name = str(actor.get('cls', '')).lower()
@@ -1138,15 +1152,30 @@ class GlobalLitterTracker:
             world_width = self._projected_actor_width((ax1, ay1, ax2, ay2), homography)
             if cls_name in ('vehicle', 'scooter'):
                 threshold = max(180.0, world_width * 0.75)
+                origin_margin = max(130.0, (ax2 - ax1) * 1.05, (ay2 - ay1) * 0.45)
             else:
                 threshold = max(90.0, world_width * 1.8)
+                origin_margin = max(75.0, (ax2 - ax1) * 1.25, (ay2 - ay1) * 0.45)
 
             score = world_dist / max(threshold, 1e-6)
+            
+            box_dist = self._point_to_box_distance(history[0], actor['box']) if history else self._point_to_box_distance(litter_anchor, actor['box'])
+            if box_dist == 0.0:
+                score = min(score, 1.8)
+
             if actor_key == prev_thrower_key:
                 score *= self.thrower_previous_bonus
 
-            if start_world is not None and end_world is not None:
-                score *= self._trajectory_direction_factor(actor_world, start_world, end_world)
+            if start_2d is not None and end_2d is not None:
+                score *= self._trajectory_direction_factor_2d(actor_anchor, start_2d, end_2d)
+                
+            release_like = self._release_origin_near_actor(history, actor)
+            if release_like:
+                score = min(score, 2.2)
+                score *= 0.82
+
+            if box_dist <= origin_margin:
+                score *= 0.88
 
             if score < fallback_score:
                 fallback_score = score
@@ -1313,6 +1342,26 @@ class GlobalLitterTracker:
         # 軌跡方向若像是從 actor 往外離開，稍微降低該 actor 的 score。
         move_vec = (end_world[0] - start_world[0], end_world[1] - start_world[1])
         from_actor_vec = (start_world[0] - actor_world[0], start_world[1] - actor_world[1])
+        move_len = math.hypot(move_vec[0], move_vec[1])
+        actor_len = math.hypot(from_actor_vec[0], from_actor_vec[1])
+        if move_len < 1e-6 or actor_len < 1e-6:
+            return 1.0
+
+        cosine = (
+            move_vec[0] * from_actor_vec[0] +
+            move_vec[1] * from_actor_vec[1]
+        ) / (move_len * actor_len)
+        if cosine >= 0.25:
+            return 0.9
+        if cosine <= -0.25:
+            return 1.15
+        return 1.0
+
+    @staticmethod
+    def _trajectory_direction_factor_2d(actor_anchor, start_2d, end_2d):
+        # 使用 2D 影像座標計算軌跡方向，避免空中點投影後產生巨大誤差。
+        move_vec = (end_2d[0] - start_2d[0], end_2d[1] - start_2d[1])
+        from_actor_vec = (start_2d[0] - actor_anchor[0], start_2d[1] - actor_anchor[1])
         move_len = math.hypot(move_vec[0], move_vec[1])
         actor_len = math.hypot(from_actor_vec[0], from_actor_vec[1])
         if move_len < 1e-6 or actor_len < 1e-6:

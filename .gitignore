@@ -22,3 +22,4 @@ train.py
 yolo26n.pt
 skills-lock.json
 scripts-old-long/
+output.log

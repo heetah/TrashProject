@@ -1188,6 +1188,7 @@ if __name__ == "__main__":
                 f"stgcn_predicts={detection_stats.get('stgcn_predict_calls', 0)}, "
                 f"stgcn_littering={detection_stats.get('stgcn_pred_littering', 0)}, "
                 f"stgcn_urination={detection_stats.get('stgcn_pred_urination', 0)}, "
+                f"stgcn_urination_blocked_on_vehicle={detection_stats.get('stgcn_urination_blocked_on_vehicle', 0)}, "
                 f"stgcn_urination_confirmed={detection_stats.get('stgcn_urination_confirmed', 0)}, "
                 f"stgcn_alerts={detection_stats.get('stgcn_alerts', 0)}, "
                 f"stgcn_registered_violators={detection_stats.get('stgcn_registered_violators', 0)}"

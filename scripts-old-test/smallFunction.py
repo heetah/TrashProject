@@ -111,6 +111,39 @@ def calculate_iou_matrix(boxes1, boxes2):
 
     return inter_area / union_area
 
+def calculate_iom_matrix(boxes1, boxes2):
+    # 計算兩組 bbox 的 IoM (Intersection over Minimum) 矩陣，用於 person 與 vehicle 包含關係。
+    b1 = np.array(boxes1)
+    b2 = np.array(boxes2)
+
+    if len(b1) == 0 or len(b2) == 0:
+        return np.zeros((len(b1), len(b2)))
+    
+    # 擴張維度
+    b1 = np.expand_dims(b1, axis=1)
+    b2 = np.expand_dims(b2, axis=0)
+
+    # 計算重疊的左上 & 右下座標
+    xx1 = np.maximum(b1[..., 0], b2[..., 0])
+    yy1 = np.maximum(b1[..., 1], b2[..., 1])
+    xx2 = np.minimum(b1[..., 2], b2[..., 2])
+    yy2 = np.minimum(b1[..., 3], b2[..., 3])
+
+    # 計算重疊區域面積
+    w = np.maximum(0.0, xx2 - xx1)
+    h = np.maximum(0.0, yy2 - yy1)
+    inter_area = w * h
+
+    # 計算各自面積
+    area1 = (b1[..., 2] - b1[..., 0]) * (b1[..., 3] - b1[..., 1])
+    area2 = (b2[..., 2] - b2[..., 0]) * (b2[..., 3] - b2[..., 1])
+
+    # 計算 IoM: 分母為兩者中較小的面積
+    min_area = np.minimum(area1, area2)
+    min_area = np.maximum(min_area, 1e-6) # 避免除以 0
+
+    return inter_area / min_area
+
 
 def calculate_mask_overlap_ratio(litter_box, actor_mask_poly):
     # 計算 litter bbox 被 actor segmentation mask 覆蓋的比例，支援 polygon-aware holding。
@@ -335,12 +368,12 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
                    vehicle_relative_motion_threshold=12.0,
                    bbox_margin_px=8.0,
                    allow_distance_holding=True,
-                   vehicle_release_downward_threshold=15.0,
-                   vehicle_release_horizontal_threshold=12.0,
-                   vehicle_release_relative_motion_threshold=18.0,
-                   vehicle_release_abs_downward_threshold=10.0,
-                   vehicle_release_abs_horizontal_threshold=10.0,
-                   vehicle_release_abs_motion_threshold=18.0,
+                   vehicle_release_downward_threshold=8.0,
+                   vehicle_release_horizontal_threshold=6.0,
+                   vehicle_release_relative_motion_threshold=10.0,
+                   vehicle_release_abs_downward_threshold=6.0,
+                   vehicle_release_abs_horizontal_threshold=6.0,
+                   vehicle_release_abs_motion_threshold=10.0,
                    vehicle_release_min_mask_gap_px=8.0,
                    vehicle_release_max_mask_overlap=0.08,
                    vehicle_release_lower_edge_ratio=0.90,
@@ -375,8 +408,8 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
     if prev_litter_center is not None:
         litter_vx = lc_x - float(prev_litter_center[0])
         litter_vy = lc_y - float(prev_litter_center[1])
-        # 垃圾靜止特徵：X 與 Y 軸位移極小
-        if abs(litter_vx) < 1.0 and abs(litter_vy) < 1.0:
+        # 垃圾靜止特徵：X 與 Y 軸位移極小 (容忍 YOLO BBox 正常抖動約 2-4 px)
+        if abs(litter_vx) < 3.5 and abs(litter_vy) < 3.5:
             is_litter_static = True
     litter_motion_points = _motion_points(prev_litter_history, prev_litter_center, anchor_point)
     best_actor_key = None
