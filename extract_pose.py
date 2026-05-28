@@ -19,9 +19,10 @@ The output ``garbage_final.pkl`` follows MMACTION2 ``PoseDataset`` format:
     }
 
 Labels are intentionally aligned with scripts-old-test/action.py:
-0 = normal, 1 = littering, 2 = urination.
-The class-2 folder on disk may be named ``urinate`` while the exported label
-name stays ``urination`` for runtime compatibility.
+0 = normal, 1 = urinate.
+The class-1 folder on disk may be named ``urinate`` while the exported label
+name stays ``urinate`` to match the current runtime contract. Littering is
+intentionally not part of STGCN; it is handled by the litter tracker.
 """
 
 from __future__ import annotations
@@ -42,8 +43,7 @@ import numpy as np
 
 CLASS_SPECS = [
     {"folder": "normal", "label_name": "normal", "label": 0},
-    {"folder": "littering", "label_name": "littering", "label": 1},
-    {"folder": "urinate", "label_name": "urination", "label": 2},
+    {"folder": "urinate", "label_name": "urinate", "label": 1},
 ]
 
 LABEL_TO_ID = {
@@ -115,7 +115,9 @@ def collect_videos(dataset_dir: Path, limit: int | None = None) -> list[dict]:
 
 
 def filter_readable_videos(
-    samples: list[dict], dataset_dir: Path, skip_bad_videos: bool
+    samples: list[dict],
+    report_dir: Path,
+    skip_bad_videos: bool,
 ) -> list[dict]:
     readable = []
     failures = []
@@ -127,7 +129,8 @@ def filter_readable_videos(
             failures.append((sample["path"].as_posix(), repr(exc)))
 
     if failures:
-        failure_path = dataset_dir / "bad_videos.json"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        failure_path = report_dir / "bad_videos.json"
         failure_path.write_text(
             json.dumps(failures, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
@@ -371,7 +374,8 @@ def build_annotations(samples: list[dict], args: argparse.Namespace) -> list[dic
                 raise
 
     if failures:
-        failure_path = Path(args.dataset_dir) / "pose_extraction_failures.json"
+        failure_path = Path(args.out).parent / "pose_extraction_failures.json"
+        failure_path.parent.mkdir(parents=True, exist_ok=True)
         failure_path.write_text(
             json.dumps(failures, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
@@ -655,9 +659,10 @@ def main() -> None:
         raise ValueError("--shard-index must satisfy 0 <= shard-index < num-shards")
 
     samples = collect_videos(dataset_dir, limit=args.limit)
-    samples = filter_readable_videos(samples, dataset_dir, args.skip_bad_videos)
+    output_dir = out_path.parent
+    samples = filter_readable_videos(samples, output_dir, args.skip_bad_videos)
     train_ids, val_ids = build_stratified_split(samples, args.train_ratio, args.seed)
-    write_text_outputs(samples, train_ids, val_ids, dataset_dir, out_path, raw_out_path, args)
+    write_text_outputs(samples, train_ids, val_ids, output_dir, out_path, raw_out_path, args)
     print(
         f"Prepared lists: total={len(samples)}, train={len(train_ids)}, val={len(val_ids)}"
     )
@@ -698,7 +703,7 @@ def main() -> None:
             available_samples,
             available_train,
             available_val,
-            dataset_dir,
+            output_dir,
             out_path,
             raw_out_path,
             args,
