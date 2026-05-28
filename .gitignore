@@ -23,3 +23,13 @@ yolo26n.pt
 skills-lock.json
 scripts-old-long/
 output.log
+rtmw_test_image.py
+scripts-old-stable/tests/__init__.py
+scripts-old-stable/tests/test_detect_4c.py
+scripts-old-stable/tests/test_litter_tracker_4c.py
+scripts-old-stable/tests/test_pipeline_cases.py
+scripts-old-test/tests/__init__.py
+scripts-old-test/tests/test_detect_4c.py
+scripts-old-test/tests/test_litter_tracker_4c.py
+scripts-old-test/tests/test_pipeline_cases.py
+tests/test_litter_regression.py
