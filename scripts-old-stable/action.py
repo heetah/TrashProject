@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# STGCN++ 動作辨識模組：從 person bbox 對應 pose keypoints，累積序列後判斷 normal/littering/urination。
+# STGCN++ 動作辨識模組：從 person bbox 對應 pose keypoints，累積序列後只判斷 normal/urinate。
 import os
 import sys
 import traceback
@@ -11,8 +11,9 @@ from ultralytics import YOLO
 from timeUtils import profile_block
 
 
-ACTION_CLASSES = {0: "normal", 1: "littering", 2: "urination"}
-VIOLATION_ACTIONS = {"littering", "urination"}
+ACTION_CLASSES = {0: "normal", 1: "urinate"}
+URINATION_ACTIONS = {"urinate", "urination", "urinating"}
+VIOLATION_ACTIONS = set(URINATION_ACTIONS)
 
 
 def _add_stat(stats, key, amount=1):
@@ -26,6 +27,16 @@ def _int_env(name, default):
         return int(os.environ.get(name, str(default)))
     except ValueError:
         return int(default)
+
+
+def _safe_fps(fps, default=30.0):
+    try:
+        fps_value = float(fps)
+    except (TypeError, ValueError):
+        fps_value = float(default)
+    if fps_value <= 0:
+        return float(default)
+    return fps_value
 
 
 def _can_use_half(device):
@@ -80,11 +91,13 @@ class STGCNActionModule:
         pose_model_path,
         stgcn_weight_path,
         stgcn_config_path,
-        # STGCN 判定為 littering/urination 後，conf 需 >= 0.5（預設值）才會啟動違規警報。
+        # STGCN 判定為 urinate 後，conf 需 >= 0.5（預設值）且累積滿時間才會啟動違規警報。
         action_threshold=0.5,
         track_iou_threshold=0.2,
         window_size=25,
         alert_frames=35,
+        urination_window_sec=10.0,
+        urination_min_sec=8.0,
         device=None,
         profiler=None,
     ):
@@ -99,14 +112,22 @@ class STGCNActionModule:
         self.track_iou_threshold = float(track_iou_threshold)
         self.window_size = int(window_size)
         self.alert_frames = int(alert_frames)
+        self.urination_window_sec = max(0.0, float(urination_window_sec))
+        self.urination_min_sec = max(0.0, float(urination_min_sec))
+        if self.urination_min_sec > self.urination_window_sec:
+            raise ValueError("urination_min_sec cannot exceed urination_window_sec")
         self.predict_interval = max(1, _int_env("ACTION_PREDICT_INTERVAL", 1))
         self.frame_index = 0
         self.track_history = {}
+        self.urination_history = {}
+        self.urination_positive_counts = {}
         self.alert_counter = {}
+        self.alert_action = {}
         self.last_action = {}
         self._logged_error = False
         self.action_classes = dict(ACTION_CLASSES)
         self.violation_actions = set(VIOLATION_ACTIONS)
+        self.urination_actions = set(URINATION_ACTIONS)
 
         self.model = None
         self.pose_model = None
@@ -296,13 +317,80 @@ class STGCNActionModule:
             self.loaded = False
             print(f"STGCN action module warmup failed; action disabled: {exc}")
 
-    def update(self, frame, persons, profiler=None, stats=None):
+    def _is_urination_action(self, action):
+        return str(action or "").strip().lower() in self.urination_actions
+
+    @staticmethod
+    def _normalize_track_id_set(track_ids):
+        normalized = set()
+        if track_ids is None:
+            return normalized
+        for track_id in track_ids:
+            try:
+                normalized.add(int(track_id))
+            except (TypeError, ValueError):
+                continue
+        return normalized
+
+    def _clear_urination_state(self, track_id):
+        history = self.urination_history.get(track_id)
+        if history is not None:
+            history.clear()
+        self.urination_positive_counts[track_id] = 0
+        action, _ = self.last_action.get(track_id, ("normal", 0.0))
+        if self._is_urination_action(action):
+            self.last_action[track_id] = ("normal", 0.0)
+        if self.alert_action.get(track_id) == "urinate":
+            self.alert_counter[track_id] = 0
+            self.alert_action[track_id] = None
+
+    def _record_urination_evidence(self, track_id, action, conf, fps, stats=None):
+        # urinate 需在最近 10 秒內累積至少 8 秒 positive，避免單次 STGCN 閃爍誤報。
+        fps_value = _safe_fps(fps)
+        now_sec = self.frame_index / fps_value
+        positive = self._is_urination_action(action) and float(conf) >= self.action_threshold
+        history = self.urination_history.setdefault(track_id, deque())
+        if track_id not in self.urination_positive_counts:
+            self.urination_positive_counts[track_id] = 0
+
+        history.append((now_sec, positive))
+        if positive:
+            self.urination_positive_counts[track_id] += 1
+            _add_stat(stats, "stgcn_urination_evidence_frames")
+
+        cutoff_sec = now_sec - self.urination_window_sec
+        while history and history[0][0] < cutoff_sec:
+            _, stale_positive = history.popleft()
+            if stale_positive:
+                self.urination_positive_counts[track_id] = max(
+                    0,
+                    self.urination_positive_counts[track_id] - 1,
+                )
+
+        positive_sec = self.urination_positive_counts[track_id] / fps_value
+        observed_sec = min(self.urination_window_sec, len(history) / fps_value)
+        confirmed = (
+            self.urination_min_sec <= 0.0 or
+            positive_sec >= self.urination_min_sec
+        )
+        return confirmed, positive_sec, observed_sec
+
+    def update(
+        self,
+        frame,
+        persons,
+        fps=30.0,
+        blocked_urination_track_ids=None,
+        profiler=None,
+        stats=None,
+    ):
         """
         persons：格式為 {'box': xyxy, 'track_id': int, ...} 的 list。
         回傳：{track_id: {'action': str, 'conf': float, 'stgcn_conf': float, 'alert': bool}}。
         """
         # 每幀更新入口：追蹤每個 person 的骨架 history，視 interval 決定是否跑 STGCN。
         active_profiler = profiler if profiler is not None else self.profiler
+        blocked_urination_track_ids = self._normalize_track_id_set(blocked_urination_track_ids)
         with profile_block(active_profiler, "action.update_total"):
             action_map = {}
             self.frame_index += 1
@@ -358,6 +446,13 @@ class STGCNActionModule:
                         self.track_history[track_id] = deque(maxlen=self.window_size)
                         self.alert_counter[track_id] = 0
                         self.last_action[track_id] = ("normal", 0.0)
+                        self.alert_action[track_id] = None
+                        self.urination_history[track_id] = deque()
+                        self.urination_positive_counts[track_id] = 0
+
+                    urination_blocked = track_id in blocked_urination_track_ids
+                    if urination_blocked:
+                        self._clear_urination_state(track_id)
 
                     best_idx = -1
                     best_iou = 0.0
@@ -390,26 +485,48 @@ class STGCNActionModule:
                                 img_shape=frame.shape[:2],
                                 profiler=active_profiler,
                             )
-                            self.last_action[track_id] = (action, conf)
                             _add_stat(stats, f"stgcn_pred_{action}")
-                            # 違規成立門檻：模型動作必須是 littering/urination，且 conf >= self.action_threshold。
-                            if action in self.violation_actions and conf >= self.action_threshold:
-                                self.alert_counter[track_id] = self.alert_frames
-                                _add_stat(stats, "stgcn_alerts")
-
+                            if urination_blocked and self._is_urination_action(action):
+                                _add_stat(stats, "stgcn_urinate_blocked_on_vehicle")
+                                action, conf = "normal", 0.0
+                            self.last_action[track_id] = (action, conf)
                     action, conf = self.last_action[track_id]
+                    urination_confirmed, urination_positive_sec, urination_observed_sec = (
+                        self._record_urination_evidence(track_id, action, conf, fps, stats=stats)
+                    )
+                    if self._is_urination_action(action) and urination_confirmed:
+                        already_alerting_urination = (
+                            self.alert_counter[track_id] > 0 and
+                            self.alert_action.get(track_id) == "urinate"
+                        )
+                        self.alert_counter[track_id] = self.alert_frames
+                        self.alert_action[track_id] = "urinate"
+                        if not already_alerting_urination:
+                            _add_stat(stats, "stgcn_alerts")
+                            _add_stat(stats, "stgcn_urinate_confirmed")
+
+                    reported_action = action
+                    if self._is_urination_action(action) and not urination_confirmed:
+                        reported_action = "normal"
+
                     action_result = {
-                        "action": action,
+                        "action": reported_action,
+                        "raw_action": action,
                         # conf 舊欄位保留相容性；stgcn_conf 明確表示這是 STGCN 動作分類分數，不是 person bbox 分數。
                         "conf": conf,
                         "stgcn_conf": conf,
+                        "urination_evidence_sec": urination_positive_sec,
+                        "urination_observed_sec": urination_observed_sec,
+                        "urination_required_sec": self.urination_min_sec,
                     }
                     if self.alert_counter[track_id] > 0:
                         # alert_frames 讓違規標記維持數幀，避免單幀分類閃爍。
                         self.alert_counter[track_id] -= 1
                         action_result["alert"] = True
+                        action_result["action"] = self.alert_action.get(track_id) or reported_action
                     else:
                         action_result["alert"] = False
+                        self.alert_action[track_id] = None
                     action_map[track_id] = action_result
 
             return action_map

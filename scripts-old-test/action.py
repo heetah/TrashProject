@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# STGCN++ 動作辨識模組：從 person bbox 對應 pose keypoints，累積序列後判斷 normal/littering/urination。
+# STGCN++ 動作辨識模組：從 person bbox 對應 pose keypoints，累積序列後只判斷 normal/urinate。
 import os
 import sys
 import traceback
@@ -11,9 +11,9 @@ from ultralytics import YOLO
 from timeUtils import profile_block
 
 
-ACTION_CLASSES = {0: "normal", 1: "littering", 2: "urination"}
-URINATION_ACTIONS = {"urination", "urinating"}
-VIOLATION_ACTIONS = {"littering", *URINATION_ACTIONS}
+ACTION_CLASSES = {0: "normal", 1: "urinate"}
+URINATION_ACTIONS = {"urinate", "urination", "urinating"}
+VIOLATION_ACTIONS = set(URINATION_ACTIONS)
 
 
 def _add_stat(stats, key, amount=1):
@@ -91,7 +91,7 @@ class STGCNActionModule:
         pose_model_path,
         stgcn_weight_path,
         stgcn_config_path,
-        # STGCN 判定為 littering/urination 後，conf 需 >= 0.5（預設值）才會啟動違規警報。
+        # STGCN 判定為 urinate 後，conf 需 >= 0.5（預設值）且累積滿時間才會啟動違規警報。
         action_threshold=0.5,
         track_iou_threshold=0.2,
         window_size=25,
@@ -340,12 +340,12 @@ class STGCNActionModule:
         action, _ = self.last_action.get(track_id, ("normal", 0.0))
         if self._is_urination_action(action):
             self.last_action[track_id] = ("normal", 0.0)
-        if self.alert_action.get(track_id) == "urination":
+        if self.alert_action.get(track_id) == "urinate":
             self.alert_counter[track_id] = 0
             self.alert_action[track_id] = None
 
     def _record_urination_evidence(self, track_id, action, conf, fps, stats=None):
-        # urinating/urination 需在最近 10 秒內累積至少 8 秒 positive，避免單次 STGCN 閃爍誤報。
+        # urinate 需在最近 10 秒內累積至少 8 秒 positive，避免單次 STGCN 閃爍誤報。
         fps_value = _safe_fps(fps)
         now_sec = self.frame_index / fps_value
         positive = self._is_urination_action(action) and float(conf) >= self.action_threshold
@@ -487,15 +487,9 @@ class STGCNActionModule:
                             )
                             _add_stat(stats, f"stgcn_pred_{action}")
                             if urination_blocked and self._is_urination_action(action):
-                                _add_stat(stats, "stgcn_urination_blocked_on_vehicle")
+                                _add_stat(stats, "stgcn_urinate_blocked_on_vehicle")
                                 action, conf = "normal", 0.0
                             self.last_action[track_id] = (action, conf)
-                            # littering 仍採即時門檻；urination 另走 10 秒內至少 8 秒的持續性確認。
-                            if action == "littering" and conf >= self.action_threshold:
-                                self.alert_counter[track_id] = self.alert_frames
-                                self.alert_action[track_id] = action
-                                _add_stat(stats, "stgcn_alerts")
-
                     action, conf = self.last_action[track_id]
                     urination_confirmed, urination_positive_sec, urination_observed_sec = (
                         self._record_urination_evidence(track_id, action, conf, fps, stats=stats)
@@ -503,13 +497,13 @@ class STGCNActionModule:
                     if self._is_urination_action(action) and urination_confirmed:
                         already_alerting_urination = (
                             self.alert_counter[track_id] > 0 and
-                            self.alert_action.get(track_id) == "urination"
+                            self.alert_action.get(track_id) == "urinate"
                         )
                         self.alert_counter[track_id] = self.alert_frames
-                        self.alert_action[track_id] = "urination"
+                        self.alert_action[track_id] = "urinate"
                         if not already_alerting_urination:
                             _add_stat(stats, "stgcn_alerts")
-                            _add_stat(stats, "stgcn_urination_confirmed")
+                            _add_stat(stats, "stgcn_urinate_confirmed")
 
                     reported_action = action
                     if self._is_urination_action(action) and not urination_confirmed:

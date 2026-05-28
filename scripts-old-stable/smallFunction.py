@@ -111,6 +111,39 @@ def calculate_iou_matrix(boxes1, boxes2):
 
     return inter_area / union_area
 
+def calculate_iom_matrix(boxes1, boxes2):
+    # 計算兩組 bbox 的 IoM (Intersection over Minimum) 矩陣，用於 person 與 vehicle 包含關係。
+    b1 = np.array(boxes1)
+    b2 = np.array(boxes2)
+
+    if len(b1) == 0 or len(b2) == 0:
+        return np.zeros((len(b1), len(b2)))
+    
+    # 擴張維度
+    b1 = np.expand_dims(b1, axis=1)
+    b2 = np.expand_dims(b2, axis=0)
+
+    # 計算重疊的左上 & 右下座標
+    xx1 = np.maximum(b1[..., 0], b2[..., 0])
+    yy1 = np.maximum(b1[..., 1], b2[..., 1])
+    xx2 = np.minimum(b1[..., 2], b2[..., 2])
+    yy2 = np.minimum(b1[..., 3], b2[..., 3])
+
+    # 計算重疊區域面積
+    w = np.maximum(0.0, xx2 - xx1)
+    h = np.maximum(0.0, yy2 - yy1)
+    inter_area = w * h
+
+    # 計算各自面積
+    area1 = (b1[..., 2] - b1[..., 0]) * (b1[..., 3] - b1[..., 1])
+    area2 = (b2[..., 2] - b2[..., 0]) * (b2[..., 3] - b2[..., 1])
+
+    # 計算 IoM: 分母為兩者中較小的面積
+    min_area = np.minimum(area1, area2)
+    min_area = np.maximum(min_area, 1e-6) # 避免除以 0
+
+    return inter_area / min_area
+
 
 def calculate_mask_overlap_ratio(litter_box, actor_mask_poly):
     # 計算 litter bbox 被 actor segmentation mask 覆蓋的比例，支援 polygon-aware holding。
@@ -323,24 +356,25 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
                    person_dist_threshold=55.0,
                    vehicle_dist_threshold=90.0,
                    overlap_ratio_threshold=0.55,
-                   mask_overlap_ratio_threshold=0.35,
+                   mask_overlap_ratio_threshold=0.20,
                    min_mask_overlap_for_vehicle_distance=0.08,
                    prev_litter_center=None,
                    prev_litter_missed=None,
                    prev_litter_history=None,
                    vehicle_history=None,
-                   person_mask_dilation_px=10.0,
+                   person_mask_dilation_px=14.0,
                    vehicle_mask_dilation_px=16.0,
                    vehicle_mask_gap_threshold=100.0,
                    vehicle_relative_motion_threshold=12.0,
                    bbox_margin_px=8.0,
                    allow_distance_holding=True,
-                   vehicle_release_downward_threshold=15.0,
-                   vehicle_release_horizontal_threshold=12.0,
-                   vehicle_release_relative_motion_threshold=18.0,
-                   vehicle_release_abs_downward_threshold=10.0,
-                   vehicle_release_abs_horizontal_threshold=10.0,
-                   vehicle_release_abs_motion_threshold=18.0,
+                   vehicle_upper_half_attached_ratio=0.55,
+                   vehicle_release_downward_threshold=8.0,
+                   vehicle_release_horizontal_threshold=6.0,
+                   vehicle_release_relative_motion_threshold=10.0,
+                   vehicle_release_abs_downward_threshold=6.0,
+                   vehicle_release_abs_horizontal_threshold=6.0,
+                   vehicle_release_abs_motion_threshold=10.0,
                    vehicle_release_min_mask_gap_px=8.0,
                    vehicle_release_max_mask_overlap=0.08,
                    vehicle_release_lower_edge_ratio=0.90,
@@ -375,8 +409,8 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
     if prev_litter_center is not None:
         litter_vx = lc_x - float(prev_litter_center[0])
         litter_vy = lc_y - float(prev_litter_center[1])
-        # 垃圾靜止特徵：X 與 Y 軸位移極小
-        if abs(litter_vx) < 1.0 and abs(litter_vy) < 1.0:
+        # 垃圾靜止特徵：X 與 Y 軸位移極小 (容忍 YOLO BBox 正常抖動約 2-4 px)
+        if abs(litter_vx) < 3.5 and abs(litter_vy) < 3.5:
             is_litter_static = True
     litter_motion_points = _motion_points(prev_litter_history, prev_litter_center, anchor_point)
     best_actor_key = None
@@ -454,8 +488,11 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
             is_vehicle_release_motion = is_relative_release_motion or is_absolute_release_motion
 
             # 解綁條件 A：垃圾靜止在地上，但車子還在開，表示不是持有狀態。
-            if is_litter_static and is_vehicle_moving:
-                continue 
+            # 例外：若垃圾中心仍在車輛 bbox 內（車頂 / 車身物件），不應以地面靜止邏輯跳過；
+            # 應讓下方 no-mask 路徑的 is_inside_bbox 判斷持有。
+            litter_inside_vehicle_bbox = (ax1 <= lc_x <= ax2 and ay1 <= lc_y <= ay2)
+            if is_litter_static and is_vehicle_moving and not litter_inside_vehicle_bbox:
+                continue
 
             actor_anchor = ((ax1 + ax2) / 2.0, ay2)
             dilation_px = vehicle_mask_dilation_px
@@ -590,6 +627,22 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
                         has_strong_release_side_gap
                     )
                 )
+
+                # 車輛上半部 (後照鏡 / 車燈 / 車頂物件) 屬於車輛部件誤判高發區，
+                # 真正被丟出的垃圾應穿過下半部與底部離開車體；若仍停留在上半部 bbox 內，
+                # 且沒有明顯 release motion，視為車輛部件持有。
+                norm_in_bbox = _normalized_point_in_box(anchor_point, actor['box'])
+                is_inside_bbox = (
+                    -0.02 <= norm_in_bbox[0] <= 1.02 and
+                    -0.02 <= norm_in_bbox[1] <= 1.02
+                )
+                is_upper_half_attached = (
+                    is_inside_bbox and
+                    norm_in_bbox[1] <= float(vehicle_upper_half_attached_ratio)
+                )
+                if is_upper_half_attached and not mask_aware_release_motion:
+                    return True, (cls_name, track_id)
+
                 if is_inside_actual_region:
                     if norm_x is not None and (
                         norm_x <= float(vehicle_side_edge_ratio) or
@@ -652,7 +705,17 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
             continue
 
         if cls_name in VEHICLE_LIKE_CLASSES:
-            # 沒有 mask 時退回 bbox 距離與相對速度判斷。
+            # 沒有 mask 時退回 bbox 距離 + 相對速度，
+            # 並補上「litter 落在整個車體 bbox 內」的車輛部件持有判斷
+            # (車燈 / 後照鏡 / 車頂掛物 / 車身誤判)。
+            norm_in_bbox = _normalized_point_in_box(anchor_point, actor['box'])
+            is_inside_bbox = (
+                -0.02 <= norm_in_bbox[0] <= 1.02 and
+                -0.02 <= norm_in_bbox[1] <= 1.02
+            )
+            if is_inside_bbox and not is_vehicle_release_motion:
+                return True, (cls_name, track_id)
+
             is_distance_holding = (
                 allow_distance_holding and
                 dist <= adaptive_thr and
@@ -663,6 +726,16 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
                     continue
                 return True, (cls_name, track_id)
             continue
+
+        # 沒有 mask 時的 person fallback：litter 落在 person bbox 內視為人體 / 手持物持有，
+        # 包含「鞋子 / 衣服 / 手持寶特瓶」被誤判為 litter 的情況。
+        norm_in_bbox = _normalized_point_in_box(anchor_point, actor['box'])
+        is_inside_bbox = (
+            -0.02 <= norm_in_bbox[0] <= 1.02 and
+            -0.02 <= norm_in_bbox[1] <= 1.02
+        )
+        if is_inside_bbox:
+            return True, (cls_name, track_id)
 
         is_distance_holding = allow_distance_holding and dist <= adaptive_thr
         if is_distance_holding:
@@ -702,5 +775,19 @@ def validate_trajectory(centroid_history):
 
     # 綜合判斷：軌跡夠平滑且往下掉
     is_valid = straightness > 0.85 and is_falling and downward_ratio >= 0.6
-    
+
+    # 拋物線（先升後降）識別：上升段 downward_ratio 必然偏低，但落下段應清楚向下。
+    # 條件：終點低於起點（is_falling）、有明顯高點（peak 不在兩端）、落下段夠長且向下。
+    if not is_valid and is_falling and len(pts) >= 4:
+        ys = pts[:, 1]
+        peak_idx = int(np.argmin(ys))  # 最高點（Y 最小）
+        if 1 <= peak_idx < len(pts) - 1:
+            descent = ys[peak_idx:]
+            descent_steps = np.diff(descent)
+            descent_ratio = np.count_nonzero(descent_steps >= -2.0) / max(len(descent_steps), 1)
+            descent_disp = float(ys[-1] - ys[peak_idx])
+            # 落下段向下明確、下降幅度夠大、整體軌跡不雜亂
+            if descent_ratio >= 0.8 and descent_disp >= 10.0 and straightness > 0.65:
+                is_valid = True
+
     return is_valid, straightness

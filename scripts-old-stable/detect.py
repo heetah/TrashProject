@@ -7,7 +7,7 @@ import os
 from licensePlate import detect_license_plates, dispatch_license_plate_rois, get_plate_number
 from timeUtils import profile_block
 from smallFunction import (
-    calculate_iou_matrix,
+    calculate_iom_matrix,
     litter_holding,
     motion_evidence,
 )
@@ -15,11 +15,43 @@ from smallFunction import (
 # 類別顏色與名稱正規化：避免不同模型 label-space 造成 actor 解析錯誤。
 BLACK = (0, 0, 0)
 WARN = (0, 0, 255)
+
+
+def compute_pixel_change_map(prev_frame, curr_frame):
+    """Return a grayscale image visualising per-pixel absolute difference.
+
+    4c model design principle: the change map must preserve magnitude.
+    Static scenes → near-zero output.  Moving objects → bright pixels.
+    cv2.normalize is intentionally avoided: it collapses a near-zero noise
+    range (e.g. 0-2) to 0-255, making the 4th channel indistinguishable
+    from a scene with heavy motion.  Direct scaling retains the magnitude
+    relationship the model was trained on.
+
+    Args:
+        prev_frame: Previous frame (H, W, 3) BGR uint8
+        curr_frame: Current frame (H, W, 3) BGR uint8
+
+    Returns:
+        diff_gray: Grayscale change map (H, W) uint8
+    """
+    if prev_frame is None:
+        # First frame: return zeros for change map
+        return np.zeros(curr_frame.shape[:2], dtype=np.uint8)
+
+    diff = cv2.absdiff(prev_frame, curr_frame)  # shape H×W×3, uint8
+    diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)  # collapse to 1 channel
+    # Scale up raw magnitude without normalising.
+    # Factor 2.0: a 30-pixel diff (clear motion) → 60, clipped at 255.
+    # A 1-2 pixel sensor noise → 2-4, stays near zero as intended.
+    diff_gray = np.clip(diff_gray.astype(np.float32) * 2.0, 0, 255).astype(np.uint8)
+    return diff_gray
 ACTOR_CLASSES = ('person', 'scooter', 'vehicle')
 VEHICLE_LIKE_CLASSES = ('scooter', 'vehicle')
 ACTION_WARNING_LABELS = {
     'littering': 'LITTERING',
-    'urination': 'URINATING',
+    'urinate': 'URINATE',
+    'urination': 'URINATE',
+    'urinating': 'URINATE',
 }
 CLASS_ALIASES = {
     'motorcycle': 'scooter',
@@ -297,7 +329,8 @@ def detect(frame, model_bbox, model_trash,
            fg_mask_scale=1.0,
            stats=None,
            actor_mode="track",
-           actor_track_iou=0.3):
+           actor_track_iou=0.3,
+           prev_frame=None):
     # 單幀偵測入口：負責一幀內完整 actor、litter、違規者、渲染流程。
     if violator_display_cache is None:
         violator_display_cache = {}
@@ -391,23 +424,34 @@ def detect(frame, model_bbox, model_trash,
             # 將 vehicle 的 (cls, track_id) 組合成一個 list，方便後續建立對應關係
             detected_vehicle_keys = [(v['cls'], int(v['track_id'])) for v in vehicles]
 
-            # 計算所有 person 與 vehicle 之間的 IoU，得到一個 shape 為 (num_persons, num_vehicles) 的矩陣
-            iou_matrix = calculate_iou_matrix(person_boxes, vehicle_boxes)
+            # 計算所有 person 與 vehicle 之間的 IoM (Intersection over Minimum)
+            # 解決 IoU 在 person 完全包含在巨大 vehicle 框內時數值過低的問題
+            iom_matrix = calculate_iom_matrix(person_boxes, vehicle_boxes)
 
-            overlap_mask = np.any(iou_matrix > 0.2, axis=1)
+            overlap_mask = np.any(iom_matrix > 0.7, axis=1)
 
             for i, has_overlap in enumerate(overlap_mask):
                 if has_overlap:
-                    max_veh_idx = np.argmax(iou_matrix[i])
+                    max_veh_idx = np.argmax(iom_matrix[i])
                     person_vehicle_map[person_ids[i]] = detected_vehicle_keys[max_veh_idx]
 
     all_objects = persons + vehicles
+    if stats is not None and persons:
+        stats['person_frame_hits'] = stats.get('person_frame_hits', 0) + 1
+        stats['person_detections'] = stats.get('person_detections', 0) + len(persons)
 
     # 如果有動作模組，先取得每個人的動作資訊，供後續違規判斷使用
     person_action_map = {}
     if action_module is not None:
         with profile_block(profiler, "detect.action_update"):
-            person_action_map = action_module.update(frame, persons, profiler=profiler, stats=stats)
+            person_action_map = action_module.update(
+                frame,
+                persons,
+                fps=fps,
+                blocked_urination_track_ids=person_vehicle_map.keys(),
+                profiler=profiler,
+                stats=stats,
+            )
 
     filtererd_objects = []
 
@@ -431,8 +475,13 @@ def detect(frame, model_bbox, model_trash,
     # 直接使用全圖進行 RTDETR 追蹤/偵測
     if precomputed_trash_results is None:
         with profile_block(profiler, "detect.rtdetr_litter_predict"):
+            # 計算像素變化圖，並創建 4 通道輸入 (RGB + change map)
+            change_map = compute_pixel_change_map(prev_frame, frame)
+            # 將 BGR frame 和 change_map 堆疊成 (H, W, 4)
+            frame_4ch = np.dstack((frame, change_map))
+            
             chunk_results = model_trash.predict(
-                frame,          # 直接傳入整張圖
+                frame_4ch,      # 傳入 (H, W, 4) 格式
                 conf=trash_conf,
                 device=TRASH_DEVICE,
                 half=TRASH_HALF,
@@ -530,6 +579,21 @@ def detect(frame, model_bbox, model_trash,
             # 新出現目標先進 tracker 建立一個 history anchor；第二幀起才能判斷它
             # 是否相對車輛真的往下分離，避免把 resize.mp4 這類剛丟出的垃圾第一點擋掉。
             if prev_litter_center is None:
+                # 出生抑制：若 litter 中心落在車輛/機車 bbox 內部（邊緣保留 12px 緩衝），
+                # 視為車輛部件偵測（FP），跳過這個出生幀；真正丟出的垃圾出現在車外。
+                lc_x = (lx1 + lx2) / 2.0
+                lc_y = (ly1 + ly2) / 2.0
+                _vehicle_birth_margin = 12.0
+                _is_vehicle_born = False
+                for _actor in tracking_objects:
+                    if _actor.get('cls', '').lower() in VEHICLE_LIKE_CLASSES:
+                        _ax1, _ay1, _ax2, _ay2 = map(float, _actor['box'])
+                        if (_ax1 + _vehicle_birth_margin < lc_x < _ax2 - _vehicle_birth_margin and
+                                _ay1 + _vehicle_birth_margin < lc_y < _ay2 - _vehicle_birth_margin):
+                            _is_vehicle_born = True
+                            break
+                if _is_vehicle_born:
+                    continue
                 filtered_frame_litters.append(litter_box)
                 continue
 
@@ -569,6 +633,31 @@ def detect(frame, model_bbox, model_trash,
             stats['confirmed_litter_frame_hits'] = stats.get('confirmed_litter_frame_hits', 0) + 1
             if stats.get('first_confirmed_litter_frame') is None:
                 stats['first_confirmed_litter_frame'] = frame_index
+        confirmed_litter_thrower_ids = [
+            litter_id for litter_id, litter_data in tracked_litters.items()
+            if (
+                litter_data.get('state') == 'confirmed' and
+                litter_data.get('thrower_key') is not None
+            )
+        ]
+        if confirmed_litter_thrower_ids:
+            stats.setdefault('confirmed_litter_thrower_ids', set()).update(confirmed_litter_thrower_ids)
+            stats['confirmed_litter_thrower_frame_hits'] = (
+                stats.get('confirmed_litter_thrower_frame_hits', 0) + 1
+            )
+        backtracked_thrower_ids = [
+            litter_id for litter_id, litter_data in tracked_litters.items()
+            if (
+                litter_data.get('state') == 'confirmed' and
+                isinstance(litter_data.get('backward_result'), dict) and
+                litter_data['backward_result'].get('actor_key') is not None
+            )
+        ]
+        if backtracked_thrower_ids:
+            stats.setdefault('backtracked_thrower_ids', set()).update(backtracked_thrower_ids)
+            stats['backtracked_thrower_frame_hits'] = (
+                stats.get('backtracked_thrower_frame_hits', 0) + 1
+            )
     if person_action_map:
         # STGCN 若判定 person 正在違規動作，也可直接把人/車註冊成違規者。
         with profile_block(profiler, "detect.stgcn_violator_register"):
@@ -842,9 +931,18 @@ def _select_zero_repair_positions(box_counts, mode, context=None):
 
 def _run_batched_trash_predict(model_trash, frames, trash_conf, export_batch_size,
                                profiler=None, zero_repair="adjacent",
-                               zero_repair_context=None, stats=None):
+                               zero_repair_context=None, stats=None, prev_frames=None):
     # 批次 RTDETR litter predict；尾端不足 batch 時用最後一幀 padding，輸出再裁回原長度。
-    infer_frames = list(frames)
+    # 創建 4 通道輸入：將每幀的 BGR 與變化圖 (change map) 堆疊成 (H, W, 4) 格式。
+    if prev_frames is None:
+        prev_frames = [None] * len(frames)
+    
+    infer_frames = []
+    for frame, prev_frame in zip(frames, prev_frames):
+        change_map = compute_pixel_change_map(prev_frame, frame)
+        frame_4ch = np.dstack((frame, change_map))
+        infer_frames.append(frame_4ch)
+    
     if export_batch_size > len(infer_frames):
         infer_frames.extend([infer_frames[-1]] * (export_batch_size - len(infer_frames)))
 
@@ -859,6 +957,13 @@ def _run_batched_trash_predict(model_trash, frames, trash_conf, export_batch_siz
                 verbose=False,
             )
     except Exception as exc:
+        # channel/imgsz mismatch は warmup 設定ミスを示す。修復不可能なのでそのまま再 raise。
+        # AssertionError("input size ... not equal to max model size") がこのケース。
+        exc_str = str(exc)
+        if "not equal to max model size" in exc_str or "input size" in exc_str:
+            raise RuntimeError(
+                f"RTDETR channel/imgsz mismatch — check trash model warmup (channels & imgsz): {exc}"
+            ) from exc
         if len(frames) <= 1:
             raise
         _warn_once(
@@ -866,8 +971,10 @@ def _run_batched_trash_predict(model_trash, frames, trash_conf, export_batch_siz
             f"Warning: batched RTDETR failed; repairing frame-by-frame with padded batch source: {exc}",
         )
         result_list = []
-        for frame in frames:
-            repair_source = [frame] * export_batch_size if export_batch_size > 1 else frame
+        for frame, prev_frame in zip(frames, prev_frames):
+            change_map = compute_pixel_change_map(prev_frame, frame)
+            frame_4ch = np.dstack((frame, change_map))
+            repair_source = [frame_4ch] * export_batch_size if export_batch_size > 1 else frame_4ch
             with profile_block(profiler, "detect.rtdetr_litter_predict_batch_repair"):
                 repair_results = model_trash.predict(
                     repair_source,
@@ -907,7 +1014,10 @@ def _run_batched_trash_predict(model_trash, frames, trash_conf, export_batch_siz
         _add_stat(stats, "rtdetr_batch_zero_repaired_frames", len(repair_positions))
         for pos in repair_positions:
             frame = frames[pos]
-            repair_source = [frame] * export_batch_size if export_batch_size > 1 else frame
+            prev_frame = prev_frames[pos] if prev_frames and pos < len(prev_frames) else None
+            change_map = compute_pixel_change_map(prev_frame, frame)
+            frame_4ch = np.dstack((frame, change_map))
+            repair_source = [frame_4ch] * export_batch_size if export_batch_size > 1 else frame_4ch
             with profile_block(profiler, "detect.rtdetr_litter_predict_batch_repair"):
                 repair_results = model_trash.predict(
                     repair_source,
@@ -1024,7 +1134,8 @@ def detect_batch(frames, model_bbox, model_trash,
                  rtdetr_zero_repair="adjacent",
                  rtdetr_batch_context=None,
                  actor_mode="track",
-                 actor_track_iou=0.3):
+                 actor_track_iou=0.3,
+                 prev_frames=None):
     # 批次偵測入口：RTDETR 批次推理、actor 可跳幀快取，最後逐幀套用單幀後處理。
     if not frames:
         return []
@@ -1034,6 +1145,8 @@ def detect_batch(frames, model_bbox, model_trash,
         violator_display_cache = {}
     if yolo_seg_cache is None:
         yolo_seg_cache = {}
+    if prev_frames is None:
+        prev_frames = [None] * len(frames)
 
     batch_size = max(int(batch_size or 1), 1)
     trash_batch_size = max(int(trash_batch_size or batch_size), 1)
@@ -1066,8 +1179,9 @@ def detect_batch(frames, model_bbox, model_trash,
                 stats=stats,
                 actor_mode=actor_mode,
                 actor_track_iou=actor_track_iou,
+                prev_frame=prev_frame,
             )
-            for frame, fg_mask, frame_index in zip(frames, fg_masks, frame_indices)
+            for frame, fg_mask, frame_index, prev_frame in zip(frames, fg_masks, frame_indices, prev_frames)
         ]
 
     # 批次前處理：actor 結果可跳幀快取，litter 結果用 RTDETR 批次推理。
@@ -1094,12 +1208,13 @@ def detect_batch(frames, model_bbox, model_trash,
         zero_repair=rtdetr_zero_repair,
         zero_repair_context=rtdetr_batch_context,
         stats=stats,
+        prev_frames=prev_frames,
     )
 
     annotated_frames = []
     # 批次推理完成後，逐幀套用相同的 motion/holding/tracker/render 後處理。
-    for frame, fg_mask, frame_index, actor_pair, trash_result in zip(
-        frames, fg_masks, frame_indices, actor_pairs, trash_results
+    for frame, fg_mask, frame_index, actor_pair, trash_result, prev_frame in zip(
+        frames, fg_masks, frame_indices, actor_pairs, trash_results, prev_frames
     ):
         persons, vehicles = actor_pair
         annotated_frames.append(
@@ -1130,6 +1245,7 @@ def detect_batch(frames, model_bbox, model_trash,
                 stats=stats,
                 actor_mode=actor_mode,
                 actor_track_iou=actor_track_iou,
+                prev_frame=prev_frame,
             )
         )
 

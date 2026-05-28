@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # 主流程入口：負責模型載入、影片讀寫、逐幀/批次推理、輸出壓縮與耗時統計。
 import cv2
+import json
 import numpy as np
 import os
 import queue
@@ -30,14 +31,15 @@ COLORS = {
 
 # 預設模型路徑：batch 1 使用一般權重；batch N 使用 batch 匯出/訓練資料夾中的權重。
 SUPPORTED_BATCH_SIZES = (1, 2, 4, 8)
-POSE_MODEL_PATH = 'modules_weight/yolo26x-pose.pt'
-STGCN_WEIGHT_PATH = 'modules_weight/stgcnpp_garbage_3class_best.pth'
-STGCN_CONFIG_PATH = 'mmaction2/configs/skeleton/stgcnpp/custom_trash_stgcnpp.py'
+POSE_MODEL_PATH = '/home/se_copilot/trashProject/modules_weight/yolo26x-pose.pt'
+STGCN_WEIGHT_PATH = '/home/se_copilot/trashProject/modules_weight/stgcnpp_urinate_2class_best.pth'
+STGCN_CONFIG_PATH = '/home/se_copilot/trashProject/mmaction2/configs/skeleton/stgcnpp/custom_trash_stgcnpp.py'
 
-MODEL_BBOX_PATH = 'modules_weight/best-yolo-seg_v3.pt'
-MODEL_TRASH_PATH = 'modules_weight/best-rtdetr-seg.pt'
-MODEL_BBOX_PATH_BATCH = 'modules_weight/batch/best-yolo-seg_v3.pt'
-MODEL_TRASH_PATH_BATCH = 'modules_weight/batch/best-rtdetr-seg.pt'
+MODEL_BBOX_PATH = '/home/se_copilot/trashProject/modules_weight/best-yolo-seg_v3.pt'
+MODEL_TRASH_PATH = '/home/se_copilot/trashProject/modules_weight/best-rtdetr-4c.pt'
+MODEL_BBOX_PATH_BATCH = '/home/se_copilot/trashProject/modules_weight/batch/best-yolo-seg_v3.pt'
+# best-rtdetr-4c.pt 無 batch/ 版本；batch engine 由 export_tensorrt.py 在同目錄產出 best-rtdetr-4c_b8.engine。
+MODEL_TRASH_PATH_BATCH = '/home/se_copilot/trashProject/modules_weight/best-rtdetr-4c.pt'
 
 DEFAULT_FG_MASK_SCALE = 0.5
 DEFAULT_MOTION_DIFF_THRESHOLD = 10
@@ -51,6 +53,7 @@ DEFAULT_MOTION_MIN_COMPONENT_AREA = 4
 DEFAULT_MOTION_MIN_LARGEST_COMPONENT_RATIO = 0.25
 DEFAULT_READER_QUEUE_SIZE = 32
 DEFAULT_CAPTURE_BUFFER_SIZE = 8
+LEGACY_RESOURCE_ROOT = Path("/mnt/8tb_hdd/under115a")
 
 # torch 是選用依賴：若不可用，TensorRT engine 檢查會自動略過。
 try:
@@ -63,6 +66,25 @@ def _set_env_if_present(name, value):
     # CLI 有傳值才寫入環境變數，避免覆蓋使用者原本的設定。
     if value is not None:
         os.environ[name] = str(value)
+
+
+def _resolve_video_path(file_arg):
+    # 支援 AGENTS.md 的 resources/foo.mp4、單純檔名與舊 /mnt/8tb_hdd/under115a/resources 來源。
+    raw = Path(str(file_arg)).expanduser()
+    if raw.is_absolute():
+        return str(raw)
+
+    candidates = [raw]
+    if len(raw.parts) == 1:
+        candidates.insert(0, Path("resources") / raw)
+        candidates.insert(1, LEGACY_RESOURCE_ROOT / "resources" / raw)
+    elif raw.parts[0] == "resources":
+        candidates.append(LEGACY_RESOURCE_ROOT / raw)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return str(candidates[0])
 
 
 def _odd_kernel_size(value):
@@ -679,12 +701,155 @@ class AsyncVideoFrameReader:
                 self._put(self._sentinel)
 
 
-def _batched_dummy_frame(batch_size):
+def _batched_dummy_frame(batch_size, imgsz=640, channels=3):
     # warmup 使用假 frame；batch 模式需傳入 list，才能讓 backend 建立正確 batch shape。
-    dummy_frame = np.zeros((640, 640, 3), dtype=np.uint8)
+    dummy_frame = np.zeros((int(imgsz), int(imgsz), int(channels)), dtype=np.uint8)
     if int(batch_size) <= 1:
         return dummy_frame
     return [dummy_frame.copy() for _ in range(int(batch_size))]
+
+
+def _read_engine_input_shape(engine_path):
+    # 讀取 engine input binding shape，回傳 (batch, channels, h, w) 或 None。
+    # 優先從 ultralytics metadata prefix JSON 讀取（快速，不需要起 TRT Runtime）；
+    # 舊格式 engine 沒有 prefix 時才退回 TRT Runtime 讀取 binding shape。
+    #
+    # ultralytics metadata prefix 格式：
+    #   [4-byte little-endian signed length][UTF-8 JSON][raw TRT serialized bytes]
+    path = Path(engine_path)
+    if path.suffix != ".engine":
+        return None
+    try:
+        import json as _json
+        with open(str(path), "rb") as f:
+            raw = f.read()
+
+        # ── 嘗試讀取 metadata prefix ──────────────────────────────────────────
+        meta_len = int.from_bytes(raw[:4], byteorder="little", signed=True)
+        if 0 < meta_len < 65536:
+            try:
+                meta = _json.loads(raw[4:4 + meta_len].decode("utf-8"))
+                imgsz_raw = meta.get("imgsz")
+                channels = int(meta.get("channels", 3))
+                batch = int(meta.get("batch", 1))
+                if imgsz_raw is not None:
+                    if isinstance(imgsz_raw, (list, tuple)) and len(imgsz_raw) >= 2:
+                        h, w = int(imgsz_raw[0]), int(imgsz_raw[1])
+                    else:
+                        h = w = int(imgsz_raw)
+                    shape = (batch, channels, h, w)
+                    print(f"Engine input shape from metadata: {shape}")
+                    return shape
+            except Exception:
+                pass
+            # metadata prefix 存在但 imgsz 缺失 → 跳過 prefix，用 TRT 讀 binding
+            trt_bytes = raw[4 + meta_len:]
+        else:
+            # 沒有 metadata prefix（舊格式 engine）→ 直接 TRT 解析
+            trt_bytes = raw
+
+        # ── TRT Runtime fallback ───────────────────────────────────────────────
+        import tensorrt as trt  # noqa: F401 – optional import
+        trt_logger = trt.Logger(trt.Logger.ERROR)
+        runtime = trt.Runtime(trt_logger)
+        engine = runtime.deserialize_cuda_engine(trt_bytes)
+        if engine is None:
+            return None
+        if hasattr(engine, "num_io_tensors"):  # TRT 10+
+            name = engine.get_tensor_name(0)
+            shape = tuple(engine.get_tensor_shape(name))
+        else:
+            shape = tuple(engine.get_binding_shape(0))
+        print(f"Engine input shape from TRT: {shape}")
+        return shape  # (batch, ch, h, w)
+    except Exception as exc:
+        print(f"Warning: could not read engine input shape from {path}: {exc}")
+        return None
+
+
+def _apply_engine_overrides(model, model_path):
+    # engine 載入後，用 TRT binding shape 補回 imgsz override，讓後續 predict() 前處理正確。
+    shape = _read_engine_input_shape(model_path)
+    if shape is None or len(shape) != 4:
+        return
+    _, ch, h, w = shape
+    imgsz = max(h, w)
+    model.overrides["imgsz"] = imgsz
+    print(f"Applied engine overrides: imgsz={imgsz}, input_channels={ch}")
+
+
+def _get_model_input_channels(model) -> int:
+    """讀取模型的 input channel 數，優先從 .pt checkpoint yaml 取，再試 AutoBackend backend。
+    4c 模型的 .pt 內 yaml["channels"] = 4；找不到時回傳 3（標準 3-channel 模型預設）。
+    """
+    # .pt 路徑：model.model 是 PyTorch YOLO/RTDETR 模型，yaml 存有 channels key
+    try:
+        ch = model.model.yaml.get("channels", None)
+        if ch is not None:
+            return int(ch)
+    except Exception:
+        pass
+    # engine 路徑：AutoBackend backend 的 channels 屬性（由 apply_metadata 設定）
+    try:
+        return int(model.predictor.model.backend.channels)
+    except Exception:
+        pass
+    return 3
+
+
+def _get_model_warmup_imgsz(model) -> int:
+    """讀取模型應使用的 warmup imgsz。
+    優先從 model.overrides（.pt checkpoint 有；engine 需 _apply_engine_overrides 設定過）讀取，
+    再試 model.backend.imgsz（engine metadata），最後回退到 640。
+    """
+    try:
+        raw = model.overrides.get("imgsz", None)
+        if raw is not None:
+            if isinstance(raw, (list, tuple)):
+                return max(int(v) for v in raw)
+            return int(raw)
+    except Exception:
+        pass
+    try:
+        raw = model.predictor.model.backend.imgsz
+        if isinstance(raw, (list, tuple)):
+            return max(int(v) for v in raw)
+        return int(raw)
+    except Exception:
+        pass
+    return 640
+
+
+import contextlib
+
+@contextlib.contextmanager
+def _engine_channel_patch(expected_channels):
+    # 暫時 patch BasePredictor.setup_model，在 AutoBackend 建立後立刻設 channels，
+    # 讓 ultralytics 內部 warmup 用正確的 channels 呼叫 engine。
+    # 只在 trash engine 載入期間有效，結束後還原。
+    try:
+        from ultralytics.engine.predictor import BasePredictor as _BP
+    except Exception:
+        yield
+        return
+
+    _original = _BP.setup_model
+
+    def _patched(self, model, verbose=True):
+        _original(self, model, verbose=verbose)
+        try:
+            if hasattr(self.model, "bindings") and "images" in self.model.bindings:
+                ch = int(self.model.bindings["images"].shape[1])
+                self.model.channels = ch
+                print(f"[engine_channel_patch] Set AutoBackend.channels={ch}")
+        except Exception as exc:
+            print(f"[engine_channel_patch] Warning: {exc}")
+
+    _BP.setup_model = _patched
+    try:
+        yield
+    finally:
+        _BP.setup_model = _original
 
 
 def _default_model_paths_for_batch(batch_size):
@@ -706,15 +871,17 @@ def _warmup_bbox_model(model, batch_size=1):
     )
 
 
-def _warmup_trash_model(model, batch_size=1):
+def _warmup_trash_model(model, batch_size=1, imgsz=640, channels=3):
     # RTDETR litter model warmup：確保垃圾模型在正式迴圈前已初始化。
-    dummy_source = _batched_dummy_frame(batch_size)
+    # engine 傳入 imgsz/channels 才能產生符合 binding shape 的 dummy frame。
+    dummy_source = _batched_dummy_frame(batch_size, imgsz=imgsz, channels=channels)
     model.predict(
         dummy_source,
         conf=0.01,
         device=TRASH_DEVICE,
         half=TRASH_HALF,
         verbose=False,
+        imgsz=imgsz,
     )
 
 
@@ -740,7 +907,8 @@ def _read_frame_batch(cap, motion_masker, batch_size, profiler):
 if __name__ == "__main__":
     # CLI 參數：控制模型、batch 模式、STGCN、車牌辨識與偵測信心門檻。
     parser = argparse.ArgumentParser()
-    parser.add_argument("file", nargs="?", help="file name in resources/", default="TThrow.mp4")
+    parser.add_argument("file", nargs="?", help="video path or file name in resources/", default="TThrow.mp4")
+    parser.add_argument("--output-root", default="output", help="root directory for annotated outputs")
     parser.add_argument(
         "--disable-speed-filter",
         action="store_true",
@@ -749,12 +917,12 @@ if __name__ == "__main__":
     parser.add_argument("--pose-model", default=POSE_MODEL_PATH, help="YOLO pose model path")
     parser.add_argument("--stgcn-weight", default=STGCN_WEIGHT_PATH, help="STGCN++ checkpoint path")
     parser.add_argument("--stgcn-config", default=STGCN_CONFIG_PATH, help="STGCN++ config path")
-    parser.add_argument("--action-threshold", type=float, default=0.5, help="raw STGCN violation confidence threshold")
+    parser.add_argument("--action-threshold", type=float, default=0.5, help="raw STGCN urinate confidence threshold")
     parser.add_argument("--action-window", type=int, default=30, help="STGCN sequence window size")
     parser.add_argument("--urination-window-sec", type=float, default=10.0,
-                        help="lookback seconds for sustained urination confirmation")
+                        help="lookback seconds for sustained urinate confirmation")
     parser.add_argument("--urination-min-sec", type=float, default=8.0,
-                        help="required urination seconds inside --urination-window-sec before alert")
+                        help="required urinate seconds inside --urination-window-sec before alert")
     parser.add_argument("--action-device", default=os.environ.get("ACTION_DEVICE"), help="ACTION_DEVICE override, e.g. cuda:0 or cpu")
     parser.add_argument("--action-predict-interval", type=int, default=None, help="run STGCN every N frames after the sequence window is full")
     parser.add_argument("--action-pose-imgsz", type=int, default=None, help="optional YOLO pose imgsz override")
@@ -827,6 +995,10 @@ if __name__ == "__main__":
     parser.add_argument("--video-encoder", default="auto",
                         choices=("auto", "h264_nvenc", "hevc_nvenc", "libx264"),
                         help="FFmpeg video encoder for annotated output")
+    parser.add_argument("--summary-json", default=None,
+                        help="write machine-readable per-video summary JSON to this path")
+    parser.add_argument("--debug-tracker", action="store_true",
+                        help="Enable per-frame confirmation debug output from GlobalLitterTracker")
     args = parser.parse_args()
     if args.urination_min_sec > args.urination_window_sec:
         parser.error("--urination-min-sec cannot be greater than --urination-window-sec")
@@ -926,14 +1098,40 @@ if __name__ == "__main__":
                 bbox_model_path,
                 desired_actor_batch_size,
             )
+            # engine 載入前先讀 input shape，取得正確的 imgsz 和 channels 供 warmup 使用。
+            # 用 TRT Runtime 讀取，不需要呼叫 predict()。
+            _trash_engine_shape = _read_engine_input_shape(trash_model_candidates[0]) if trash_model_candidates else None
+            _trash_warmup_imgsz = int(_trash_engine_shape[2]) if _trash_engine_shape else 640
+            _trash_warmup_channels = int(_trash_engine_shape[1]) if _trash_engine_shape else 3
+
+            def _trash_warmup(model, model_path):
+                # 依實際 engine binding shape 建 dummy frame。
+                # _read_engine_input_shape 先從 metadata JSON 讀取（快速），
+                # 找不到才退回 TRT Runtime 解析；.pt 路徑從 model yaml 讀 channels/imgsz。
+                engine_shape = _read_engine_input_shape(model_path)
+                if engine_shape is not None:
+                    _apply_engine_overrides(model, model_path)
+                    imgsz = int(engine_shape[2])
+                    channels = int(engine_shape[1])
+                else:
+                    # .pt 或無法讀取 shape 的 engine：從模型本身讀取 channels / imgsz
+                    channels = _get_model_input_channels(model)
+                    imgsz = _get_model_warmup_imgsz(model)
+                    if imgsz != 640:
+                        model.overrides["imgsz"] = imgsz
+                    print(f"[trash_warmup] fallback: imgsz={imgsz}, channels={channels}")
+                _warmup_trash_model(
+                    model,
+                    _engine_batch_size_from_path(model_path, args.batch_size),
+                    imgsz=imgsz,
+                    channels=channels,
+                )
+
             model_trash, trash_model_path = _load_model_with_warmup(
                 "trash_rtdetr",
                 trash_model_candidates,
                 RTDETR,
-                lambda model, model_path: _warmup_trash_model(
-                    model,
-                    _engine_batch_size_from_path(model_path, args.batch_size),
-                ),
+                _trash_warmup,
                 profiler,
             )
             trash_runtime_batch_size = _engine_batch_size_from_path(
@@ -969,11 +1167,11 @@ if __name__ == "__main__":
                 )
 
             # === 影片處理參數設定 ===
-            video_path = f"resources/{args.file}"
-            output_dir = "output"
+            video_path = _resolve_video_path(args.file)
+            output_dir = Path(args.output_root).expanduser()
             with profiler.time_block("setup.output_dir"):
-                os.makedirs(output_dir, exist_ok = True)
-            final_output = os.path.join(output_dir, f"{Path(video_path).stem}_annotated.mp4")
+                output_dir.mkdir(parents=True, exist_ok=True)
+            final_output = str(output_dir / f"{Path(video_path).stem}_annotated.mp4")
 
             with profiler.time_block("video.open_capture"):
                 # 讀取影片屬性；fps 無效時用 30 避免 writer 初始化失敗。
@@ -1019,6 +1217,8 @@ if __name__ == "__main__":
             # 垃圾反追蹤物件初始化
             with profiler.time_block("setup.litter_tracker"):
                 litter_tracker = GlobalLitterTracker(distance_threshold=250)
+                if getattr(args, 'debug_tracker', False):
+                    litter_tracker._debug = True
 
             # 紀錄車輛歷史軌跡
             vehicle_history = defaultdict(lambda: {
@@ -1034,9 +1234,15 @@ if __name__ == "__main__":
                 'filtered_litter_candidates': 0,
                 'confirmed_litter_ids': set(),
                 'confirmed_litter_frame_hits': 0,
+                'confirmed_litter_thrower_ids': set(),
+                'confirmed_litter_thrower_frame_hits': 0,
+                'backtracked_thrower_ids': set(),
+                'backtracked_thrower_frame_hits': 0,
                 'first_confirmed_litter_frame': None,
                 'rtdetr_batch_zero_frames': 0,
                 'rtdetr_batch_zero_repaired_frames': 0,
+                'person_frame_hits': 0,
+                'person_detections': 0,
                 'yolo_actor_infer_frames': 0,
                 'yolo_actor_padded_frames': 0,
                 'stgcn_person_frames': 0,
@@ -1051,6 +1257,7 @@ if __name__ == "__main__":
             yolo_seg_cache = {}
             rtdetr_batch_context = {}
             frame_index = 0
+            last_frame = None  # Track previous frame for 4-channel litter detection
             if not args.disable_async_reader:
                 with profiler.time_block("video.start_async_reader"):
                     frame_reader = AsyncVideoFrameReader(
@@ -1091,6 +1298,8 @@ if __name__ == "__main__":
 
                         with profiler.time_block("detect.total"):
                             if args.batch_size > 1:
+                                # Create prev_frames list: first frame's prev is last_frame from previous batch
+                                prev_frames = [last_frame] + frames[:-1]
                                 annotated_frames = detect_batch(
                                     frames, model_bbox, model_trash, COLORS,
                                     fg_masks, litter_tracker, vehicle_history,
@@ -1120,7 +1329,11 @@ if __name__ == "__main__":
                                     rtdetr_batch_context=rtdetr_batch_context,
                                     actor_mode=args.actor_mode,
                                     actor_track_iou=args.actor_track_iou,
+                                    prev_frames=prev_frames,
                                 )
+                                # Update last_frame for next batch
+                                if frames:
+                                    last_frame = frames[-1]
                             else:
                                 annotated_frames = [
                                     detect(
@@ -1147,8 +1360,12 @@ if __name__ == "__main__":
                                         stats=detection_stats,
                                         actor_mode=args.actor_mode,
                                         actor_track_iou=args.actor_track_iou,
+                                        prev_frame=last_frame,
                                     )
                                 ]
+                                # Update last_frame for next iteration
+                                if frames:
+                                    last_frame = frames[0]
 
                         with profiler.time_block("frame.write_output"):
                             # detect_batch 可能回傳多幀；保持輸出順序與讀取順序一致。
@@ -1169,30 +1386,85 @@ if __name__ == "__main__":
                 out = None
             print(f"Video saved to {final_output}")
             confirmed_litter_ids = detection_stats.get('confirmed_litter_ids', set())
+            confirmed_litter_thrower_ids = detection_stats.get('confirmed_litter_thrower_ids', set())
+            backtracked_thrower_ids = detection_stats.get('backtracked_thrower_ids', set())
             first_confirmed = detection_stats.get('first_confirmed_litter_frame')
             first_confirmed_text = "None" if first_confirmed is None else str(first_confirmed)
+            stgcn_urinate = int(detection_stats.get('stgcn_pred_urinate', 0))
+            stgcn_urinate_confirmed = int(detection_stats.get('stgcn_urinate_confirmed', 0))
             print(
                 "Litter detection summary: "
                 f"raw_candidates={detection_stats.get('raw_litter_candidates', 0)}, "
                 f"motion_filtered_candidates={detection_stats.get('filtered_litter_candidates', 0)}, "
                 f"confirmed_ids={len(confirmed_litter_ids)}, "
                 f"confirmed_frame_hits={detection_stats.get('confirmed_litter_frame_hits', 0)}, "
+                f"confirmed_thrower_ids={len(confirmed_litter_thrower_ids)}, "
+                f"backtracked_thrower_ids={len(backtracked_thrower_ids)}, "
                 f"first_confirmed_frame={first_confirmed_text}, "
                 f"rtdetr_zero_frames={detection_stats.get('rtdetr_batch_zero_frames', 0)}, "
                 f"rtdetr_zero_repaired={detection_stats.get('rtdetr_batch_zero_repaired_frames', 0)}, "
+                f"person_frame_hits={detection_stats.get('person_frame_hits', 0)}, "
+                f"person_detections={detection_stats.get('person_detections', 0)}, "
                 f"yolo_actor_infer_frames={detection_stats.get('yolo_actor_infer_frames', 0)}, "
                 f"yolo_actor_padded_frames={detection_stats.get('yolo_actor_padded_frames', 0)}, "
                 f"stgcn_person_frames={detection_stats.get('stgcn_person_frames', 0)}, "
                 f"stgcn_pose_matches={detection_stats.get('stgcn_pose_matches', 0)}, "
                 f"stgcn_window_ready={detection_stats.get('stgcn_window_ready', 0)}, "
                 f"stgcn_predicts={detection_stats.get('stgcn_predict_calls', 0)}, "
-                f"stgcn_littering={detection_stats.get('stgcn_pred_littering', 0)}, "
-                f"stgcn_urination={detection_stats.get('stgcn_pred_urination', 0)}, "
-                f"stgcn_urination_blocked_on_vehicle={detection_stats.get('stgcn_urination_blocked_on_vehicle', 0)}, "
-                f"stgcn_urination_confirmed={detection_stats.get('stgcn_urination_confirmed', 0)}, "
+                f"stgcn_urinate={stgcn_urinate}, "
+                f"stgcn_urinate_blocked_on_vehicle={detection_stats.get('stgcn_urinate_blocked_on_vehicle', 0)}, "
+                f"stgcn_urinate_confirmed={stgcn_urinate_confirmed}, "
                 f"stgcn_alerts={detection_stats.get('stgcn_alerts', 0)}, "
                 f"stgcn_registered_violators={detection_stats.get('stgcn_registered_violators', 0)}"
             )
+            run_summary = {
+                "input_video": str(video_path),
+                "output_video": str(final_output),
+                "processed_frames": int(processed_frames),
+                "total_frames": int(total_frames),
+                "rtdetr_enabled": True,
+                "stgcn_pose_enabled": not bool(args.disable_action),
+                "plate_enabled": not bool(args.disable_plate),
+                "raw_litter_candidates": int(detection_stats.get('raw_litter_candidates', 0)),
+                "filtered_litter_candidates": int(detection_stats.get('filtered_litter_candidates', 0)),
+                "confirmed_litter_ids": len(confirmed_litter_ids),
+                "confirmed_litter_frame_hits": int(detection_stats.get('confirmed_litter_frame_hits', 0)),
+                "confirmed_litter_thrower_ids": len(confirmed_litter_thrower_ids),
+                "confirmed_litter_thrower_frame_hits": int(
+                    detection_stats.get('confirmed_litter_thrower_frame_hits', 0)
+                ),
+                "backtracked_thrower_ids": len(backtracked_thrower_ids),
+                "backtracked_thrower_frame_hits": int(
+                    detection_stats.get('backtracked_thrower_frame_hits', 0)
+                ),
+                "person_frame_hits": int(detection_stats.get('person_frame_hits', 0)),
+                "person_detections": int(detection_stats.get('person_detections', 0)),
+                "stgcn_person_frames": int(detection_stats.get('stgcn_person_frames', 0)),
+                "stgcn_pose_matches": int(detection_stats.get('stgcn_pose_matches', 0)),
+                "stgcn_pose_unmatched": int(detection_stats.get('stgcn_pose_unmatched', 0)),
+                "stgcn_pose_boxes": int(detection_stats.get('stgcn_pose_boxes', 0)),
+                "stgcn_window_ready": int(detection_stats.get('stgcn_window_ready', 0)),
+                "stgcn_predict_calls": int(detection_stats.get('stgcn_predict_calls', 0)),
+                "stgcn_urination": stgcn_urinate,
+                "stgcn_pred_urinate": stgcn_urinate,
+                "stgcn_urinate_confirmed": stgcn_urinate_confirmed,
+                "stgcn_alerts": int(detection_stats.get('stgcn_alerts', 0)),
+                "stgcn_registered_violators": int(detection_stats.get('stgcn_registered_violators', 0)),
+                "has_urinate": stgcn_urinate > 0 or stgcn_urinate_confirmed > 0,
+                "has_littering": False,
+                "has_confirm_litter": len(confirmed_litter_ids) > 0,
+                "has_confirmed_litter_thrower": len(confirmed_litter_thrower_ids) > 0,
+                "has_backtracked_thrower": len(backtracked_thrower_ids) > 0,
+                "has_keypoints": int(detection_stats.get('stgcn_pose_matches', 0)) > 0,
+                "has_person": int(detection_stats.get('person_detections', 0)) > 0,
+            }
+            if args.summary_json:
+                summary_path = Path(args.summary_json).expanduser()
+                summary_path.parent.mkdir(parents=True, exist_ok=True)
+                summary_path.write_text(
+                    json.dumps(run_summary, ensure_ascii=False, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
 
             if litter_tracker is not None:
                 litter_tracker.close()

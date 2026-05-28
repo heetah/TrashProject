@@ -32,24 +32,58 @@ class GlobalLitterTracker:
         self.confirmed_shape_change_ratio = 1.20
         # pending 轉 confirmed 的最低觀測幀數與位移條件
         self.min_confirm_age = 2
-        self.min_confirm_abs_displacement = 18.0
-        self.min_confirm_downward_displacement = 10.0
-        self.min_confirm_horizontal_displacement = 8.0
+        self.min_confirm_abs_displacement = 14.0
+        self.min_confirm_downward_displacement = 7.0
+        self.min_confirm_horizontal_displacement = 5.0
+        # vehicle/scooter thrower 需要更強的確認門檻，避免車輛部件被誤認為丟棄物。
+        # 分析顯示 FP 案例中 thrower 幾乎全為 vehicle，且幾乎都在 age=2 就 confirm；
+        # 提高至 age=3 + 更嚴格的向下位移門檻可排除大多數車輛假陽性。
+        self.min_confirm_age_vehicle = 3   # 車輛 thrower 需要 age >= 3 才能 confirm
+        self.min_confirm_downward_displacement_vehicle = 12.0  # 車輛 thrower 需更明顯向下位移
+        # vehicle thrower 確認時，水平位移不可超過向下位移的 N 倍（防純水平滑動假陽性）。
+        # FP 案例的水平/向下比值往往 > 4；真實丟擲通常 < 3。
+        self.max_horiz_to_down_ratio_vehicle = 3.5
+        # vehicle thrower 確認時，軌跡中任意相鄰兩幀的最大位移（px/frame）。
+        # resize.mp4 實測：快速丟擲的第一步位移可達 147px，因此從 80.0 提高至 200.0。
+        # 真實丟棄物最大單步：~150px；車輛部件整幀持續移動通常也在此範圍。
+        # 本欄位保留以供未來精細調整，主要靠 is_static_candidate / litter_holding 攔截靜態假陽性。
+        self.max_vehicle_thrower_step_px = 200.0
+        # 靜止舊垃圾抑制：候選的歷史中心點若長期落在小範圍內，視為地上既有垃圾，永遠不 confirm。
+        # 4c 說明：change channel 已在 detector 端過濾靜止物件，此處只需排除 ≤ 2-3px 的 detector jitter。
+        # 閾值從 3c 的 18.0 降至 10.0：典型丟擲在 3 幀後 span ≈ 14-20px；
+        # 靜止物件的 jitter 通常 ≤ 3-4px，仍被正確壓制。
+        self.static_candidate_min_age = 3
+        self.min_history_span_for_confirm = 10.0
+        # 永久靜止標記：candidate 連續 stationary_lock_age 幀都未脫離靜止半徑後，
+        # 即使之後 detector 抖出大位移也不再允許 confirm，避免「靜止 → 偶發大抖動」誤觸發。
+        # 4c 說明：span 閾值從 12.0 降至 8.0，避免真正慢速丟擲（span ≈ 9-11px）被永久鎖定。
+        self.stationary_lock_age = 10
+        self.stationary_lock_span = 8.0
 
         self.person_to_vehicle_history = {}
         # 反追蹤 thrower 時，用車輛/機車 bbox 底邊點估計地面 homography，
         # 把 2D 影像點轉成 pseudo-ground 座標後再計算距離。
         self.homography_min_depth = 25.0
         self.thrower_previous_bonus = 0.85
-        self.thrower_fallback_score_limit = 1.35
+        # 4c 調整 (原 3c: 1.35, 前次 4c 收緊至 1.10)：
+        # 1.10 過嚴，score 稍超 1.0 的近距 actor 被排除；
+        # 1.25 在允許略遠的合理 thrower 的同時，仍攔截遠方路過 actor。
+        self.thrower_fallback_score_limit = 1.25
+        # 出生時 fallback thrower 必須與 litter bbox 邊距小於此值；
+        # 抑制靜止舊垃圾被遠方路過 actor 認領為丟擲者。
+        # 4c 從 220.0 放寬至 270.0，容許水平拋出落點距 actor bbox 邊緣較遠的情況。
+        self.thrower_birth_box_dist_limit = 270.0
         # 長距離丟出後，垃圾當前點會離 thrower 很遠；只在軌跡起點貼近 actor 時啟用較寬的反追蹤 fallback。
         self.thrower_release_origin_score_limit = 4.0
         # backward resolver：confirmed 後回推到 litter 出生幀，用 actor ring buffer 找 thrower。
         self.backward_actor_history_len = 120
         self.backward_pre_birth_frames = 24
         self.backward_post_birth_frames = 18
-        self.backward_score_limit = 2.30
-        self.backward_release_score_limit = 3.60
+        # 4c 調整 (原 3c: 2.30 / 3.60, 前次 4c 收緊至 1.95 / 3.20)：
+        # 1.95 過嚴，導致 backward resolver 找不到合理 thrower；
+        # 恢復至介於兩者之間，保持稍嚴但不阻斷合理反追蹤。
+        self.backward_score_limit = 2.10
+        self.backward_release_score_limit = 3.40
         self.backward_plate_roi_per_result = 3
         # STGCN 判定 person 違規時，往回看 actor history 找曾經重疊的 vehicle/scooter。
         self.action_vehicle_backtrack_frames = 90
@@ -67,6 +101,8 @@ class GlobalLitterTracker:
         )
         self._backward_thread.start()
         self._fallback_frame_index = 0
+        # Debug mode: set to True via tracker._debug = True to enable per-frame prints
+        self._debug = False
 
     def update(self, detected_litters, actors, person_vehicle_map=None, frame_index=None,
                frame=None, vehicle_history=None):
@@ -140,6 +176,10 @@ class GlobalLitterTracker:
                 )
 
                 if dist < self.distance_threshold and (is_shape_consistent or allow_confirmed_dist_only) and dist < min_dist:
+                    # 靜止鎖定的 pending litter 不吸收新偵測：讓新的偵測另開新軌跡，
+                    # 避免靜止舊垃圾鎖住真正丟棄的垃圾軌跡起點。
+                    if l_data.get('stationary_locked', False) and prev_state == 'pending':
+                        continue
                     min_dist = dist
                     best_id = l_id
 
@@ -171,7 +211,7 @@ class GlobalLitterTracker:
 
                     # 取得初始長寬
                     init_w, init_h = l_data.get('init_shape', (curr_w, curr_h))
-                    
+
                     # 1. 判定移動距離與向下位移是否達標
                     start_centroid = l_data['history'][0]
                     moved_dist = distance.euclidean(start_centroid, centroid)
@@ -183,29 +223,121 @@ class GlobalLitterTracker:
                     is_downward_enough = downward_disp >= self.min_confirm_downward_displacement
                     horizontal_disp = abs(float(centroid[0] - start_centroid[0]))
                     is_horizontal_enough = horizontal_disp >= self.min_confirm_horizontal_displacement
-                    
+
                     # 2. 使用軌跡物理特徵檢查（至少要有足夠歷史幀）
                     is_physics_valid = False
                     if age >= self.min_confirm_age:
                         is_physics_valid, _ = validate_trajectory(l_data['history'])
 
-                    # 3. confirmed 條件：
+                    # 2.5 靜止舊垃圾抑制：歷史中心點最大跨距 (x/y 軸 span 取大)。
+                    # 真正被丟出的垃圾在 age >= 3 時 span 通常 > 30 px；
+                    # 靜止舊垃圾即使 detector 抖動也很少同時在 x/y 上拉出 > 18 px。
+                    history_xs = [p[0] for p in l_data['history']]
+                    history_ys = [p[1] for p in l_data['history']]
+                    if len(history_xs) >= 2:
+                        history_max_span = max(
+                            max(history_xs) - min(history_xs),
+                            max(history_ys) - min(history_ys),
+                        )
+                    else:
+                        history_max_span = 0.0
+
+                    # 短期靜止：在最低 confirm age 之上，但 span 仍小 → 視為靜止候選不 confirm。
+                    is_static_candidate = (
+                        age >= self.static_candidate_min_age and
+                        history_max_span < self.min_history_span_for_confirm
+                    )
+
+                    # 長期靜止鎖：若曾連續 stationary_lock_age 幀都在小半徑內，
+                    # 永久標記 stationary_locked，避免後續單一大抖動衝過 confirm。
+                    if (
+                        age >= self.stationary_lock_age and
+                        history_max_span < self.stationary_lock_span and
+                        not l_data.get('stationary_locked', False)
+                    ):
+                        l_data['stationary_locked'] = True
+                    stationary_locked = bool(l_data.get('stationary_locked', False))
+
+                    # 3. confirmed 條件 (litter object-event branch 唯一入口)：
+                    # - 必須有明確 thrower (避免靜止舊垃圾沿用遠方 actor)
+                    # - 不可為靜止候選或被靜止鎖鎖定
                     # - 軌跡符合物理特性且有向下位移
-                    # - 或 有明顯位移 + 向下位移 + 具 thrower 關聯（避免舊垃圾堆誤判）
+                    # - 或 有明顯位移 + 向下位移 + 具 thrower 關聯
+
+                    # 車輛/機車 thrower 的加嚴確認條件：
+                    # 分析顯示 FP 案例幾乎都是 vehicle thrower + age=2；
+                    # 加嚴 min_age 與向下位移門檻，排除車輛部件或快速車輛造成的假陽性。
+                    is_vehicle_thrower = (
+                        thrower_key is not None and
+                        thrower_key[0] in ('vehicle', 'scooter')
+                    )
+                    effective_min_age = (
+                        self.min_confirm_age_vehicle
+                        if is_vehicle_thrower
+                        else self.min_confirm_age
+                    )
+                    effective_min_downward = (
+                        self.min_confirm_downward_displacement_vehicle
+                        if is_vehicle_thrower
+                        else self.min_confirm_downward_displacement
+                    )
+                    is_downward_enough_effective = (
+                        downward_disp >= effective_min_downward
+                    )
+                    # 若 thrower 為車輛，且水平位移遠大於向下位移（純水平滑動），則不 confirm。
+                    is_horiz_ratio_ok = True
+                    if is_vehicle_thrower and downward_disp > 0:
+                        horiz_ratio = horizontal_disp / max(downward_disp, 1e-6)
+                        if horiz_ratio > self.max_horiz_to_down_ratio_vehicle:
+                            is_horiz_ratio_ok = False
+
+                    # 車輛 thrower：軌跡任意相鄰幀最大位移過大 → 車輛本體移動誤觸發，拒絕 confirm。
+                    # 真實丟棄物的單步位移通常 < 80px；車輛部件可達 100-250px。
+                    is_step_velocity_ok = True
+                    if is_vehicle_thrower and len(l_data['history']) >= 2:
+                        hist_pts = l_data['history']
+                        _max_step = max(
+                            distance.euclidean(hist_pts[i], hist_pts[i + 1])
+                            for i in range(len(hist_pts) - 1)
+                        )
+                        if _max_step > self.max_vehicle_thrower_step_px:
+                            is_step_velocity_ok = False
+
                     can_confirm_by_trajectory = (
-                        age >= self.min_confirm_age and
+                        age >= effective_min_age and
                         is_physics_valid and
-                        is_downward_enough and
+                        is_downward_enough_effective and
                         is_horizontal_enough and
-                        (age >= 3 or thrower_key is not None)
+                        is_horiz_ratio_ok and
+                        is_step_velocity_ok and
+                        thrower_key is not None and
+                        not is_static_candidate and
+                        not stationary_locked
                     )
                     can_confirm_by_motion = (
-                        age >= self.min_confirm_age and
+                        age >= effective_min_age and
                         is_moved_enough and
-                        is_downward_enough and
+                        is_downward_enough_effective and
                         is_horizontal_enough and
-                        thrower_key is not None
+                        is_horiz_ratio_ok and
+                        is_step_velocity_ok and
+                        thrower_key is not None and
+                        not is_static_candidate and
+                        not stationary_locked
                     )
+
+                    if getattr(self, '_debug', False) and age >= 2:
+                        print(
+                            f"  [TRK fi={frame_index} lid={best_id} age={age}] "
+                            f"span={history_max_span:.1f} moved={moved_dist:.1f} "
+                            f"down={downward_disp:.1f} horiz={horizontal_disp:.1f} "
+                            f"thrower={thrower_key} veh={is_vehicle_thrower} "
+                            f"eff_age={effective_min_age} eff_down={effective_min_downward:.0f} "
+                            f"horiz_ok={is_horiz_ratio_ok} step_ok={is_step_velocity_ok} "
+                            f"static={is_static_candidate} locked={stationary_locked} "
+                            f"traj={is_physics_valid} "
+                            f"can_traj={can_confirm_by_trajectory} can_mot={can_confirm_by_motion}"
+                        )
 
                     if can_confirm_by_trajectory or can_confirm_by_motion:
                         state = 'confirmed' # 確認為垃圾！
@@ -256,7 +388,7 @@ class GlobalLitterTracker:
                                 )
                 
                 new_active_litters[best_id] = {
-                    'bbox': litter_box, 
+                    'bbox': litter_box,
                     'history': l_data['history'],
                     'missed': 0,
                     'thrower_key': thrower_key,
@@ -270,6 +402,7 @@ class GlobalLitterTracker:
                     'history_frames': (l_data.get('history_frames', []) + [frame_index])[-self.trajectory_history_len:],
                     'backward_submitted': l_data.get('backward_submitted', False) or state == 'confirmed',
                     'backward_result': l_data.get('backward_result'),
+                    'stationary_locked': bool(l_data.get('stationary_locked', False)),
                     'ref_shape': (
                         0.7 * float(l_data.get('ref_shape', l_data['init_shape'])[0]) + 0.3 * float(curr_w),
                         0.7 * float(l_data.get('ref_shape', l_data['init_shape'])[1]) + 0.3 * float(curr_h),
@@ -287,11 +420,11 @@ class GlobalLitterTracker:
                 litter_id = self.next_id
                 new_active_litters[litter_id] = {
                     'bbox': litter_box,
-                    'history': [centroid], 
+                    'history': [centroid],
                     'missed': 0,
                     'thrower_key': thrower_key,        # 紀錄嫌疑犯
                     'thrower_center': thrower_center,
-                    'age': 1, 
+                    'age': 1,
                     'state': 'pending',
                     'init_shape': (curr_w, curr_h),
                     'ref_shape': (curr_w, curr_h),
@@ -301,6 +434,7 @@ class GlobalLitterTracker:
                     'history_frames': [frame_index],
                     'backward_submitted': False,
                     'backward_result': None,
+                    'stationary_locked': False,
                 }
 
                 self.next_id += 1
@@ -511,6 +645,14 @@ class GlobalLitterTracker:
         if birth_anchor is None:
             return None
 
+        # 取得最後確認時的地面點，作為真實世界座標的基準 (避免空中的 birth_anchor 投影出錯)
+        ground_ref = task.get('current_bbox')
+        if ground_ref is None:
+            ground_ref = task.get('current_centroid')
+        ground_anchor = self._litter_ground_anchor(ground_ref)
+        if ground_anchor is None:
+            ground_anchor = birth_anchor
+
         history = task.get('history') or []
         prev_thrower_key = task.get('prev_thrower_key')
         birth_frame = int(task.get('birth_frame', 0))
@@ -526,10 +668,10 @@ class GlobalLitterTracker:
             if not actors:
                 continue
 
-            homography = self._estimate_ground_homography(actors, birth_anchor)
-            birth_world = self._project_point(birth_anchor, homography)
-            start_world = self._project_point(history[0], homography) if history else None
-            end_world = self._project_point(history[-1], homography) if history else None
+            homography = self._estimate_ground_homography(actors, ground_anchor)
+            ground_world = self._project_point(ground_anchor, homography)
+            start_2d = history[0] if history else None
+            end_2d = history[-1] if history else None
 
             for actor_snapshot in frame_snapshot.get('actors', []):
                 actor = self._snapshot_to_actor(actor_snapshot)
@@ -539,9 +681,9 @@ class GlobalLitterTracker:
                 score, release_like = self._score_backward_actor(
                     actor=actor,
                     birth_anchor=birth_anchor,
-                    birth_world=birth_world,
-                    start_world=start_world,
-                    end_world=end_world,
+                    ground_world=ground_world,
+                    start_2d=start_2d,
+                    end_2d=end_2d,
                     homography=homography,
                     history=history,
                     frame_index=frame_index,
@@ -616,11 +758,11 @@ class GlobalLitterTracker:
             'plate_blocked_since_litter': plate_key is not None and not plate_roi_items,
         }
 
-    def _score_backward_actor(self, actor, birth_anchor, birth_world,
-                              start_world, end_world, homography, history,
+    def _score_backward_actor(self, actor, birth_anchor, ground_world,
+                              start_2d, end_2d, homography, history,
                               frame_index, birth_frame, prev_thrower_key=None):
         cls_name = str(actor.get('cls', '')).lower()
-        if cls_name not in ('person', 'vehicle', 'scooter') or birth_world is None:
+        if cls_name not in ('person', 'vehicle', 'scooter') or ground_world is None:
             return None, False
 
         try:
@@ -635,8 +777,8 @@ class GlobalLitterTracker:
             return None, False
 
         world_dist = math.hypot(
-            birth_world[0] - actor_world[0],
-            birth_world[1] - actor_world[1],
+            ground_world[0] - actor_world[0],
+            ground_world[1] - actor_world[1],
         )
         world_width = self._projected_actor_width((ax1, ay1, ax2, ay2), homography)
         if cls_name in ('vehicle', 'scooter'):
@@ -647,20 +789,26 @@ class GlobalLitterTracker:
             origin_margin = max(75.0, (ax2 - ax1) * 1.25, (ay2 - ay1) * 0.45)
 
         score = world_dist / max(threshold, 1e-6)
+        
+        box_dist = self._point_to_box_distance(birth_anchor, actor['box'])
+        if box_dist == 0.0:
+            score = min(score, 1.8)
+
         if actor_key == prev_thrower_key:
             score *= self.thrower_previous_bonus
 
-        if start_world is not None and end_world is not None:
-            score *= self._trajectory_direction_factor(actor_world, start_world, end_world)
+        if start_2d is not None and end_2d is not None:
+            score *= self._trajectory_direction_factor_2d(actor_anchor, start_2d, end_2d)
 
         frame_gap = abs(int(frame_index) - int(birth_frame))
         score *= (1.0 + min(frame_gap, 45) * 0.025)
 
         release_like = self._release_origin_near_actor(history, actor)
         if release_like:
+            score = min(score, 2.2)
             score *= 0.82
 
-        if self._point_to_box_distance(birth_anchor, actor['box']) <= origin_margin:
+        if box_dist <= origin_margin:
             score *= 0.88
 
         return score, release_like
@@ -894,7 +1042,7 @@ class GlobalLitterTracker:
         frame_index=None,
         vehicle_history=None,
     ):
-        # STGCN 旁路：動作模型已判定違規動作時，直接註冊 person，並反追蹤其 vehicle/scooter。
+        # STGCN 旁路只接受 urinate；littering 一律由 litter object-event branch 確認。
         if not person_action_map:
             return set()
 
@@ -914,8 +1062,9 @@ class GlobalLitterTracker:
                 continue
 
             action_name = str(action_info.get('action', '')).strip().lower()
-            if action_name not in ('littering', 'urination'):
-                action_name = None
+            if action_name not in ('urinate', 'urination', 'urinating'):
+                continue
+            action_name = 'urinate'
 
             try:
                 person_id = int(raw_person_id)
@@ -1107,11 +1256,11 @@ class GlobalLitterTracker:
 
         homography = self._estimate_ground_homography(actors, litter_anchor)
         litter_world = self._project_point(litter_anchor, homography)
-        start_world = None
-        end_world = None
+        start_2d = None
+        end_2d = None
         if history and len(history) >= 2:
-            start_world = self._project_point(history[0], homography)
-            end_world = self._project_point(history[-1], homography)
+            start_2d = history[0]
+            end_2d = history[-1]
 
         for actor in actors:
             cls_name = str(actor.get('cls', '')).lower()
@@ -1138,15 +1287,30 @@ class GlobalLitterTracker:
             world_width = self._projected_actor_width((ax1, ay1, ax2, ay2), homography)
             if cls_name in ('vehicle', 'scooter'):
                 threshold = max(180.0, world_width * 0.75)
+                origin_margin = max(130.0, (ax2 - ax1) * 1.05, (ay2 - ay1) * 0.45)
             else:
                 threshold = max(90.0, world_width * 1.8)
+                origin_margin = max(75.0, (ax2 - ax1) * 1.25, (ay2 - ay1) * 0.45)
 
             score = world_dist / max(threshold, 1e-6)
+            
+            box_dist = self._point_to_box_distance(history[0], actor['box']) if history else self._point_to_box_distance(litter_anchor, actor['box'])
+            if box_dist == 0.0:
+                score = min(score, 1.8)
+
             if actor_key == prev_thrower_key:
                 score *= self.thrower_previous_bonus
 
-            if start_world is not None and end_world is not None:
-                score *= self._trajectory_direction_factor(actor_world, start_world, end_world)
+            if start_2d is not None and end_2d is not None:
+                score *= self._trajectory_direction_factor_2d(actor_anchor, start_2d, end_2d)
+                
+            release_like = self._release_origin_near_actor(history, actor)
+            if release_like:
+                score = min(score, 2.2)
+                score *= 0.82
+
+            if box_dist <= origin_margin:
+                score *= 0.88
 
             if score < fallback_score:
                 fallback_score = score
@@ -1172,8 +1336,23 @@ class GlobalLitterTracker:
             fallback_actor_key is not None and
             fallback_score <= self.thrower_fallback_score_limit
         ):
-            best_actor_key = fallback_actor_key
-            best_center = fallback_center
+            # fallback 必須要有 actor bbox 與 litter 邊距夠近的證據；
+            # 否則靜止舊垃圾會被遠方路過的 actor 認領為 thrower 並過 confirm。
+            fallback_box_dist = float('inf')
+            fallback_anchor = history[0] if history else litter_anchor
+            for actor in actors:
+                try:
+                    actor_id_key = (str(actor.get('cls', '')).lower(), int(actor['track_id']))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if actor_id_key != fallback_actor_key:
+                    continue
+                fallback_box_dist = self._point_to_box_distance(fallback_anchor, actor['box'])
+                break
+
+            if fallback_box_dist <= self.thrower_birth_box_dist_limit:
+                best_actor_key = fallback_actor_key
+                best_center = fallback_center
         elif best_actor_key is None and release_actor_key is not None:
             best_actor_key = release_actor_key
             best_center = release_center
@@ -1313,6 +1492,26 @@ class GlobalLitterTracker:
         # 軌跡方向若像是從 actor 往外離開，稍微降低該 actor 的 score。
         move_vec = (end_world[0] - start_world[0], end_world[1] - start_world[1])
         from_actor_vec = (start_world[0] - actor_world[0], start_world[1] - actor_world[1])
+        move_len = math.hypot(move_vec[0], move_vec[1])
+        actor_len = math.hypot(from_actor_vec[0], from_actor_vec[1])
+        if move_len < 1e-6 or actor_len < 1e-6:
+            return 1.0
+
+        cosine = (
+            move_vec[0] * from_actor_vec[0] +
+            move_vec[1] * from_actor_vec[1]
+        ) / (move_len * actor_len)
+        if cosine >= 0.25:
+            return 0.9
+        if cosine <= -0.25:
+            return 1.15
+        return 1.0
+
+    @staticmethod
+    def _trajectory_direction_factor_2d(actor_anchor, start_2d, end_2d):
+        # 使用 2D 影像座標計算軌跡方向，避免空中點投影後產生巨大誤差。
+        move_vec = (end_2d[0] - start_2d[0], end_2d[1] - start_2d[1])
+        from_actor_vec = (start_2d[0] - actor_anchor[0], start_2d[1] - actor_anchor[1])
         move_len = math.hypot(move_vec[0], move_vec[1])
         actor_len = math.hypot(from_actor_vec[0], from_actor_vec[1])
         if move_len < 1e-6 or actor_len < 1e-6:

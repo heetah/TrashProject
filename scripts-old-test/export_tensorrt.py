@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 import cv2
+import numpy as np
 import torch
 from ultralytics import RTDETR, YOLO
 
@@ -13,10 +14,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # 匯出預設需和 main.py 對齊：batch 1 用 root 權重，batch N 用 modules_weight/batch。
 SUPPORTED_BATCH_SIZES = (1, 2, 4, 8, 12, 16, 24)
 ROOT_BBOX_MODEL = PROJECT_ROOT / "modules_weight" / "best-yolo-seg_v3.pt"
-ROOT_TRASH_MODEL = PROJECT_ROOT / "modules_weight" / "best-rtdetr-seg.pt"
+ROOT_TRASH_MODEL = PROJECT_ROOT / "modules_weight" / "best-rtdetr-4c.pt"
 ROOT_POSE_MODEL = PROJECT_ROOT / "modules_weight" / "yolo26x-pose.pt"
 BATCH_BBOX_MODEL = PROJECT_ROOT / "modules_weight" / "batch" / "best-yolo-seg_v3.pt"
-BATCH_TRASH_MODEL = PROJECT_ROOT / "modules_weight" / "batch" / "best-rtdetr-seg.pt"
+# best-rtdetr-4c.pt 沒有 batch/ 版本，使用 root 同一份權重做 batch engine export。
+BATCH_TRASH_MODEL = ROOT_TRASH_MODEL
 DEFAULT_SMOKE_VIDEO = PROJECT_ROOT / "resources" / "resize.mp4"
 
 
@@ -126,6 +128,26 @@ def _keypoint_counts(results, keep_count):
     return counts
 
 
+def _build_4ch_frames(frames: list) -> list:
+    """將連續 BGR frames 轉成 4-channel (BGR + pixel-change map) 格式。
+    用於 4c trash model 的 smoke test。change map 以相鄰幀 absdiff 計算。
+    """
+    import cv2
+    result = []
+    for i, fr in enumerate(frames):
+        prev = frames[i - 1] if i > 0 else None
+        if prev is None:
+            diff = cv2.cvtColor(
+                cv2.absdiff(np.zeros_like(fr), fr),
+                cv2.COLOR_BGR2GRAY,
+            )
+        else:
+            diff = cv2.cvtColor(cv2.absdiff(prev, fr), cv2.COLOR_BGR2GRAY)
+        diff = np.clip(diff.astype(np.float32) * 2.0, 0, 255).astype(np.uint8)
+        result.append(np.dstack((fr, diff)))
+    return result
+
+
 def _smoke_test_engine(label, engine_path, loader, task, args, conf):
     # 使用專案 regression frame 驗證 engine 不是「可載入但輸出全 0」的壞檔。
     if not args.smoke_test:
@@ -141,6 +163,12 @@ def _smoke_test_engine(label, engine_path, loader, task, args, conf):
 
     model = loader(str(engine_path), task=task) if task else loader(str(engine_path))
     batch = max(int(args.batch or 1), 1)
+
+    # 4c trash engine は channels=4 の入力が必要。metadata から判断して変換する。
+    channels = getattr(model, "channels", 3) or 3
+    if channels == 4:
+        frames = _build_4ch_frames(frames)
+
     counts = []
     keypoint_counts = []
     if batch <= 1:
@@ -252,7 +280,7 @@ def _export_model(label, model_path, loader, task, args):
 def parse_args():
     # CLI 參數：控制 device、batch、imgsz、FP16、dynamic shape 與是否重建既有 engine。
     parser = argparse.ArgumentParser(description="Export project YOLO/RTDETR weights to TensorRT engines.")
-    parser.add_argument("--device", default="0", help="CUDA device index, e.g. 0 or cuda:0")
+    parser.add_argument("--device", default="1", help="CUDA device index, e.g. 0 or cuda:0")
     parser.add_argument("--batch", type=int, default=8, choices=SUPPORTED_BATCH_SIZES,
                         help="TensorRT optimization batch size")
     parser.add_argument("--workspace", type=float, default=None, help="TensorRT workspace size in GiB")
