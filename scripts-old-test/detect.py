@@ -308,8 +308,7 @@ def _assign_fast_actor_track_ids(actors, yolo_seg_cache, iou_threshold=0.3):
 
 def detect(frame, model_bbox, model_trash,
            color_dict, fg_mask, litter_tracker, vehicle_history,
-           fps=30.0, vehicle_relative_speed_threshold_pct_per_s=20.0,
-           enable_vehicle_speed_filter=True,
+           fps=30.0,
            violator_display_cache=None, violator_display_ttl=60,
            violator_display_max_jump=80.0,
            action_module=None,
@@ -453,21 +452,16 @@ def detect(frame, model_bbox, model_trash,
                 stats=stats,
             )
 
-    filtererd_objects = []
-
     tracking_objects = all_objects
 
     # 第二段：更新車輛中心點歷史，供 holding 與後續相對運動判斷使用。
-    with profile_block(profiler, "detect.vehicle_history_filter"):
+    with profile_block(profiler, "detect.vehicle_history"):
         for obj in all_objects:
-            # 針對 vehicle 進行相對速度過濾
             if obj['cls'] in VEHICLE_LIKE_CLASSES:
                 track_id = obj['track_id']
                 x1, y1, x2, y2 = map(int, obj['box'])
                 centroid = ((x1 + x2) / 2, (y1 + y2) / 2)
                 vehicle_history[track_id]['centroids'].append(centroid)
-
-            filtererd_objects.append(obj)
 
     # 第三段：RTDETR 全圖偵測垃圾。
     current_frame_litters = []
@@ -524,7 +518,6 @@ def detect(frame, model_bbox, model_trash,
             lx1, ly1, lx2, ly2, _ = litter_box
             litter_w = max(int(lx2 - lx1), 1)
             litter_h = max(int(ly2 - ly1), 1)
-
             # 檢查整個 litter bbox 的前景像素比例，先排除靜止舊垃圾。
             is_moving = motion_evidence(
                 fg_mask,
@@ -579,25 +572,14 @@ def detect(frame, model_bbox, model_trash,
             # 新出現目標先進 tracker 建立一個 history anchor；第二幀起才能判斷它
             # 是否相對車輛真的往下分離，避免把 resize.mp4 這類剛丟出的垃圾第一點擋掉。
             if prev_litter_center is None:
-                # 出生抑制：若 litter 中心落在車輛/機車 bbox 內部（邊緣保留 12px 緩衝），
-                # 視為車輛部件偵測（FP），跳過這個出生幀；真正丟出的垃圾出現在車外。
-                lc_x = (lx1 + lx2) / 2.0
-                lc_y = (ly1 + ly2) / 2.0
-                _vehicle_birth_margin = 12.0
-                _is_vehicle_born = False
-                for _actor in tracking_objects:
-                    if _actor.get('cls', '').lower() in VEHICLE_LIKE_CLASSES:
-                        _ax1, _ay1, _ax2, _ay2 = map(float, _actor['box'])
-                        if (_ax1 + _vehicle_birth_margin < lc_x < _ax2 - _vehicle_birth_margin and
-                                _ay1 + _vehicle_birth_margin < lc_y < _ay2 - _vehicle_birth_margin):
-                            _is_vehicle_born = True
-                            break
-                if _is_vehicle_born:
-                    continue
+                if getattr(litter_tracker, '_debug', False):
+                    lc_x = (lx1 + lx2) / 2.0
+                    lc_y = (ly1 + ly2) / 2.0
+                    print(f"  [BIRTH_PASS fi={frame_index} cx={lc_x:.0f},{lc_y:.0f}]")
                 filtered_frame_litters.append(litter_box)
                 continue
 
-            is_holding_like, _ = litter_holding(
+            is_holding_like, _hold_actor = litter_holding(
                 litter_box,
                 tracking_objects,
                 prev_litter_center=prev_litter_center,
@@ -606,6 +588,10 @@ def detect(frame, model_bbox, model_trash,
                 vehicle_history=vehicle_history,
             )
             if is_holding_like:
+                if getattr(litter_tracker, '_debug', False):
+                    lc_x2 = (lx1 + lx2) / 2.0
+                    lc_y2 = (ly1 + ly2) / 2.0
+                    print(f"  [HOLDING fi={frame_index} cx={lc_x2:.0f},{lc_y2:.0f} actor={_hold_actor}]")
                 continue
 
             filtered_frame_litters.append(litter_box)
@@ -720,13 +706,7 @@ def detect(frame, model_bbox, model_trash,
                     'action': action_name,
                 }
 
-        # 已鎖定違規者即使被速度過濾暫時排除，也要保留渲染框。
-        filtered_keys = {(obj['cls'], obj['track_id']) for obj in filtererd_objects}
-        render_objects = list(filtererd_objects)
-        for obj in tracking_objects:
-            obj_key = (obj['cls'], obj['track_id'])
-            if obj_key in violator_display_cache and obj_key not in filtered_keys:
-                render_objects.append(obj)
+        render_objects = list(tracking_objects)
 
     # 第六段：統一渲染 actor。違規者紅框，正常人車用各類別顏色。
     with profile_block(profiler, "detect.render_actors"):
@@ -1111,8 +1091,7 @@ def _prepare_actor_batch(frames, frame_indices, model_bbox, bbox_conf,
 
 def detect_batch(frames, model_bbox, model_trash,
                  color_dict, fg_masks, litter_tracker, vehicle_history,
-                 fps=30.0, vehicle_relative_speed_threshold_pct_per_s=20.0,
-                 enable_vehicle_speed_filter=True,
+                 fps=30.0,
                  violator_display_cache=None, violator_display_ttl=60,
                  violator_display_max_jump=80.0,
                  action_module=None,
@@ -1159,8 +1138,6 @@ def detect_batch(frames, model_bbox, model_trash,
                 frame, model_bbox, model_trash, color_dict,
                 fg_mask, litter_tracker, vehicle_history,
                 fps=fps,
-                vehicle_relative_speed_threshold_pct_per_s=vehicle_relative_speed_threshold_pct_per_s,
-                enable_vehicle_speed_filter=enable_vehicle_speed_filter,
                 violator_display_cache=violator_display_cache,
                 violator_display_ttl=violator_display_ttl,
                 violator_display_max_jump=violator_display_max_jump,
@@ -1222,8 +1199,6 @@ def detect_batch(frames, model_bbox, model_trash,
                 frame, model_bbox, model_trash, color_dict,
                 fg_mask, litter_tracker, vehicle_history,
                 fps=fps,
-                vehicle_relative_speed_threshold_pct_per_s=vehicle_relative_speed_threshold_pct_per_s,
-                enable_vehicle_speed_filter=enable_vehicle_speed_filter,
                 violator_display_cache=violator_display_cache,
                 violator_display_ttl=violator_display_ttl,
                 violator_display_max_jump=violator_display_max_jump,

@@ -8,6 +8,58 @@ import numpy as np
 ACTOR_CLASSES = ('person', 'vehicle', 'scooter')
 VEHICLE_LIKE_CLASSES = ('vehicle', 'scooter')
 
+# === litter_holding 參數常數（皆為固定調校值，不從呼叫端覆寫）===
+
+# 距離 / 重疊門檻
+PERSON_DIST_THRESHOLD = 55.0
+VEHICLE_DIST_THRESHOLD = 90.0
+MASK_OVERLAP_RATIO_THRESHOLD = 0.20
+MIN_MASK_OVERLAP_FOR_VEHICLE_DIST = 0.08
+PERSON_MASK_DILATION_PX = 14.0
+VEHICLE_MASK_DILATION_PX = 16.0
+VEHICLE_MASK_GAP_THRESHOLD = 100.0
+VEHICLE_RELATIVE_MOTION_THRESHOLD = 12.0
+
+# Vehicle 上半部 attached 判定（後照鏡 / 車頂物件）
+VEHICLE_UPPER_HALF_ATTACHED_RATIO = 0.55
+
+# Vehicle release：相對運動門檻（litter 相對車身的分離速度）
+VEHICLE_RELEASE_DOWNWARD_THRESHOLD = 8.0
+VEHICLE_RELEASE_HORIZONTAL_THRESHOLD = 6.0
+VEHICLE_RELEASE_RELATIVE_MOTION_THRESHOLD = 10.0
+
+# Vehicle release：絕對運動門檻（車身不動時用）
+VEHICLE_RELEASE_ABS_DOWNWARD_THRESHOLD = 6.0
+VEHICLE_RELEASE_ABS_HORIZONTAL_THRESHOLD = 6.0
+VEHICLE_RELEASE_ABS_MOTION_THRESHOLD = 10.0
+
+# Vehicle release：mask gap / overlap（脫離車身的距離要求）
+VEHICLE_RELEASE_MIN_MASK_GAP_PX = 8.0
+VEHICLE_RELEASE_MAX_MASK_OVERLAP = 0.08
+VEHICLE_RELEASE_LOWER_EDGE_RATIO = 0.90
+VEHICLE_RELEASE_SIDE_MIN_Y_RATIO = 0.55
+VEHICLE_RELEASE_SIDE_MIN_MASK_GAP_PX = 16.0
+VEHICLE_RELEASE_SIDE_MAX_MASK_OVERLAP = 0.01
+
+# Vehicle release：強側邊釋放（穿過車側出去）
+VEHICLE_RELEASE_STRONG_SIDE_MIN_Y_RATIO = 0.30
+VEHICLE_RELEASE_STRONG_SIDE_MIN_MASK_GAP_PX = 48.0
+VEHICLE_RELEASE_STRONG_SIDE_DOWNWARD_THRESHOLD = 18.0
+VEHICLE_RELEASE_STRONG_SIDE_HORIZONTAL_THRESHOLD = 24.0
+VEHICLE_RELEASE_STRONG_SIDE_MOTION_THRESHOLD = 42.0
+
+# Anchor missed 上限（litter 短暫消失幾幀內仍視為同一物）
+VEHICLE_RELEASE_MAX_ANCHOR_MISSED = 3
+VEHICLE_RELEASE_STRONG_SIDE_MAX_ANCHOR_MISSED = 6
+
+# Vehicle bbox / mask 邊緣判定比例
+VEHICLE_BBOX_GAP_THRESHOLD = 48.0
+VEHICLE_SIDE_EDGE_RATIO = 0.12
+VEHICLE_LOWER_EDGE_RATIO = 0.75
+VEHICLE_BOTTOM_GAP_RATIO = 0.95
+
+ALLOW_DISTANCE_HOLDING = True
+
 def _motion_crop(fg_mask, coords, mask_scale=1.0):
     # 依 mask scale 裁出 bbox 對應區域；check_motion 與 motion_evidence 共用。
     x1, y1, x2, y2 = coords
@@ -26,19 +78,6 @@ def _motion_crop(fg_mask, coords, mask_scale=1.0):
     y2 = max(0, min(y2, h))
     return fg_mask[y1:y2, x1:x2]
 
-
-def check_motion(fg_mask, coords, threshold, mask_scale=1.0):
-    # 檢查指定 bbox 內前景像素比例；用於排除靜止舊垃圾或雜訊框。
-    mask_crop = _motion_crop(fg_mask, coords, mask_scale=mask_scale)
-    if mask_crop.size == 0:
-        return False
-
-    white_pixels = np.count_nonzero(mask_crop == 255)
-    total_pixels = mask_crop.size
-
-    ratio = white_pixels / total_pixels
-
-    return ratio >= threshold
 
 
 def motion_evidence(fg_mask, coords, threshold, mask_scale=1.0,
@@ -292,18 +331,6 @@ def _latest_distinct_velocity(points, min_motion_px=0.75):
     return 0.0, 0.0
 
 
-def _same_actor(prev_actor_id, cls_name, track_id):
-    # 判斷上一個關聯 actor 是否與目前 actor 相同，兼容 tuple 與舊版純 id。
-    if isinstance(prev_actor_id, tuple) and len(prev_actor_id) == 2:
-        try:
-            return str(prev_actor_id[0]).lower() == cls_name and int(prev_actor_id[1]) == int(track_id)
-        except (TypeError, ValueError):
-            return False
-    try:
-        return int(prev_actor_id) == int(track_id)
-    except (TypeError, ValueError):
-        return False
-
 
 def _motion_points(prev_litter_history, prev_litter_center, current_point):
     # holding release 需要軌跡形狀；支援「先往上拋、再往下落」。
@@ -352,46 +379,11 @@ def _has_up_then_down_release(points, min_vertical, min_horizontal, min_motion):
     )
 
 
-def litter_holding(litter_box, actors, prev_actor_id=None,
-                   person_dist_threshold=55.0,
-                   vehicle_dist_threshold=90.0,
-                   overlap_ratio_threshold=0.55,
-                   mask_overlap_ratio_threshold=0.20,
-                   min_mask_overlap_for_vehicle_distance=0.08,
+def litter_holding(litter_box, actors,
                    prev_litter_center=None,
                    prev_litter_missed=None,
                    prev_litter_history=None,
-                   vehicle_history=None,
-                   person_mask_dilation_px=14.0,
-                   vehicle_mask_dilation_px=16.0,
-                   vehicle_mask_gap_threshold=100.0,
-                   vehicle_relative_motion_threshold=12.0,
-                   bbox_margin_px=8.0,
-                   allow_distance_holding=True,
-                   vehicle_upper_half_attached_ratio=0.55,
-                   vehicle_release_downward_threshold=8.0,
-                   vehicle_release_horizontal_threshold=6.0,
-                   vehicle_release_relative_motion_threshold=10.0,
-                   vehicle_release_abs_downward_threshold=6.0,
-                   vehicle_release_abs_horizontal_threshold=6.0,
-                   vehicle_release_abs_motion_threshold=10.0,
-                   vehicle_release_min_mask_gap_px=8.0,
-                   vehicle_release_max_mask_overlap=0.08,
-                   vehicle_release_lower_edge_ratio=0.90,
-                   vehicle_release_side_min_y_ratio=0.55,
-                   vehicle_release_side_min_mask_gap_px=16.0,
-                   vehicle_release_side_max_mask_overlap=0.01,
-                   vehicle_release_strong_side_min_y_ratio=0.30,
-                   vehicle_release_strong_side_min_mask_gap_px=48.0,
-                   vehicle_release_strong_side_downward_threshold=18.0,
-                   vehicle_release_strong_side_horizontal_threshold=24.0,
-                   vehicle_release_strong_side_motion_threshold=42.0,
-                   vehicle_release_strong_side_max_anchor_missed=6,
-                   vehicle_release_max_anchor_missed=3,
-                   vehicle_bbox_gap_threshold=48.0,
-                   vehicle_side_edge_ratio=0.12,
-                   vehicle_lower_edge_ratio=0.75,
-                   vehicle_bottom_gap_ratio=0.95):
+                   vehicle_history=None):
     # holding 主判斷：若 litter 仍在 actor mask/bbox 內或近旁，視為尚未被丟出。
     if not actors:
         return False, None
@@ -448,21 +440,21 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
             abs_litter_motion = math.hypot(litter_vx, litter_vy)
             is_absolute_downward_release_motion = (
                 prev_litter_center is not None and
-                litter_vy >= float(vehicle_release_abs_downward_threshold) and
-                abs(litter_vx) >= float(vehicle_release_abs_horizontal_threshold) and
-                abs_litter_motion >= float(vehicle_release_abs_motion_threshold)
+                litter_vy >= float(VEHICLE_RELEASE_ABS_DOWNWARD_THRESHOLD) and
+                abs(litter_vx) >= float(VEHICLE_RELEASE_ABS_HORIZONTAL_THRESHOLD) and
+                abs_litter_motion >= float(VEHICLE_RELEASE_ABS_MOTION_THRESHOLD)
             )
             is_absolute_upward_release_motion = (
                 prev_litter_center is not None and
-                litter_vy <= -float(vehicle_release_abs_downward_threshold) and
-                abs(litter_vx) >= float(vehicle_release_abs_horizontal_threshold) and
-                abs_litter_motion >= float(vehicle_release_abs_motion_threshold)
+                litter_vy <= -float(VEHICLE_RELEASE_ABS_DOWNWARD_THRESHOLD) and
+                abs(litter_vx) >= float(VEHICLE_RELEASE_ABS_HORIZONTAL_THRESHOLD) and
+                abs_litter_motion >= float(VEHICLE_RELEASE_ABS_MOTION_THRESHOLD)
             )
             is_absolute_arc_release_motion = _has_up_then_down_release(
                 litter_motion_points,
-                min_vertical=vehicle_release_abs_downward_threshold,
-                min_horizontal=vehicle_release_abs_horizontal_threshold,
-                min_motion=vehicle_release_abs_motion_threshold,
+                min_vertical=VEHICLE_RELEASE_ABS_DOWNWARD_THRESHOLD,
+                min_horizontal=VEHICLE_RELEASE_ABS_HORIZONTAL_THRESHOLD,
+                min_motion=VEHICLE_RELEASE_ABS_MOTION_THRESHOLD,
             )
             is_absolute_release_motion = (
                 is_absolute_downward_release_motion or
@@ -471,21 +463,29 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
             )
             is_relative_downward_release_motion = (
                 prev_litter_center is not None and
-                relative_vy >= float(vehicle_release_downward_threshold) and
-                abs(relative_vx) >= float(vehicle_release_horizontal_threshold) and
-                relative_motion >= float(vehicle_release_relative_motion_threshold)
+                relative_vy >= float(VEHICLE_RELEASE_DOWNWARD_THRESHOLD) and
+                abs(relative_vx) >= float(VEHICLE_RELEASE_HORIZONTAL_THRESHOLD) and
+                relative_motion >= float(VEHICLE_RELEASE_RELATIVE_MOTION_THRESHOLD)
             )
             is_relative_upward_release_motion = (
                 prev_litter_center is not None and
-                relative_vy <= -float(vehicle_release_downward_threshold) and
-                abs(relative_vx) >= float(vehicle_release_horizontal_threshold) and
-                relative_motion >= float(vehicle_release_relative_motion_threshold)
+                relative_vy <= -float(VEHICLE_RELEASE_DOWNWARD_THRESHOLD) and
+                abs(relative_vx) >= float(VEHICLE_RELEASE_HORIZONTAL_THRESHOLD) and
+                relative_motion >= float(VEHICLE_RELEASE_RELATIVE_MOTION_THRESHOLD)
             )
             is_relative_release_motion = (
                 is_relative_downward_release_motion or
                 is_relative_upward_release_motion
             )
             is_vehicle_release_motion = is_relative_release_motion or is_absolute_release_motion
+            # 寬鬆 relative release：不要求水平分量。
+            # 從水平行駛車輛垂直丟下的垃圾，relative_vx ≈ 0 但 relative_vy 大；
+            # 標準 is_relative_release_motion 因水平門檻失敗，此條件補救。
+            is_relative_bbox_release = (
+                prev_litter_center is not None and
+                abs(relative_vy) >= float(VEHICLE_RELEASE_DOWNWARD_THRESHOLD) and
+                relative_motion >= float(VEHICLE_RELEASE_RELATIVE_MOTION_THRESHOLD)
+            )
 
             # 解綁條件 A：垃圾靜止在地上，但車子還在開，表示不是持有狀態。
             # 例外：若垃圾中心仍在車輛 bbox 內（車頂 / 車身物件），不應以地面靜止邏輯跳過；
@@ -495,13 +495,13 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
                 continue
 
             actor_anchor = ((ax1 + ax2) / 2.0, ay2)
-            dilation_px = vehicle_mask_dilation_px
-            adaptive_thr = vehicle_dist_threshold * (1.5 if _same_actor(prev_actor_id, cls_name, track_id) else 1.0)
+            dilation_px = VEHICLE_MASK_DILATION_PX
+            adaptive_thr = VEHICLE_DIST_THRESHOLD
 
         else:
             actor_anchor = ((ax1 + ax2) / 2.0, ay2 - (ah * 0.2))
-            dilation_px = person_mask_dilation_px
-            adaptive_thr = person_dist_threshold * (1.5 if _same_actor(prev_actor_id, cls_name, track_id) else 1.0)
+            dilation_px = PERSON_MASK_DILATION_PX
+            adaptive_thr = PERSON_DIST_THRESHOLD
 
         dist = math.hypot(lc_x - actor_anchor[0], lc_y - actor_anchor[1])
         if dist < best_distance:
@@ -528,8 +528,8 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
                 norm_x, norm_y = norm_xy if norm_xy is not None else (None, None)
                 is_near_side_edge = (
                     norm_x is not None and (
-                        norm_x <= float(vehicle_side_edge_ratio) or
-                        norm_x >= (1.0 - float(vehicle_side_edge_ratio))
+                        norm_x <= float(VEHICLE_SIDE_EDGE_RATIO) or
+                        norm_x >= (1.0 - float(VEHICLE_SIDE_EDGE_RATIO))
                     )
                 )
                 # 側邊拋出不一定會落到車體最下緣；但側邊最容易受車體移動誤導，
@@ -538,50 +538,50 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
                     not is_inside_actual_region and
                     is_near_side_edge and
                     norm_y is not None and
-                    norm_y >= float(vehicle_release_side_min_y_ratio) and
+                    norm_y >= float(VEHICLE_RELEASE_SIDE_MIN_Y_RATIO) and
                     (
                         mask_signed_dist is None or
-                        mask_signed_dist <= -float(vehicle_release_side_min_mask_gap_px)
+                        mask_signed_dist <= -float(VEHICLE_RELEASE_SIDE_MIN_MASK_GAP_PX)
                     ) and
                     (
                         mask_overlap_ratio is None or
-                        mask_overlap_ratio <= float(vehicle_release_side_max_mask_overlap)
+                        mask_overlap_ratio <= float(VEHICLE_RELEASE_SIDE_MAX_MASK_OVERLAP)
                     )
                 )
                 has_strong_release_side_gap = (
                     not is_inside_actual_region and
                     is_near_side_edge and
                     norm_y is not None and
-                    norm_y >= float(vehicle_release_strong_side_min_y_ratio) and
+                    norm_y >= float(VEHICLE_RELEASE_STRONG_SIDE_MIN_Y_RATIO) and
                     (
                         mask_signed_dist is None or
-                        mask_signed_dist <= -float(vehicle_release_strong_side_min_mask_gap_px)
+                        mask_signed_dist <= -float(VEHICLE_RELEASE_STRONG_SIDE_MIN_MASK_GAP_PX)
                     ) and
                     (
                         mask_overlap_ratio is None or
-                        mask_overlap_ratio <= float(vehicle_release_side_max_mask_overlap)
+                        mask_overlap_ratio <= float(VEHICLE_RELEASE_SIDE_MAX_MASK_OVERLAP)
                     )
                 )
                 has_release_lower_gap = (
                     not is_inside_actual_region and
                     norm_y is not None and
-                    norm_y >= float(vehicle_release_lower_edge_ratio) and
+                    norm_y >= float(VEHICLE_RELEASE_LOWER_EDGE_RATIO) and
                     (
                         mask_signed_dist is None or
-                        mask_signed_dist <= -float(vehicle_release_min_mask_gap_px)
+                        mask_signed_dist <= -float(VEHICLE_RELEASE_MIN_MASK_GAP_PX)
                     ) and
                     (
                         mask_overlap_ratio is None or
-                        mask_overlap_ratio <= float(vehicle_release_max_mask_overlap)
+                        mask_overlap_ratio <= float(VEHICLE_RELEASE_MAX_MASK_OVERLAP)
                     )
                 )
                 has_fresh_litter_anchor = (
                     prev_litter_missed is None or
-                    int(prev_litter_missed) <= int(vehicle_release_max_anchor_missed)
+                    int(prev_litter_missed) <= int(VEHICLE_RELEASE_MAX_ANCHOR_MISSED)
                 )
                 has_fresh_strong_side_anchor = (
                     prev_litter_missed is None or
-                    int(prev_litter_missed) <= int(vehicle_release_strong_side_max_anchor_missed)
+                    int(prev_litter_missed) <= int(VEHICLE_RELEASE_STRONG_SIDE_MAX_ANCHOR_MISSED)
                 )
                 side_release_motion = (
                     has_fresh_litter_anchor and (
@@ -591,21 +591,21 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
                 )
                 is_strong_relative_side_release = (
                     prev_litter_center is not None and
-                    abs(relative_vy) >= float(vehicle_release_strong_side_downward_threshold) and
-                    abs(relative_vx) >= float(vehicle_release_strong_side_horizontal_threshold) and
-                    relative_motion >= float(vehicle_release_strong_side_motion_threshold)
+                    abs(relative_vy) >= float(VEHICLE_RELEASE_STRONG_SIDE_DOWNWARD_THRESHOLD) and
+                    abs(relative_vx) >= float(VEHICLE_RELEASE_STRONG_SIDE_HORIZONTAL_THRESHOLD) and
+                    relative_motion >= float(VEHICLE_RELEASE_STRONG_SIDE_MOTION_THRESHOLD)
                 )
                 is_strong_absolute_side_release = (
                     prev_litter_center is not None and
-                    abs(litter_vy) >= float(vehicle_release_strong_side_downward_threshold) and
-                    abs(litter_vx) >= float(vehicle_release_strong_side_horizontal_threshold) and
-                    abs_litter_motion >= float(vehicle_release_strong_side_motion_threshold)
+                    abs(litter_vy) >= float(VEHICLE_RELEASE_STRONG_SIDE_DOWNWARD_THRESHOLD) and
+                    abs(litter_vx) >= float(VEHICLE_RELEASE_STRONG_SIDE_HORIZONTAL_THRESHOLD) and
+                    abs_litter_motion >= float(VEHICLE_RELEASE_STRONG_SIDE_MOTION_THRESHOLD)
                 )
                 is_strong_arc_side_release = _has_up_then_down_release(
                     litter_motion_points,
-                    min_vertical=vehicle_release_strong_side_downward_threshold,
-                    min_horizontal=vehicle_release_strong_side_horizontal_threshold,
-                    min_motion=vehicle_release_strong_side_motion_threshold,
+                    min_vertical=VEHICLE_RELEASE_STRONG_SIDE_DOWNWARD_THRESHOLD,
+                    min_horizontal=VEHICLE_RELEASE_STRONG_SIDE_HORIZONTAL_THRESHOLD,
+                    min_motion=VEHICLE_RELEASE_STRONG_SIDE_MOTION_THRESHOLD,
                 )
                 strong_side_release_motion = (
                     has_fresh_strong_side_anchor and
@@ -638,57 +638,58 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
                 )
                 is_upper_half_attached = (
                     is_inside_bbox and
-                    norm_in_bbox[1] <= float(vehicle_upper_half_attached_ratio)
+                    norm_in_bbox[1] <= float(VEHICLE_UPPER_HALF_ATTACHED_RATIO)
                 )
-                if is_upper_half_attached and not mask_aware_release_motion:
+                _mask_release = mask_aware_release_motion or is_relative_bbox_release
+                if is_upper_half_attached and not _mask_release:
                     return True, (cls_name, track_id)
 
                 if is_inside_actual_region:
                     if norm_x is not None and (
-                        norm_x <= float(vehicle_side_edge_ratio) or
-                        norm_x >= (1.0 - float(vehicle_side_edge_ratio))
-                    ) and not mask_aware_release_motion:
+                        norm_x <= float(VEHICLE_SIDE_EDGE_RATIO) or
+                        norm_x >= (1.0 - float(VEHICLE_SIDE_EDGE_RATIO))
+                    ) and not _mask_release:
                         return True, (cls_name, track_id)
 
                 is_lower_side_gap = (
                     not is_inside_actual_region and
                     mask_signed_dist is not None and
-                    mask_signed_dist >= -float(vehicle_bbox_gap_threshold) and
+                    mask_signed_dist >= -float(VEHICLE_BBOX_GAP_THRESHOLD) and
                     norm_y is not None and
-                    norm_y >= float(vehicle_lower_edge_ratio) and
+                    norm_y >= float(VEHICLE_LOWER_EDGE_RATIO) and
                     norm_x is not None and (
-                        norm_x <= float(vehicle_side_edge_ratio) or
-                        norm_x >= (1.0 - float(vehicle_side_edge_ratio))
+                        norm_x <= float(VEHICLE_SIDE_EDGE_RATIO) or
+                        norm_x >= (1.0 - float(VEHICLE_SIDE_EDGE_RATIO))
                     )
                 )
-                if is_lower_side_gap and not mask_aware_release_motion:
+                if is_lower_side_gap and not _mask_release:
                     return True, (cls_name, track_id)
 
                 is_bottom_gap = (
                     not is_inside_actual_region and
                     mask_signed_dist is not None and
-                    mask_signed_dist >= -float(vehicle_bbox_gap_threshold) and
+                    mask_signed_dist >= -float(VEHICLE_BBOX_GAP_THRESHOLD) and
                     norm_y is not None and
-                    norm_y >= float(vehicle_bottom_gap_ratio)
+                    norm_y >= float(VEHICLE_BOTTOM_GAP_RATIO)
                 )
-                if is_bottom_gap and not mask_aware_release_motion:
+                if is_bottom_gap and not _mask_release:
                     return True, (cls_name, track_id)
 
                 is_mask_attached = (
                     mask_overlap_ratio is not None and
-                    mask_overlap_ratio >= float(min_mask_overlap_for_vehicle_distance)
+                    mask_overlap_ratio >= float(MIN_MASK_OVERLAP_FOR_VEHICLE_DIST)
                 )
                 is_vehicle_attached = is_inside or is_mask_attached
                 if is_vehicle_attached:
-                    if mask_aware_release_motion:
+                    if _mask_release:
                         continue
                     return True, (cls_name, track_id)
 
                 is_near_vehicle_mask = (
                     mask_signed_dist is not None and
-                    mask_signed_dist >= -float(vehicle_mask_gap_threshold)
+                    mask_signed_dist >= -float(VEHICLE_MASK_GAP_THRESHOLD)
                 )
-                if allow_distance_holding and is_near_vehicle_mask and not mask_aware_release_motion:
+                if ALLOW_DISTANCE_HOLDING and is_near_vehicle_mask and not _mask_release:
                     return True, (cls_name, track_id)
 
                 continue
@@ -698,7 +699,7 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
 
             if (
                 mask_overlap_ratio is not None and
-                mask_overlap_ratio >= float(mask_overlap_ratio_threshold)
+                mask_overlap_ratio >= float(MASK_OVERLAP_RATIO_THRESHOLD)
             ):
                 return True, (cls_name, track_id)
 
@@ -713,16 +714,25 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
                 -0.02 <= norm_in_bbox[0] <= 1.02 and
                 -0.02 <= norm_in_bbox[1] <= 1.02
             )
-            if is_inside_bbox and not is_vehicle_release_motion:
+            # 用相對運動判斷是否已脫離車輛：absolute motion 可能來自車輛本身移動，
+            # 只有 litter 相對車輛的分離速度才能確認是真正被丟出，而非車輛部件。
+            # inside-bbox 的寬鬆 release：不要求水平分量（從水平行駛車輛直落時 relative_vx ≈ 0），
+            # 只要相對車輛有足夠的縱向分離速度即可視為已被丟出。
+            is_relative_bbox_release = (
+                prev_litter_center is not None and
+                abs(relative_vy) >= float(VEHICLE_RELEASE_DOWNWARD_THRESHOLD) and
+                relative_motion >= float(VEHICLE_RELEASE_RELATIVE_MOTION_THRESHOLD)
+            )
+            if is_inside_bbox and not (is_relative_release_motion or is_relative_bbox_release):
                 return True, (cls_name, track_id)
 
             is_distance_holding = (
-                allow_distance_holding and
+                ALLOW_DISTANCE_HOLDING and
                 dist <= adaptive_thr and
-                relative_motion <= float(vehicle_relative_motion_threshold)
+                relative_motion <= float(VEHICLE_RELATIVE_MOTION_THRESHOLD)
             )
             if is_distance_holding:
-                if is_vehicle_release_motion:
+                if is_relative_release_motion or is_relative_bbox_release:
                     continue
                 return True, (cls_name, track_id)
             continue
@@ -737,7 +747,7 @@ def litter_holding(litter_box, actors, prev_actor_id=None,
         if is_inside_bbox:
             return True, (cls_name, track_id)
 
-        is_distance_holding = allow_distance_holding and dist <= adaptive_thr
+        is_distance_holding = ALLOW_DISTANCE_HOLDING and dist <= adaptive_thr
         if is_distance_holding:
             return True, (cls_name, track_id)
 

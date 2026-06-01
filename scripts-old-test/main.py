@@ -909,11 +909,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("file", nargs="?", help="video path or file name in resources/", default="TThrow.mp4")
     parser.add_argument("--output-root", default="output", help="root directory for annotated outputs")
-    parser.add_argument(
-        "--disable-speed-filter",
-        action="store_true",
-        help="Disable vehicle speed filtering based on calculate_speed"
-    )
     parser.add_argument("--pose-model", default=POSE_MODEL_PATH, help="YOLO pose model path")
     parser.add_argument("--stgcn-weight", default=STGCN_WEIGHT_PATH, help="STGCN++ checkpoint path")
     parser.add_argument("--stgcn-config", default=STGCN_CONFIG_PATH, help="STGCN++ config path")
@@ -1304,8 +1299,6 @@ if __name__ == "__main__":
                                     frames, model_bbox, model_trash, COLORS,
                                     fg_masks, litter_tracker, vehicle_history,
                                     fps=fps,
-                                    vehicle_relative_speed_threshold_pct_per_s=20.0,
-                                    enable_vehicle_speed_filter=not args.disable_speed_filter,
                                     violator_display_cache=violator_display_cache,
                                     violator_display_ttl=60,
                                     violator_display_max_jump=80.0,
@@ -1340,8 +1333,6 @@ if __name__ == "__main__":
                                         frames[0], model_bbox, model_trash, COLORS,
                                         fg_masks[0], litter_tracker, vehicle_history,
                                         fps=fps,
-                                        vehicle_relative_speed_threshold_pct_per_s=20.0,
-                                        enable_vehicle_speed_filter=not args.disable_speed_filter,
                                         violator_display_cache=violator_display_cache,
                                         violator_display_ttl=60,
                                         violator_display_max_jump=80.0,
