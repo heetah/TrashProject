@@ -8,6 +8,53 @@ import numpy as np
 ACTOR_CLASSES = ('person', 'vehicle', 'scooter')
 VEHICLE_LIKE_CLASSES = ('vehicle', 'scooter')
 
+# === 相機晃動偵測（監視器輕微晃動 → 全域位移 → 靜止物被誤判 litter confirm）===
+# phaseCorrelate 量測整幀主導位移：穩定場景(含移動車輛) <1px；輕微晃動會 spike 到 6~13px。
+SHAKE_DOWNSCALE = (480, 360)           # phaseCorrelate 前先降採樣到此尺寸（省成本、抗噪）
+SHAKE_SHIFT_FRAC = 0.0014              # 全域位移 > 幀寬 × 此比例 視為晃動（1440→2.0px、2592→3.6px）
+SHAKE_SHIFT_FLOOR_PX = 1.8             # 位移閾值下限（小解析度時）
+SHAKE_COOLDOWN_SEC = 0.8               # 晃動後冷卻時間（×fps 幀），涵蓋偵測 gap 與晃動餘波
+
+_SHAKE_HANN_CACHE = {}
+
+
+def estimate_global_shift(prev_frame, curr_frame, downscale=SHAKE_DOWNSCALE):
+    """估計兩幀間的全域主導位移（相機晃動量），回傳 (magnitude_px_in_original, response)。
+
+    以降採樣灰階 + Hanning window 做 phaseCorrelate；對畫面中局部移動物件穩健
+    （單一車輛不會主導全域位移），故能區分『相機晃動(全幀位移)』與『物件移動(局部)』。
+    回傳的 magnitude 已換算回原始解析度像素；輸入不合法時回傳 (0.0, 0.0)。
+    """
+    if prev_frame is None or curr_frame is None:
+        return 0.0, 0.0
+    try:
+        dw, dh = int(downscale[0]), int(downscale[1])
+        h0, w0 = curr_frame.shape[:2]
+        if h0 == 0 or w0 == 0:
+            return 0.0, 0.0
+        p = cv2.cvtColor(cv2.resize(prev_frame, (dw, dh)), cv2.COLOR_BGR2GRAY).astype(np.float32)
+        c = cv2.cvtColor(cv2.resize(curr_frame, (dw, dh)), cv2.COLOR_BGR2GRAY).astype(np.float32)
+        win = _SHAKE_HANN_CACHE.get((dw, dh))
+        if win is None:
+            win = cv2.createHanningWindow((dw, dh), cv2.CV_32F)
+            _SHAKE_HANN_CACHE[(dw, dh)] = win
+        (dx, dy), response = cv2.phaseCorrelate(p, c, win)
+        # 換算回原始解析度
+        mag = math.hypot(dx * (w0 / dw), dy * (h0 / dh))
+        return float(mag), float(response)
+    except Exception:
+        return 0.0, 0.0
+
+
+# === 前處理 litter 候選 FP 篩選參數（集中在 detect 前處理，tracker 只負責追蹤）===
+# 隨車部件（車燈/後照鏡/車身）與純水平條紋（橫越畫面的車/機車被拉成條）不該進 tracker。
+LITTER_FP_CONTAINMENT_THR = 0.85       # 候選與某車輛 bbox 重疊達此值 → 隨車部件
+LITTER_FP_STREAK_RATIO = 5.0           # horizontal 位移 > 此倍率 × downward → 純水平條紋（非重力下墜）
+LITTER_FP_NEAREST_VEHICLE_DIST = 40.0  # 候選距車輛 bbox 此值內才做共動判斷（像素）
+LITTER_FP_COMOTION_MIN_VEH_STEP = 4.0  # 該步車輛位移 ≥ 此值才足以判斷共動（px/frame）
+LITTER_FP_COMOTION_MAX_REL = 4.0       # 該步 litter 相對車輛位移 ≤ 此值視為隨車（px/frame）
+LITTER_FP_COMOTION_MIN_COS = 0.85      # litter 與車輛速度向量夾角餘弦門檻
+
 # === litter_holding 參數常數（皆為固定調校值，不從呼叫端覆寫）===
 
 # 距離 / 重疊門檻
@@ -752,6 +799,88 @@ def litter_holding(litter_box, actors,
             return True, (cls_name, track_id)
 
     return False, best_actor_key
+
+
+def litter_candidate_is_vehicle_fp(litter_box, actors, vehicle_history=None,
+                                   prev_litter_history=None):
+    """前處理 FP 篩選：判斷此 litter 候選是否為『隨車部件』或『純水平條紋』。
+
+    依使用者架構決策：垃圾辨識的篩選動作集中在 detect 前處理，tracker 只負責追蹤、
+    不再對候選做 FP「懷疑」。本函式在候選進入 tracker 前判斷是否丟棄。
+
+    判別（任一成立即丟棄）：
+      1. containment：候選幾乎全在某車輛 bbox 內 → 隨車部件（車燈/車身/車牌；
+         對大型透視車輛也成立，因為真掉落物會脫離車框而部件不會）。
+      2. horizontal streak：向下分量遠小於水平位移 → 非重力下墜（橫越畫面的車/機車條紋）。
+      3. co-motion：與鄰近移動車輛逐幀同速（平行+同速、相對位移極小）→ 隨車部件。
+
+    回傳 (drop: bool, reason: str|None)。需要軌跡的判別在無歷史（新生候選）時自動略過，
+    只做 per-frame 的 containment，避免誤殺剛丟出的垃圾。
+    """
+    lx1, ly1, lx2, ly2 = map(float, litter_box[:4])
+    lcx, lcy = (lx1 + lx2) / 2.0, (ly1 + ly2) / 2.0
+    litter_area = max((lx2 - lx1) * (ly2 - ly1), 1e-6)
+
+    # 找最近車輛 + 最大重疊
+    best_overlap = 0.0
+    nearest_veh_id = None
+    nearest_dist = float('inf')
+    for a in actors or []:
+        if str(a.get('cls', '')).lower() not in VEHICLE_LIKE_CLASSES:
+            continue
+        box = a.get('box')
+        if box is None:
+            continue
+        ax1, ay1, ax2, ay2 = map(float, box[:4])
+        ix1, iy1 = max(lx1, ax1), max(ly1, ay1)
+        ix2, iy2 = min(lx2, ax2), min(ly2, ay2)
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        overlap = inter / litter_area
+        if overlap > best_overlap:
+            best_overlap = overlap
+        dx = max(ax1 - lcx, 0.0, lcx - ax2)
+        dy = max(ay1 - lcy, 0.0, lcy - ay2)
+        d = math.hypot(dx, dy)
+        if d < nearest_dist:
+            nearest_dist = d
+            try:
+                nearest_veh_id = int(a['track_id'])
+            except (KeyError, TypeError, ValueError):
+                nearest_veh_id = None
+
+    # 1) containment（per-frame，新生候選也適用）
+    if best_overlap >= LITTER_FP_CONTAINMENT_THR:
+        return True, 'vehicle_contained'
+
+    hist = list(prev_litter_history or [])
+
+    # 2) horizontal streak（需軌跡）
+    if hist:
+        x0, y0 = float(hist[0][0]), float(hist[0][1])
+        down = lcy - y0
+        horiz = abs(lcx - x0)
+        if horiz > LITTER_FP_STREAK_RATIO * max(down, 1e-6):
+            return True, 'horizontal_streak'
+
+    # 3) co-motion（需軌跡 + 鄰近移動車輛的逐幀 centroid）
+    if (nearest_veh_id is not None and nearest_dist <= LITTER_FP_NEAREST_VEHICLE_DIST
+            and vehicle_history and nearest_veh_id in vehicle_history and len(hist) >= 1):
+        vcent = list(vehicle_history[nearest_veh_id].get('centroids', []))
+        if len(vcent) >= 2:
+            lvx = lcx - float(hist[-1][0])
+            lvy = lcy - float(hist[-1][1])
+            vvx = float(vcent[-1][0]) - float(vcent[-2][0])
+            vvy = float(vcent[-1][1]) - float(vcent[-2][1])
+            v_mag = math.hypot(vvx, vvy)
+            l_mag = math.hypot(lvx, lvy)
+            if v_mag >= LITTER_FP_COMOTION_MIN_VEH_STEP:
+                rel = math.hypot(lvx - vvx, lvy - vvy)
+                cos = (lvx * vvx + lvy * vvy) / (max(l_mag, 1e-6) * v_mag)
+                if rel <= LITTER_FP_COMOTION_MAX_REL and cos >= LITTER_FP_COMOTION_MIN_COS:
+                    return True, 'vehicle_comotion'
+
+    return False, None
+
 
 def validate_trajectory(centroid_history):
     """

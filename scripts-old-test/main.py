@@ -1211,7 +1211,7 @@ if __name__ == "__main__":
 
             # 垃圾反追蹤物件初始化
             with profiler.time_block("setup.litter_tracker"):
-                litter_tracker = GlobalLitterTracker(distance_threshold=250)
+                litter_tracker = GlobalLitterTracker(distance_threshold=250, fps=fps)
                 if getattr(args, 'debug_tracker', False):
                     litter_tracker._debug = True
 

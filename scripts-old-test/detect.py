@@ -7,7 +7,12 @@ import os
 from licensePlate import detect_license_plates, dispatch_license_plate_rois, get_plate_number
 from timeUtils import profile_block
 from smallFunction import (
+    SHAKE_COOLDOWN_SEC,
+    SHAKE_SHIFT_FLOOR_PX,
+    SHAKE_SHIFT_FRAC,
     calculate_iom_matrix,
+    estimate_global_shift,
+    litter_candidate_is_vehicle_fp,
     litter_holding,
     motion_evidence,
 )
@@ -267,8 +272,10 @@ def _extract_actor_detections(results, model_bbox):
     return actors
 
 
-def _assign_fast_actor_track_ids(actors, yolo_seg_cache, iou_threshold=0.3):
+def _assign_fast_actor_track_ids(actors, yolo_seg_cache, iou_threshold=0.3, track_buffer=30):
     # 極速模式用 predict 取代 BoT-SORT；用前一次 bbox IoU 給穩定 id，保留後續 holding/backtrack 基本需求。
+    # 【關鍵修正】保留最近遺失的 track 一段時間（track_buffer 次偵測），不再「單幀漏抓就丟棄」。
+    # 否則任何一次偵測閃爍都會讓人物換新 id，導致 STGCN 視窗與 urinate 證據累積不起來而漏報。
     tracks = yolo_seg_cache.setdefault('fast_actor_tracks', [])
     next_id = int(yolo_seg_cache.get('fast_next_track_id', 1))
     used_tracks = set()
@@ -294,15 +301,32 @@ def _assign_fast_actor_track_ids(actors, yolo_seg_cache, iou_threshold=0.3):
             next_id += 1
         assigned.append(actor)
 
-    yolo_seg_cache['fast_next_track_id'] = next_id
-    yolo_seg_cache['fast_actor_tracks'] = [
+    # 本輪命中的 actor 重置 TTL；本輪未命中的舊 track 暫時保留並衰減 TTL，
+    # 讓人物在短暫漏抓後再次出現時，仍能用舊 box IoU 配回原本的 id。
+    track_buffer = max(int(track_buffer), 1)
+    new_tracks = [
         {
             'track_id': int(actor['track_id']),
             'box': np.asarray(actor['box']).copy(),
             'cls': actor['cls'],
+            'ttl': track_buffer,
         }
         for actor in assigned
     ]
+    for idx, track in enumerate(tracks):
+        if idx in used_tracks:
+            continue
+        ttl = int(track.get('ttl', 0)) - 1
+        if ttl > 0:
+            new_tracks.append({
+                'track_id': int(track['track_id']),
+                'box': np.asarray(track['box']).copy(),
+                'cls': track.get('cls'),
+                'ttl': ttl,
+            })
+
+    yolo_seg_cache['fast_next_track_id'] = next_id
+    yolo_seg_cache['fast_actor_tracks'] = new_tracks
     return _split_actors(assigned)
 
 
@@ -463,6 +487,22 @@ def detect(frame, model_bbox, model_trash,
                 centroid = ((x1 + x2) / 2, (y1 + y2) / 2)
                 vehicle_history[track_id]['centroids'].append(centroid)
 
+    # 相機晃動偵測（監視器輕微晃動 → 全域位移 → 靜止物被誤判為丟擲）：
+    # 量測整幀主導位移；超過閾值即進入「晃動冷卻區間」，期間丟棄所有 litter 候選，
+    # 避免晃動跳動進入軌跡造成誤 confirm。穩定場景(含移動車輛)位移 <1px，永不觸發。
+    # 冷卻長度涵蓋偵測 gap 與晃動餘波。狀態存於 per-video 的 litter_tracker。
+    with profile_block(profiler, "detect.shake_detect"):
+        shake_mag, _shake_resp = estimate_global_shift(prev_frame, frame)
+        shake_threshold = max(SHAKE_SHIFT_FLOOR_PX, SHAKE_SHIFT_FRAC * float(frame.shape[1]))
+        if shake_mag > shake_threshold:
+            cooldown = max(1, int(round(SHAKE_COOLDOWN_SEC * float(fps or 30.0))))
+            litter_tracker._shake_until = max(
+                getattr(litter_tracker, '_shake_until', -1), int(frame_index) + cooldown
+            )
+        shake_active = int(frame_index) <= getattr(litter_tracker, '_shake_until', -1)
+        if stats is not None and shake_active:
+            stats['shake_frames'] = stats.get('shake_frames', 0) + 1
+
     # 第三段：RTDETR 全圖偵測垃圾。
     current_frame_litters = []
 
@@ -514,7 +554,11 @@ def detect(frame, model_bbox, model_trash,
     # 第四段：motion + holding 前處理。只有真的在動、且不像仍被人車持有的 litter 才進 tracker。
     filtered_frame_litters = []
     with profile_block(profiler, "detect.motion_holding_filter"):
-        for litter_box in current_frame_litters:
+        # 晃動冷卻區間內：整幀都在位移，litter 偵測不可靠 → 全數丟棄，不餵 tracker。
+        shake_skip = shake_active
+        if shake_skip and getattr(litter_tracker, '_debug', False):
+            print(f"  [SHAKE_SKIP fi={frame_index} mag={shake_mag:.1f}px thr={shake_threshold:.1f} drop={len(current_frame_litters)}]")
+        for litter_box in ([] if shake_skip else current_frame_litters):
             lx1, ly1, lx2, ly2, _ = litter_box
             litter_w = max(int(lx2 - lx1), 1)
             litter_h = max(int(ly2 - ly1), 1)
@@ -568,6 +612,21 @@ def detect(frame, model_bbox, model_trash,
                     prev_litter_center = prev_center
                     prev_litter_missed = int(l_data.get('missed', 0))
                     prev_litter_history = list(l_data.get('history', []))
+
+            # 垃圾候選 FP 篩選（集中於前處理；tracker 只負責追蹤、不再對候選做 FP 判斷）：
+            # 隨車部件（車燈/車身/後照鏡）與純水平條紋（橫越畫面的車/機車）不進 tracker。
+            # containment 為 per-frame 判別、對新生候選亦適用；streak/co-motion 需軌跡，
+            # 新生候選（無 prev history）會自動略過，避免誤殺剛丟出的垃圾第一點。
+            is_fp_candidate, fp_reason = litter_candidate_is_vehicle_fp(
+                litter_box,
+                tracking_objects,
+                vehicle_history=vehicle_history,
+                prev_litter_history=prev_litter_history,
+            )
+            if is_fp_candidate:
+                if getattr(litter_tracker, '_debug', False):
+                    print(f"  [FP_DROP fi={frame_index} cx={curr_center[0]:.0f},{curr_center[1]:.0f} reason={fp_reason}]")
+                continue
 
             # 新出現目標先進 tracker 建立一個 history anchor；第二幀起才能判斷它
             # 是否相對車輛真的往下分離，避免把 resize.mp4 這類剛丟出的垃圾第一點擋掉。

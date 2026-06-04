@@ -110,6 +110,12 @@ class STGCNActionModule:
         self.pose_imgsz = _int_env("ACTION_POSE_IMGSZ", 0)
         self.action_threshold = float(action_threshold)
         self.track_iou_threshold = float(track_iou_threshold)
+        # 【關鍵修正】訓練資料是裁切到人物的短片（人物幾乎填滿畫面），
+        # 推論時骨架卻來自整張寬景 frame。預設啟用 person-bbox 正規化，
+        # 把骨架平移縮放到人物自身範圍，與訓練分布對齊。設 ACTION_BBOX_NORM=0 可關閉。
+        self.bbox_normalize = _int_env("ACTION_BBOX_NORM", 1) != 0
+        self.bbox_norm_pad = 0.15
+        self.bbox_norm_conf = 0.3
         self.window_size = int(window_size)
         self.alert_frames = int(alert_frames)
         self.urination_window_sec = max(0.0, float(urination_window_sec))
@@ -242,6 +248,29 @@ class STGCNActionModule:
         except Exception:
             return None
 
+    def _bbox_normalize(self, keypoints, scores, img_shape):
+        # 以整個 window 內可信關鍵點的外接框，把骨架平移/縮放成「人物填滿畫面」。
+        # 回傳 (平移後的關鍵點, (h, w))，與訓練時裁切短片的正規化方式一致。
+        mask = scores > self.bbox_norm_conf
+        if int(np.count_nonzero(mask)) < 3:
+            # 可信點太少時退回整張 frame 正規化，避免外接框不穩定。
+            return keypoints, img_shape
+        xs = keypoints[..., 0][mask]
+        ys = keypoints[..., 1][mask]
+        x0, x1 = float(xs.min()), float(xs.max())
+        y0, y1 = float(ys.min()), float(ys.max())
+        w = max(1.0, x1 - x0)
+        h = max(1.0, y1 - y0)
+        pad = self.bbox_norm_pad
+        x0 -= w * pad
+        y0 -= h * pad
+        w *= (1.0 + 2.0 * pad)
+        h *= (1.0 + 2.0 * pad)
+        shifted = keypoints.copy()
+        shifted[..., 0] = keypoints[..., 0] - x0
+        shifted[..., 1] = keypoints[..., 1] - y0
+        return shifted, (int(round(h)), int(round(w)))
+
     def _predict_action(
         self,
         skeleton_sequence,
@@ -256,14 +285,18 @@ class STGCNActionModule:
             if img_shape is None:
                 img_shape = (1080, 1920)
             img_shape = (int(img_shape[0]), int(img_shape[1]))
+            keypoints = skeleton_sequence[..., :2].astype(np.float32)
+            scores = skeleton_sequence[..., 2].astype(np.float32)
+            if self.bbox_normalize:
+                keypoints, img_shape = self._bbox_normalize(keypoints, scores, img_shape)
             active_profiler = profiler if profiler is not None else self.profiler
             with profile_block(active_profiler, profile_name):
                 pose_results = []
                 for i in range(skeleton_sequence.shape[0]):
                     pose_results.append(
                         {
-                            "keypoints": skeleton_sequence[i : i + 1, :, :2].astype(np.float32),
-                            "keypoint_scores": skeleton_sequence[i : i + 1, :, 2].astype(np.float32),
+                            "keypoints": keypoints[i : i + 1].astype(np.float32),
+                            "keypoint_scores": scores[i : i + 1].astype(np.float32),
                         }
                     )
                 result = self.inference_skeleton(self.model, pose_results, img_shape=img_shape)

@@ -8,6 +8,16 @@ from collections import deque
 from scipy.spatial import distance
 from smallFunction import validate_trajectory, calculate_mask_overlap_ratio
 
+# === fps 正規化基準 ===
+# 所有「像素」閾值（位移、span、相對分離…）是與取樣率無關的物理事實，維持不變。
+# 只有「幀窗 / age / 每幀速度上限」這些與 fps 相關的參數需要隨 fps 縮放：
+#   - 高 fps（如 30）每幀位移較小，但同一物理運動會持續更多幀；
+#   - 用更長的幀窗去累積到同樣的像素位移，即可在不調降門檻的前提下救回 30fps 漏判。
+# 以 10fps 為基準：fps=10 時 frame_scale=1.0，行為與舊版完全相同（零退化）。
+REF_FPS = 10.0
+FPS_CLAMP_MIN = 5.0
+FPS_CLAMP_MAX = 60.0
+
 # === 軌跡與配對 ===
 MAX_MISSED_FRAMES = 10
 TRAJECTORY_HISTORY_LEN = 15
@@ -33,6 +43,9 @@ MAX_VEHICLE_THROWER_STEP_PX = 200.0      # 真實單步 < 150px
 CARRIER_OVERLAP_MIN = 0.15              # litter 與某車輛重疊達此值才視為「在車上」，啟用分離檢查
 MIN_VEHICLE_RELATIVE_SEPARATION = 60.0  # litter 相對載體車輛的最小淨位移（小於此視為隨車移動的部件）
 
+# 註：隨車部件 / 純水平條紋 / 車輛共動 等 litter 候選 FP 篩選已集中到 detect 前處理
+# （smallFunction.litter_candidate_is_vehicle_fp）；tracker 只負責追蹤與軌跡確認，不再做這些判斷。
+
 # === 快速落下特例 (10fps 場景，age=2 vehicle thrower) ===
 FAST_DROP_MIN_DOWNWARD = 35.0
 FAST_DROP_MIN_HORIZ_RATIO = 0.15         # 真丟擲水平/向下 > 0.15；< 0.15 多為 detector jitter
@@ -50,6 +63,11 @@ STATIC_CANDIDATE_MIN_AGE = 3
 MIN_HISTORY_SPAN_FOR_CONFIRM = 10.0
 STATIONARY_LOCK_AGE = 10
 STATIONARY_LOCK_SPAN = 8.0
+# 靜止鎖定軌跡不吸收新偵測，會在同一靜止點每幀生出未上鎖的「雙胞胎」軌跡；
+# 該雙胞胎一旦遇 detector 抖動跳動就可能誤 confirm。
+# 修正：新軌跡若與既有 stationary_locked 軌跡共位（半徑內）則繼承鎖定，斷開連鎖。
+# 半徑為像素鄰近度（fps 無關），需大於 detector 抖動、小於真實丟擲位移。
+LOCK_INHERIT_RADIUS = 30.0
 
 # === 違規者顯示 ===
 CONFIRMED_VIOLATOR_TTL = 60
@@ -80,8 +98,50 @@ class GlobalLitterTracker:
     # 對外 attribute alias（測試 / detect.py 直接讀）
     stationary_lock_age = STATIONARY_LOCK_AGE
 
-    def __init__(self, distance_threshold=250):
+    def __init__(self, distance_threshold=250, fps=REF_FPS):
         self.distance_threshold = distance_threshold
+
+        # === fps 正規化 ===
+        self.fps = float(fps) if (fps and float(fps) > 0) else REF_FPS
+        _fps_clamped = min(max(self.fps, FPS_CLAMP_MIN), FPS_CLAMP_MAX)
+        # frame_scale：高 fps > 1（幀窗放長），10fps == 1.0（不變）。
+        self._frame_scale = _fps_clamped / REF_FPS
+
+        def _scale_up(frames):
+            # 幀數/age：與 fps 同向縮放（高 fps 需要更多幀涵蓋同一段真實時間）。
+            return max(int(round(frames * self._frame_scale)), int(frames))
+
+        def _scale_down_px_per_frame(px):
+            # 每幀像素速度上限：與 fps 反向縮放（高 fps 每幀位移較小，維持 px/sec 不變）。
+            return px / self._frame_scale
+
+        # --- 像素閾值：fps 無關，維持原值（同時對外暴露，供測試/調校讀取）---
+        self.min_history_span_for_confirm = MIN_HISTORY_SPAN_FOR_CONFIRM
+        self.stationary_lock_span = STATIONARY_LOCK_SPAN
+        self.thrower_fallback_score_limit = THROWER_FALLBACK_SCORE_LIMIT
+        self.min_confirm_downward_displacement = MIN_CONFIRM_DOWNWARD_DISPLACEMENT
+        self.min_confirm_downward_displacement_vehicle = MIN_CONFIRM_DOWNWARD_DISPLACEMENT_VEHICLE
+
+        # --- 持續性 / 幀窗參數：隨 fps 放長 ---
+        # 高 fps（且小物件偵測稀疏，detection gap 大）時，唯有放長軌跡記憶與容錯幀數，
+        # 才能在偵測斷續間維持同一條軌跡，避免每隔數幀就重生新 id、age 永遠長不大。
+        self.trajectory_history_len = _scale_up(TRAJECTORY_HISTORY_LEN)
+        self.max_missed_frames = _scale_up(MAX_MISSED_FRAMES)
+        self.fast_drop_max_frame_gap = _scale_up(FAST_DROP_MAX_FRAME_GAP)
+
+        # --- age / 成熟度門檻：以「偵測次數」計，與 fps 無關 ---
+        # age 數的是「被配對到的偵測次數」而非經過幀數。小快物件偵測稀疏，
+        # 把 age 門檻隨 fps 放大會讓 confirm 變得不可達（實測 case 13 即因此漏判）。
+        # 真正的證據強度由像素位移 + 軌跡物理 + 每幀速度檢查把關，age 維持基準值即可。
+        self.min_confirm_age = MIN_CONFIRM_AGE
+        self.min_confirm_age_vehicle = MIN_CONFIRM_AGE_VEHICLE
+        self.static_candidate_min_age = STATIC_CANDIDATE_MIN_AGE
+        self.stationary_lock_age = STATIONARY_LOCK_AGE
+        self.fall_stable_min_age = FALL_STABLE_MIN_AGE
+        self.fall_stable_tail_window = FALL_STABLE_TAIL_WINDOW
+
+        # --- 每幀像素速度上限：隨 fps 反向縮放 ---
+        self.max_vehicle_thrower_step_px = _scale_down_px_per_frame(MAX_VEHICLE_THROWER_STEP_PX)
 
         # === Mutable state ===
         self.active_litters = {}            # {litter_id: {bbox, history, age, state, thrower_key, ...}}
@@ -190,7 +250,7 @@ class GlobalLitterTracker:
                 # 第二段：延續既有 litter，更新 history、age、shape reference。
                 l_data = self.active_litters[best_id]
                 l_data['history'].append(centroid)
-                if len(l_data['history']) > TRAJECTORY_HISTORY_LEN:
+                if len(l_data['history']) > self.trajectory_history_len:
                     l_data['history'].pop(0)
 
                 age = l_data.get('age', 1) + 1
@@ -229,7 +289,7 @@ class GlobalLitterTracker:
 
                     # 2. 使用軌跡物理特徵檢查（至少要有足夠歷史幀）
                     is_physics_valid = False
-                    if age >= MIN_CONFIRM_AGE:
+                    if age >= self.min_confirm_age:
                         is_physics_valid, _ = validate_trajectory(l_data['history'])
 
                     # 2.5 靜止舊垃圾抑制：歷史中心點最大跨距 (x/y 軸 span 取大)。
@@ -247,15 +307,15 @@ class GlobalLitterTracker:
 
                     # 短期靜止：在最低 confirm age 之上，但 span 仍小 → 視為靜止候選不 confirm。
                     is_static_candidate = (
-                        age >= STATIC_CANDIDATE_MIN_AGE and
-                        history_max_span < MIN_HISTORY_SPAN_FOR_CONFIRM
+                        age >= self.static_candidate_min_age and
+                        history_max_span < self.min_history_span_for_confirm
                     )
 
                     # 長期靜止鎖：若曾連續 stationary_lock_age 幀都在小半徑內，
                     # 永久標記 stationary_locked，避免後續單一大抖動衝過 confirm。
                     if (
-                        age >= STATIONARY_LOCK_AGE and
-                        history_max_span < STATIONARY_LOCK_SPAN and
+                        age >= self.stationary_lock_age and
+                        history_max_span < self.stationary_lock_span and
                         not l_data.get('stationary_locked', False)
                     ):
                         l_data['stationary_locked'] = True
@@ -275,14 +335,14 @@ class GlobalLitterTracker:
                         thrower_key[0] in ('vehicle', 'scooter')
                     )
                     effective_min_age = (
-                        MIN_CONFIRM_AGE_VEHICLE
+                        self.min_confirm_age_vehicle
                         if is_vehicle_thrower
-                        else MIN_CONFIRM_AGE
+                        else self.min_confirm_age
                     )
                     effective_min_downward = (
-                        MIN_CONFIRM_DOWNWARD_DISPLACEMENT_VEHICLE
+                        self.min_confirm_downward_displacement_vehicle
                         if is_vehicle_thrower
-                        else MIN_CONFIRM_DOWNWARD_DISPLACEMENT
+                        else self.min_confirm_downward_displacement
                     )
                     is_downward_enough_effective = (
                         downward_disp >= effective_min_downward
@@ -299,11 +359,20 @@ class GlobalLitterTracker:
                     is_step_velocity_ok = True
                     if is_vehicle_thrower and len(l_data['history']) >= 2:
                         hist_pts = l_data['history']
-                        _max_step = max(
-                            distance.euclidean(hist_pts[i], hist_pts[i + 1])
-                            for i in range(len(hist_pts) - 1)
-                        )
-                        if _max_step > MAX_VEHICLE_THROWER_STEP_PX:
+                        # 以「每幀」速度判斷，而非單步絕對位移：
+                        # 小快物件偵測稀疏時，單步可跨多幀（detection gap 大），位移自然大，
+                        # 但每幀速度仍小且物理合理；車身瞬移則每幀速度大。除以幀距即可區分。
+                        _frames_aligned = list(l_data.get('history_frames', [])) + [frame_index]
+                        _m = min(len(hist_pts), len(_frames_aligned))
+                        _pts = hist_pts[-_m:]
+                        _frs = _frames_aligned[-_m:]
+                        _max_step_per_frame = 0.0
+                        for i in range(_m - 1):
+                            _gap = max(int(_frs[i + 1]) - int(_frs[i]), 1)
+                            _step = distance.euclidean(_pts[i], _pts[i + 1]) / _gap
+                            if _step > _max_step_per_frame:
+                                _max_step_per_frame = _step
+                        if _max_step_per_frame > self.max_vehicle_thrower_step_px:
                             is_step_velocity_ok = False
 
                     # 車身/貨物誤判抑制（以「相對載體車輛的分離」判別，而非靜態重疊）：
@@ -362,17 +431,17 @@ class GlobalLitterTracker:
                     ys = [float(p[1]) for p in l_data['history']]
                     fall_disp_history = 0.0
                     fall_stable_tail_ok = False
-                    if len(ys) >= FALL_STABLE_TAIL_WINDOW + 2:
+                    if len(ys) >= self.fall_stable_tail_window + 2:
                         peak_y = min(ys)
                         peak_idx = ys.index(peak_y)
                         if peak_idx < len(ys) - 1:
                             max_after_peak = max(ys[peak_idx:])
                             fall_disp_history = max_after_peak - peak_y
-                        tail = ys[-FALL_STABLE_TAIL_WINDOW:]
+                        tail = ys[-self.fall_stable_tail_window:]
                         fall_stable_tail_ok = (max(tail) - min(tail)) <= FALL_STABLE_MAX_TAIL_JITTER
                     can_confirm_fall_then_stable = (
                         is_vehicle_thrower and
-                        age >= FALL_STABLE_MIN_AGE and
+                        age >= self.fall_stable_min_age and
                         fall_disp_history >= FALL_STABLE_MIN_FALL_DISP and
                         fall_stable_tail_ok and
                         is_step_velocity_ok and
@@ -403,8 +472,8 @@ class GlobalLitterTracker:
                     )
                     can_confirm_vehicle_fast_drop = (
                         is_vehicle_thrower and
-                        age == 2 and
-                        fast_drop_frame_gap <= 2 and
+                        age == self.min_confirm_age and
+                        fast_drop_frame_gap <= self.fast_drop_max_frame_gap and
                         fast_drop_release_ok and
                         fast_drop_horiz_ratio_ok and
                         is_physics_valid and
@@ -418,6 +487,9 @@ class GlobalLitterTracker:
                         not stationary_locked
                     )
 
+                    # 隨車部件 / 純水平條紋 / 共動 等 FP 篩選已移至 detect 前處理
+                    # （litter_candidate_is_vehicle_fp）。tracker 只負責追蹤與軌跡確認，
+                    # 不再對候選做 FP「懷疑」；能進到這裡的都是前處理放行的候選。
                     if getattr(self, '_debug', False) and age >= 2:
                         print(
                             f"  [TRK fi={frame_index} lid={best_id} age={age}] "
@@ -434,7 +506,10 @@ class GlobalLitterTracker:
                             f"can_fs={can_confirm_fall_then_stable} fall={fall_disp_history:.0f}"
                         )
 
-                    if can_confirm_by_trajectory or can_confirm_by_motion or can_confirm_vehicle_fast_drop or can_confirm_fall_then_stable:
+                    if (
+                        can_confirm_by_trajectory or can_confirm_by_motion or
+                        can_confirm_vehicle_fast_drop or can_confirm_fall_then_stable
+                    ):
                         state = 'confirmed' # 確認為垃圾！
                         if not l_data.get('backward_submitted', False):
                             self._submit_backward_resolution(
@@ -512,6 +587,17 @@ class GlobalLitterTracker:
                     history=[centroid],
                 )
 
+                # 與既有 stationary_locked 軌跡共位 → 繼承鎖定，避免靜止點生出可誤 confirm 的雙胞胎。
+                inherit_locked = False
+                for _l_data in self.active_litters.values():
+                    if not _l_data.get('stationary_locked', False):
+                        continue
+                    _pbox = _l_data['bbox']
+                    _pc = ((_pbox[0] + _pbox[2]) / 2.0, (_pbox[1] + _pbox[3]) / 2.0)
+                    if distance.euclidean(centroid, _pc) <= LOCK_INHERIT_RADIUS:
+                        inherit_locked = True
+                        break
+
                 litter_id = self.next_id
                 new_active_litters[litter_id] = {
                     'bbox': litter_box,
@@ -529,14 +615,14 @@ class GlobalLitterTracker:
                     'history_frames': [frame_index],
                     'backward_submitted': False,
                     'backward_result': None,
-                    'stationary_locked': False,
+                    'stationary_locked': inherit_locked,
                 }
 
                 self.next_id += 1
         # 第四段：處理本幀沒被配對到的舊 litter；短暫消失可保留，超過門檻移除。
         for l_id, l_data in self.active_litters.items():
             l_data['missed'] += 1
-            if l_data['missed'] < MAX_MISSED_FRAMES:
+            if l_data['missed'] < self.max_missed_frames:
                 new_active_litters[l_id] = l_data
         
         self.active_litters = new_active_litters
@@ -1508,7 +1594,7 @@ class GlobalLitterTracker:
         if (
             best_actor_key is None and
             fallback_actor_key is not None and
-            fallback_score <= THROWER_FALLBACK_SCORE_LIMIT
+            fallback_score <= self.thrower_fallback_score_limit
         ):
             # fallback 必須要有 actor bbox 與 litter 邊距夠近的證據；
             # 否則靜止舊垃圾會被遠方路過的 actor 認領為 thrower 並過 confirm。
