@@ -3,7 +3,7 @@
 import os
 import threading
 import numpy as np
-from timeUtils import profile_block
+from pipeline.profiling import profile_block
 
 # 全域模型與背景執行狀態：避免每幀重複載入 OCR/plate detector。
 _plate_model = None

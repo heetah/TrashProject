@@ -9,13 +9,13 @@ from tqdm import tqdm
 from ultralytics import YOLO
 from ultralytics import RTDETR
 
-from detect import detect_batch
-from litterTracker import GlobalLitterTracker
-from action import STGCNActionModule
-from licensePlate import disable_license_plate_models, preload_license_plate_models, wait_for_plate_jobs
-from timeUtils import PipelineProfiler
+from pipeline.detect import detect_batch
+from pipeline.litter_tracker import GlobalLitterTracker
+from pipeline.action import STGCNActionModule
+from pipeline.plate import disable_license_plate_models, preload_license_plate_models, wait_for_plate_jobs
+from pipeline.profiling import PipelineProfiler
 
-from examine import (
+from pipeline.infra import (
     SUPPORTED_BATCH_SIZES,
     DEFAULT_FG_MASK_SCALE,
     DEFAULT_MOTION_DIFF_THRESHOLD,

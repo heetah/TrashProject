@@ -8,7 +8,8 @@ from collections import deque
 import numpy as np
 import torch
 from ultralytics import YOLO
-from timeUtils import profile_block
+from pipeline.profiling import profile_block
+from pipeline.paths import ensure_mmaction_on_path
 
 
 ACTION_CLASSES = {0: "normal", 1: "urinate"}
@@ -238,11 +239,8 @@ class STGCNActionModule:
             except Exception:
                 pass
 
-            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-            mmaction_repo = os.path.join(project_root, "mmaction2")
-            if mmaction_repo not in sys.path:
-                # 使用專案內 mmaction2，避免吃到系統其他版本。
-                sys.path.insert(0, mmaction_repo)
+            # 使用專案內 mmaction2，避免吃到系統其他版本(路徑集中於 pipeline.paths)。
+            ensure_mmaction_on_path()
             from mmaction.apis import init_recognizer, inference_skeleton
 
             device_str = str(self.device)
