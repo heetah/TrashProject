@@ -1,12 +1,103 @@
 # -*- coding: utf-8 -*-
 # 全域垃圾追蹤器：把 RTDETR 候選 litter 串成軌跡，判斷 pending/confirmed，並反推丟擲者。
 import math
+import os
 import queue
 import threading
 import numpy as np
 from collections import deque
 from scipy.spatial import distance
 from smallFunction import validate_trajectory, calculate_mask_overlap_ratio
+
+
+def _backtrack_int_env(name, default):
+    # 反追蹤調參用：讀整數環境變數，格式錯誤時回退預設。
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _backtrack_float_env(name, default):
+    # 反追蹤調參用：讀浮點環境變數，格式錯誤時回退預設。
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _trajfit_airborne_prefix(points, frames, bounce_eps=1.5, rest_eps=0.6):
+    # 軌跡反演第一步:取 litter 質心軌跡的「空中段」前綴。
+    # 落地反彈(vy 由明顯向下轉明顯向上)或靜止(連續兩步近零速)之後的點會污染拋物線
+    # 方向,必須切掉。history 與 history_frames 上限不同(fps-scaled vs 常數),從尾端對齊。
+    n = min(len(points), len(frames))
+    if n < 2:
+        return [], []
+    pts = [(float(p[0]), float(p[1])) for p in points[-n:]]
+    fs = [int(f) for f in frames[-n:]]
+    cut = n
+    prev_vy = None
+    rest_run = 0
+    for i in range(1, n):
+        dt = max(fs[i] - fs[i - 1], 1)
+        vx = (pts[i][0] - pts[i - 1][0]) / dt
+        vy = (pts[i][1] - pts[i - 1][1]) / dt
+        if math.hypot(vx, vy) < rest_eps:
+            rest_run += 1
+            if rest_run >= 2:
+                cut = max(i - 1, 2)
+                break
+        else:
+            rest_run = 0
+        if prev_vy is not None and prev_vy > bounce_eps and vy < -bounce_eps:
+            cut = i          # pts[i-1] 是落地點(保留);pts[i] 已反彈
+            break
+        prev_vy = vy
+    return pts[:cut], fs[:cut]
+
+
+def _trajfit_fit_ballistic(pts, fs, sigma_floor=2.0, min_pts=3,
+                           min_speed=2.0, g_min=-0.05, g_max=60.0):
+    # 軌跡反演第二步:空中段最小二乘拋物線 x(t)=x0+vx·t, y(t)=y0+vy·t+0.5g·t²(t=幀偏移)。
+    # 固定機位 → 影像重力方向恆定(y 向下為正),曲率 g 應非負;負曲率=非拋射 → None(fallback)。
+    # ≥5 點時剔除一個最大殘差點重擬合(RANSAC-lite,抗單點偵測離群)。
+    # 回傳含擬合殘差 sigma:下游門檻由 sigma 自動縮放,取代手調像素常數。
+    n = min(len(pts), len(fs))
+    if n < max(int(min_pts), 3):
+        return None
+    t = np.asarray(fs[:n], dtype=np.float64)
+    t = t - t[0]
+    xs = np.asarray([p[0] for p in pts[:n]], dtype=np.float64)
+    ys = np.asarray([p[1] for p in pts[:n]], dtype=np.float64)
+    span = max(float(t[-1]), 1.0)
+    if math.hypot(float(xs[-1] - xs[0]), float(ys[-1] - ys[0])) / span < min_speed:
+        return None             # 近靜止 = 放置非拋擲,交給 holding 邏輯
+    try:
+        cx = np.polyfit(t, xs, 1)
+        cy = np.polyfit(t, ys, 2)
+        if n >= 5:
+            res2 = (xs - np.polyval(cx, t)) ** 2 + (ys - np.polyval(cy, t)) ** 2
+            keep = np.ones(n, dtype=bool)
+            keep[int(np.argmax(res2))] = False
+            cx = np.polyfit(t[keep], xs[keep], 1)
+            cy = np.polyfit(t[keep], ys[keep], 2)
+            t_u, xs_u, ys_u = t[keep], xs[keep], ys[keep]
+        else:
+            t_u, xs_u, ys_u = t, xs, ys
+    except (np.linalg.LinAlgError, ValueError):
+        return None
+    g = 2.0 * float(cy[0])
+    if not (g_min <= g <= g_max):
+        return None
+    res = np.hypot(xs_u - np.polyval(cx, t_u), ys_u - np.polyval(cy, t_u))
+    sigma = max(float(np.sqrt(np.mean(res * res))), float(sigma_floor))
+    return {'cx': cx, 'cy': cy, 't0_frame': int(fs[0]), 'sigma': sigma, 'g': g}
+
+
+def _trajfit_point_at(fit, frame_index):
+    # 軌跡反演第三步:沿擬合拋物線外插到任意幀(向後外插 = 釋放事件搜索)。
+    t = float(int(frame_index) - fit['t0_frame'])
+    return (float(np.polyval(fit['cx'], t)), float(np.polyval(fit['cy'], t)))
 
 # === fps 正規化基準 ===
 # 所有「像素」閾值（位移、span、相對分離…）是與取樣率無關的物理事實，維持不變。
@@ -143,13 +234,99 @@ class GlobalLitterTracker:
         # --- 每幀像素速度上限：隨 fps 反向縮放 ---
         self.max_vehicle_thrower_step_px = _scale_down_px_per_frame(MAX_VEHICLE_THROWER_STEP_PX)
 
+        # 違規升級門檻：LITTER_REQUIRE_VEHICLE=1 時，confirmed litter 只有在 thrower 關聯到
+        # vehicle/scooter 時才升級為違規（畫框 + 車牌 OCR）。針對「行人/小便場景被誤判丟擲」的
+        # FP：純行人 thrower（無車輛關聯）不再升級成違規，但 litter 物件追蹤本身不受影響。
+        # 預設 0（行為不變，可 env 開啟並 A/B）。
+        try:
+            self.require_vehicle_for_violation = int(os.environ.get("LITTER_REQUIRE_VEHICLE", "0")) != 0
+        except ValueError:
+            self.require_vehicle_for_violation = False
+
+        # 反追蹤方向因子：LITTER_BACKTRACK_REVVEL=1 時，把舊的「整段 start→end + 3 級 cosine 分桶」
+        # 換成 OCM(Observation-Centric Momentum)式「早期速度反向外插」連續因子。litter 被拋出後，
+        # 釋放後前段速度最能保留拋擲方向(bounce/roll 之前)；反向速度向量指回真正來源，能在 litter
+        # 橫跨多物件時排除「飛過但非來源」的路過 actor。預設 0(行為不變，可 env 開啟並 A/B)。
+        # 影像空間版(v1)：與舊因子同樣留在 2D 影像座標(避免空中點投影爆走)；BEV 度量空間為後續精修。
+        try:
+            self._revvel_enabled = int(os.environ.get("LITTER_BACKTRACK_REVVEL", "0")) != 0
+        except ValueError:
+            self._revvel_enabled = False
+        self._revvel_early_pts = max(2, _backtrack_int_env("LITTER_BACKTRACK_REVVEL_PTS", 5))
+        self._revvel_min_speed = max(0.0, _backtrack_float_env("LITTER_BACKTRACK_REVVEL_MIN_SPEED", 4.0))
+        self._revvel_gain = max(0.0, _backtrack_float_env("LITTER_BACKTRACK_REVVEL_GAIN", 0.25))
+        self._revvel_max_bonus = _backtrack_float_env("LITTER_BACKTRACK_REVVEL_MAX_BONUS", 0.75)
+        self._revvel_max_penalty = _backtrack_float_env("LITTER_BACKTRACK_REVVEL_MAX_PENALTY", 1.25)
+
+        # BEV 基板：LITTER_BEV_STABLE=1 時，把每幀從「當前車輛底邊」重估的 ground homography，
+        # 改成「跨幀累積車輛底邊 → 擬合單一穩定地面平面 → 全程重用」(固定機位的一次性 BEV 標定)。
+        # 穩定度量空間讓 world_dist 距離評分不再逐幀抖動，反追蹤關聯更可靠。預設 0(行為不變，可 A/B)。
+        # 觀測數不足時自動 fallback 回每幀估計。
+        try:
+            self._bev_stable_enabled = int(os.environ.get("LITTER_BEV_STABLE", "0")) != 0
+        except ValueError:
+            self._bev_stable_enabled = False
+        self._bev_min_obs = max(3, _backtrack_int_env("LITTER_BEV_MIN_OBS", 12))
+        self._bev_recompute_every = max(1, _backtrack_int_env("LITTER_BEV_RECOMPUTE_EVERY", 8))
+        self._bev_buffer_cap = max(self._bev_min_obs, _backtrack_int_env("LITTER_BEV_BUFFER_CAP", 600))
+
+        # 情境二 dismount 持久邊：LITTER_DISMOUNT_EDGE=1 時，person↔vehicle 綁定改成 TTL-aware
+        # 持久邊(記 first/last_bound_frame + bound_count)。person 下車後走遠(IoM 掉到 0)，邊仍在
+        # TTL 內有效 → 便溺/丟垃圾歸因可回溯到原車(scenario 2)；超過 TTL 自動失效 → 避免 track_id
+        # 回收造成的舊綁定誤歸因;bound_count >= min_bind 過濾「路過車輛 1 幀」假綁定。預設 0(行為不變)。
+        # 對照舊 person_to_vehicle_history(無 TTL、永久記憶、1 幀即綁)。
+        try:
+            self._dismount_edge_enabled = int(os.environ.get("LITTER_DISMOUNT_EDGE", "0")) != 0
+        except ValueError:
+            self._dismount_edge_enabled = False
+        self._dismount_ttl_sec = max(0.0, _backtrack_float_env("LITTER_DISMOUNT_TTL_SEC", 8.0))
+        self._dismount_min_bind = max(1, _backtrack_int_env("LITTER_DISMOUNT_MIN_BIND", 2))
+
+        # 軌跡反演歸因(LITTER_BACKTRACK_TRAJFIT=1):backward worker 的評分對象從「落點鄰近度
+        # + 修正因子」改成「釋放事件時空相交」——litter 空中段擬合拋物線,向後外插出釋放位置,
+        # 只有「在釋放時刻出現在釋放點附近」的 actor 得分。時間一致性內建 → 消滅「落地後才
+        # 路過落點」的 FP;門檻由擬合殘差 sigma 縮放,取代常數 px 門檻。空中段點數不足、近靜止
+        # (放置)、曲率非物理時回 None → 自動 fallback 既有落點評分鏈。預設 0(行為不變)。
+        try:
+            self._trajfit_enabled = int(os.environ.get("LITTER_BACKTRACK_TRAJFIT", "0")) != 0
+        except ValueError:
+            self._trajfit_enabled = False
+        self._trajfit_min_air_pts = max(3, _backtrack_int_env("LITTER_TRAJFIT_MIN_AIR_PTS", 3))
+        self._trajfit_max_back = max(1, _backtrack_int_env(
+            "LITTER_TRAJFIT_MAX_BACK_FRAMES", BACKWARD_PRE_BIRTH_FRAMES))
+        self._trajfit_gate = max(0.1, _backtrack_float_env("LITTER_TRAJFIT_GATE", 1.0))
+        self._trajfit_min_speed = max(0.0, _backtrack_float_env("LITTER_TRAJFIT_MIN_SPEED", 2.0))
+        self._trajfit_sigma_floor = max(0.5, _backtrack_float_env("LITTER_TRAJFIT_SIGMA_FLOOR", 2.0))
+
+        # Offline Person↔Vehicle 關聯(PV_ASSOC=1):全片累積輕量 actor 歷史 + confirmed litter 事件,
+        # 收尾(finalize_associations) 跑事件錨定 1對1 匈牙利+dustbin(person_vehicle_assoc.py)。
+        # 不同於 online dismount-edge,這是全片 offline 全域最優配對(車先到/人下車走遠便溺再上車的跨時間
+        # 關聯)。預設 0:不累積、不 finalize、summary 不變 → regression byte-identical。
+        try:
+            self._pv_assoc_enabled = int(os.environ.get("PV_ASSOC", "0")) != 0
+        except ValueError:
+            self._pv_assoc_enabled = False
+        self._pv_full_history = []       # [{frame_index, actors:[{cls,track_id,box,center}]}](無 plate_roi)
+        self._pv_litter_events = []      # [{frame_index, center}] confirmed litter 錨定
+        self._pv_litter_seen_ids = set() # litter id 去重,confirm 跨幀只記一次
+
         # === Mutable state ===
         self.active_litters = {}            # {litter_id: {bbox, history, age, state, thrower_key, ...}}
         self.violators = {}                 # {(cls, track_id): {ttl, center, action, ...}}
         self.next_id = 0
         self.person_to_vehicle_history = {}
+        # 情境二 dismount 持久邊：person_id -> {vehicle_key, first_frame, last_bound_frame, bound_count}。
+        self._dismount_edges = {}
+        self._current_frame_index = 0
         self.actor_frame_history = deque(maxlen=BACKWARD_ACTOR_HISTORY_LEN)
         self.backward_plate_roi_items = []
+
+        # BEV 基板：跨幀累積車輛/機車底邊中心 + 高度，擬合穩定地面平面並快取。
+        self._bev_bottoms = deque(maxlen=self._bev_buffer_cap)
+        self._bev_heights = deque(maxlen=self._bev_buffer_cap)
+        self._bev_cached_homography = None
+        self._bev_cache_count = 0
+        self._bev_lock = threading.Lock()
 
         # === Backward worker thread ===
         self._actor_history_lock = threading.Lock()
@@ -165,7 +342,7 @@ class GlobalLitterTracker:
         self._backward_thread.start()
 
         self._fallback_frame_index = 0
-        self._debug = False   # set via tracker._debug = True 開啟 per-frame 印出
+        self._debug = os.environ.get("LITTER_DEBUG", "0") not in ("0", "")   # LITTER_DEBUG=1 開啟 per-frame 印出
 
     def update(self, detected_litters, actors, person_vehicle_map=None, frame_index=None,
                frame=None, vehicle_history=None):
@@ -174,13 +351,17 @@ class GlobalLitterTracker:
             frame_index = self._fallback_frame_index
             self._fallback_frame_index += 1
         frame_index = int(frame_index)
+        self._current_frame_index = frame_index
 
         self._record_actor_frame(actors, frame_index, frame=frame)
         self._drain_backward_results(vehicle_history=vehicle_history)
 
         if person_vehicle_map:
             for p_id, vehicle_key_or_id in person_vehicle_map.items():
-                self.person_to_vehicle_history[int(p_id)] = self._normalize_vehicle_like_key(vehicle_key_or_id)
+                veh_key = self._normalize_vehicle_like_key(vehicle_key_or_id)
+                self.person_to_vehicle_history[int(p_id)] = veh_key
+                self._record_dismount_edge(p_id, veh_key, frame_index)
+        self._prune_dismount_edges(frame_index)
 
         for actor_key in list(self.violators.keys()):
             v_data = self.violators[actor_key]
@@ -511,7 +692,22 @@ class GlobalLitterTracker:
                         can_confirm_vehicle_fast_drop or can_confirm_fall_then_stable
                     ):
                         state = 'confirmed' # 確認為垃圾！
-                        if not l_data.get('backward_submitted', False):
+                        if self._pv_assoc_enabled and best_id not in self._pv_litter_seen_ids:
+                            # offline 關聯的硬錨定:confirmed litter 當幀中心(每 litter id 記一次)。
+                            self._pv_litter_seen_ids.add(best_id)
+                            self._pv_litter_events.append({
+                                'frame_index': int(frame_index),
+                                'center': tuple(centroid),
+                            })
+                        # 違規升級門檻：開啟 require_vehicle 時，純行人（無車輛關聯）thrower 不升級
+                        # 為違規——不做 backtrack/車牌、不標 violator，藉此壓制行人/小便場景的 FP。
+                        escalate_violation = (
+                            not self.require_vehicle_for_violation or
+                            self._thrower_has_vehicle(thrower_key)
+                        )
+                        if not escalate_violation and getattr(self, '_debug', False):
+                            print(f"  [VIOLATION_SKIP_NO_VEHICLE fi={frame_index} litter={best_id} thrower={thrower_key}]")
+                        if escalate_violation and not l_data.get('backward_submitted', False):
                             self._submit_backward_resolution(
                                 litter_id=best_id,
                                 litter_data=l_data,
@@ -520,8 +716,8 @@ class GlobalLitterTracker:
                                 confirm_frame=frame_index,
                                 prev_thrower_key=thrower_key,
                             )
-                        
-                        if thrower_key is not None:
+
+                        if escalate_violation and thrower_key is not None:
                             # confirmed 後標記 thrower；若該人綁定車輛，也同步標記車輛。
                             current_actor_center = thrower_center # 預設為舊位置
                             
@@ -539,9 +735,8 @@ class GlobalLitterTracker:
                             )
 
                             cls_name, track_id = thrower_key
-                            if cls_name == 'person' and track_id in self.person_to_vehicle_history:
-                                veh_key = self.person_to_vehicle_history[track_id]
-                                
+                            veh_key = self._bound_vehicle_for_person(track_id) if cls_name == 'person' else None
+                            if veh_key is not None:
                                 # 去當前畫面找車輛中心點
                                 veh_center = current_actor_center
                                 for actor in actors:
@@ -715,11 +910,66 @@ class GlobalLitterTracker:
         # detect.py 讀取 backward resolver 附加狀態，例如車牌遮擋時的無限警示。
         return dict(self.violators.get(actor_key, {}))
 
+    def finalize_associations(self):
+        """收尾:對全片輕量歷史跑 offline Person↔Vehicle 關聯(event-anchored + Hungarian + dustbin)。
+        回傳 JSON-serializable dict;PV_ASSOC 關閉或無資料時回 None。主迴圈結束後呼叫一次。"""
+        if not self._pv_assoc_enabled or not self._pv_full_history:
+            return None
+
+        import sys
+        from pathlib import Path as _Path
+        repo_root = str(_Path(__file__).resolve().parent.parent)  # scripts-old-test/.. = repo root
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        try:
+            from person_vehicle_assoc import associate, AssocConfig, LitterEvent
+        except Exception as exc:  # noqa: BLE001 — 缺模組不該讓整段 run 失敗
+            print(f"[PV_ASSOC] import failed, skip association: {exc}")
+            return None
+
+        cfg = AssocConfig(fps=self.fps)
+        tau_env = os.environ.get("PV_ASSOC_TAU")
+        if tau_env:
+            try:
+                cfg.tau = float(tau_env)
+            except ValueError:
+                pass
+
+        litter_events = [
+            LitterEvent(frame_index=int(e['frame_index']), center=tuple(e['center']))
+            for e in self._pv_litter_events
+        ]
+        result = associate(self._pv_full_history, litter_events, cfg)
+
+        bindings = []
+        for pkey, b in result.bindings.items():
+            bindings.append({
+                'person_track_id': int(pkey[1]),
+                'vehicle_cls': b.vehicle_key[0] if b.vehicle_key else None,
+                'vehicle_track_id': int(b.vehicle_key[1]) if b.vehicle_key else None,
+                'score': round(float(b.score), 4),
+                'birth_frame': int(b.birth_frame),
+                'death_frame': int(b.death_frame),
+                'ttl_until_frame': int(b.ttl_until_frame),
+            })
+        bindings.sort(key=lambda d: d['person_track_id'])
+        n_bound = sum(1 for d in bindings if d['vehicle_track_id'] is not None)
+        return {
+            'frames_accumulated': len(self._pv_full_history),
+            'litter_events': len(litter_events),
+            'persons': len(result.person_keys),
+            'confirmed_vehicles': len(result.vehicle_keys),
+            'bound_persons': n_bound,
+            'unbound_persons': len(bindings) - n_bound,
+            'bindings': bindings,
+        }
+
     def _record_actor_frame(self, actors, frame_index, frame=None):
         # 每幀保留 actor 快照。confirmed 延遲出現時，backward worker 可回看出生幀附近。
         actor_snapshots = []
         frame_h = frame.shape[0] if frame is not None else 0
         frame_w = frame.shape[1] if frame is not None else 0
+        bev_bottoms = []   # 本幀車輛/機車底邊中心 + 高度，供 BEV 穩定平面累積。
 
         for actor in actors or []:
             try:
@@ -743,6 +993,10 @@ class GlobalLitterTracker:
                 if roi is not None:
                     snapshot['plate_roi'] = roi
 
+            if self._bev_stable_enabled and cls_name in ('vehicle', 'scooter'):
+                bx1, by1, bx2, by2 = box
+                bev_bottoms.append((((bx1 + bx2) / 2.0, by2), max(by2 - by1, 1.0)))
+
             actor_snapshots.append(snapshot)
 
         with self._actor_history_lock:
@@ -751,6 +1005,23 @@ class GlobalLitterTracker:
                 'actors': actor_snapshots,
             })
 
+        if self._pv_assoc_enabled:
+            # 全片不截斷的輕量歷史(去 plate_roi 省記憶);主執行緒 only,finalize 在 join 後讀。
+            self._pv_full_history.append({
+                'frame_index': int(frame_index),
+                'actors': [
+                    {'cls': s['cls'], 'track_id': s['track_id'],
+                     'box': s['box'], 'center': s['center']}
+                    for s in actor_snapshots
+                ],
+            })
+
+        if bev_bottoms:
+            with self._bev_lock:
+                for bottom, height in bev_bottoms:
+                    self._bev_bottoms.append(bottom)
+                    self._bev_heights.append(height)
+
     def _submit_backward_resolution(self, litter_id, litter_data, current_bbox,
                                     current_centroid, confirm_frame, prev_thrower_key=None):
         # task 用 immutable snapshot，worker 不碰 main thread 追蹤狀態。
@@ -758,8 +1029,15 @@ class GlobalLitterTracker:
         birth_centroid = tuple(litter_data.get('birth_centroid', litter_data['history'][0]))
         birth_bbox = litter_data.get('birth_bbox', litter_data.get('bbox', current_bbox))
         history = [tuple(p) for p in litter_data.get('history', [])]
+        history_frames = [int(f) for f in litter_data.get('history_frames', [])]
+        if len(history_frames) == len(history) - 1:
+            # confirm 發生在 update 迴圈中段:history 已 append 本幀質心(L343),但
+            # history_frames 要到幀尾 dict 重建才補 → 這裡用 confirm_frame 補齊,
+            # 否則尾端對齊會整體錯位一幀(軌跡擬合的時間座標被污染)。
+            history_frames.append(int(confirm_frame))
         if not history or history[-1] != tuple(current_centroid):
             history.append(tuple(current_centroid))
+            history_frames.append(int(confirm_frame))
 
         with self._actor_history_lock:
             actor_frames = [
@@ -787,6 +1065,7 @@ class GlobalLitterTracker:
             'current_bbox': current_bbox,
             'current_centroid': tuple(current_centroid),
             'history': history,
+            'history_frames': history_frames,
             'prev_thrower_key': prev_thrower_key,
             'actor_frames': actor_frames,
         }
@@ -837,9 +1116,15 @@ class GlobalLitterTracker:
         history = task.get('history') or []
         prev_thrower_key = task.get('prev_thrower_key')
         birth_frame = int(task.get('birth_frame', 0))
-        actor_candidates = {}
+        actor_candidates = None
+        if self._trajfit_enabled:
+            # 軌跡反演優先;擬合失敗或無時空相交候選 → None → 走既有落點評分 fallback。
+            actor_candidates = self._trajfit_actor_candidates(task)
+        fallback_frames = task.get('actor_frames', []) if actor_candidates is None else []
+        if actor_candidates is None:
+            actor_candidates = {}
 
-        for frame_snapshot in task.get('actor_frames', []):
+        for frame_snapshot in fallback_frames:
             frame_index = int(frame_snapshot.get('frame_index', birth_frame))
             actors = []
             for actor_snapshot in frame_snapshot.get('actors', []):
@@ -939,6 +1224,76 @@ class GlobalLitterTracker:
             'plate_blocked_since_litter': plate_key is not None and not plate_roi_items,
         }
 
+    def _trajfit_actor_candidates(self, task):
+        # 軌跡反演歸因:litter 空中段 → 拋物線擬合 → 向後外插釋放事件 → 時空相交評分。
+        # 只掃 [birth - max_back, birth]:釋放必在首次偵測之前;birth 之後軌跡跟的是垃圾不是人。
+        # 評分= 外插點到 actor bbox 距離 / margin(margin 由 bbox 尺寸與擬合 sigma 縮放,無常數 px 門檻)。
+        # 回傳與既有評分同構的 candidates dict;無法反演回 None(由呼叫端 fallback)。
+        history = task.get('history') or []
+        hframes = task.get('history_frames') or []
+        if len(history) < 2 or len(hframes) < 2:
+            if self._debug:
+                print(f"  [TRAJFIT litter={task.get('litter_id')} skip: history={len(history)}/{len(hframes)}]")
+            return None
+        pts, fs = _trajfit_airborne_prefix(history, hframes)
+        fit = _trajfit_fit_ballistic(
+            pts, fs,
+            sigma_floor=self._trajfit_sigma_floor,
+            min_pts=self._trajfit_min_air_pts,
+            min_speed=self._trajfit_min_speed,
+        )
+        if fit is None:
+            if self._debug:
+                print(
+                    f"  [TRAJFIT litter={task.get('litter_id')} no-fit: "
+                    f"air_pts={len(pts)}/{len(history)} (min={self._trajfit_min_air_pts})]"
+                )
+            return None
+
+        birth_frame = int(task.get('birth_frame', 0))
+        lo = birth_frame - self._trajfit_max_back
+        candidates = {}
+        for frame_snapshot in task.get('actor_frames', []):
+            fi = int(frame_snapshot.get('frame_index', -1))
+            if fi < lo or fi > birth_frame:
+                continue
+            proj = _trajfit_point_at(fit, fi)
+            for actor_snapshot in frame_snapshot.get('actors', []):
+                actor = self._snapshot_to_actor(actor_snapshot)
+                if actor is None:
+                    continue
+                if str(actor.get('cls', '')).lower() not in ('person', 'vehicle', 'scooter'):
+                    continue
+                box = actor['box']
+                box_dist = self._point_to_box_distance(proj, box)
+                bw = float(box[2]) - float(box[0])
+                bh = float(box[3]) - float(box[1])
+                margin = max(0.35 * math.hypot(bw, bh), 3.0 * fit['sigma'], 16.0)
+                score = box_dist / max(margin, 1e-6)
+                if score > self._trajfit_gate:
+                    continue
+                actor_key = self._actor_key(actor)
+                candidate = candidates.setdefault(actor_key, {
+                    'best_score': float('inf'),
+                    'evidence_count': 0,
+                    'best_center': None,
+                    'best_frame': None,
+                    'best_frame_actors': None,
+                })
+                candidate['evidence_count'] += 1
+                if score < candidate['best_score']:
+                    candidate['best_score'] = score
+                    candidate['best_center'] = self._actor_center(actor)
+                    candidate['best_frame'] = fi
+                    candidate['best_frame_actors'] = frame_snapshot.get('actors', [])
+
+        if self._debug:
+            print(
+                f"  [TRAJFIT litter={task.get('litter_id')} air_pts={len(pts)} "
+                f"g={fit['g']:.2f} sigma={fit['sigma']:.1f} candidates={len(candidates)}]"
+            )
+        return candidates or None
+
     def _score_backward_actor(self, actor, birth_anchor, ground_world,
                               start_2d, end_2d, homography, history,
                               frame_index, birth_frame, prev_thrower_key=None):
@@ -979,7 +1334,7 @@ class GlobalLitterTracker:
             score *= THROWER_PREVIOUS_BONUS
 
         if start_2d is not None and end_2d is not None:
-            score *= self._trajectory_direction_factor_2d(actor_anchor, start_2d, end_2d)
+            score *= self._direction_factor(actor_anchor, start_2d, end_2d, history, homography)
 
         frame_gap = abs(int(frame_index) - int(birth_frame))
         score *= (1.0 + min(frame_gap, 45) * 0.025)
@@ -1227,9 +1582,13 @@ class GlobalLitterTracker:
         if not person_action_map:
             return set()
 
+        if frame_index is not None:
+            self._current_frame_index = int(frame_index)
         if person_vehicle_map:
             for p_id, vehicle_key_or_id in person_vehicle_map.items():
-                self.person_to_vehicle_history[int(p_id)] = self._normalize_vehicle_like_key(vehicle_key_or_id)
+                veh_key = self._normalize_vehicle_like_key(vehicle_key_or_id)
+                self.person_to_vehicle_history[int(p_id)] = veh_key
+                self._record_dismount_edge(p_id, veh_key, self._current_frame_index)
 
         ttl = int(ttl or CONFIRMED_VIOLATOR_TTL)
         actor_center_map = {}
@@ -1265,7 +1624,7 @@ class GlobalLitterTracker:
             self._mark_violator(person_key, person_center, ttl=ttl, action=action_name)
             marked_violators.add(person_key)
 
-            vehicle_key = self.person_to_vehicle_history.get(person_id)
+            vehicle_key = self._bound_vehicle_for_person(person_id)
             if vehicle_key is None:
                 vehicle_key = self._find_vehicle_for_person(person_id, actors)
                 if vehicle_key is not None:
@@ -1393,6 +1752,75 @@ class GlobalLitterTracker:
         inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
         litter_area = max(lx2 - lx1, 1e-6) * max(ly2 - ly1, 1e-6)
         return min(max(inter / litter_area, 0.0), 1.0)
+
+    def _thrower_has_vehicle(self, thrower_key):
+        # thrower 是否關聯到車輛：本身是 vehicle/scooter，或為已綁定車輛的 person。
+        if thrower_key is None:
+            return False
+        cls_name, track_id = thrower_key
+        if cls_name in ('vehicle', 'scooter'):
+            return True
+        if cls_name == 'person' and self._bound_vehicle_for_person(track_id) is not None:
+            return True
+        return False
+
+    def _bound_vehicle_for_person(self, person_id):
+        # 統一的 person→bound vehicle 查詢：dismount edge 開啟時走 TTL-aware 持久邊，
+        # 否則走舊的無 TTL person_to_vehicle_history(關閉時行為與改動前完全一致)。
+        try:
+            pid = int(person_id)
+        except (TypeError, ValueError):
+            return None
+        if self._dismount_edge_enabled:
+            return self._dismount_vehicle_for_person(pid)
+        return self.person_to_vehicle_history.get(pid)
+
+    def _record_dismount_edge(self, person_id, vehicle_key, frame_index):
+        # 累積/刷新 person→vehicle 持久邊。換綁不同車時重置 first_frame；同車則延長 last_bound_frame。
+        if not self._dismount_edge_enabled or vehicle_key is None or frame_index is None:
+            return
+        try:
+            pid = int(person_id)
+        except (TypeError, ValueError):
+            return
+        fi = int(frame_index)
+        edge = self._dismount_edges.get(pid)
+        if edge is None or edge.get('vehicle_key') != vehicle_key:
+            self._dismount_edges[pid] = {
+                'vehicle_key': vehicle_key,
+                'first_frame': fi,
+                'last_bound_frame': fi,
+                'bound_count': 1,
+            }
+        else:
+            edge['last_bound_frame'] = fi
+            edge['bound_count'] = int(edge.get('bound_count', 0)) + 1
+
+    def _dismount_vehicle_for_person(self, person_id, frame_index=None):
+        # TTL-aware 查詢：邊需 bound_count >= min_bind(濾路過 fluke)且在 TTL 內(濾 track_id 回收舊綁定)。
+        if not self._dismount_edge_enabled:
+            return None
+        edge = self._dismount_edges.get(int(person_id))
+        if edge is None or int(edge.get('bound_count', 0)) < self._dismount_min_bind:
+            return None
+        fi = self._current_frame_index if frame_index is None else int(frame_index)
+        ttl_frames = max(1, int(self._dismount_ttl_sec * self.fps))
+        if fi - int(edge['last_bound_frame']) > ttl_frames:
+            return None   # 邊已過期
+        return edge['vehicle_key']
+
+    def _prune_dismount_edges(self, frame_index):
+        # 清掉遠超 TTL 的陳舊邊(保留 3×TTL 緩衝後丟棄)，避免長影片無界成長。
+        if not self._dismount_edge_enabled or frame_index is None or not self._dismount_edges:
+            return
+        keep_frames = max(1, int(self._dismount_ttl_sec * self.fps)) * 3
+        fi = int(frame_index)
+        stale = [
+            pid for pid, e in self._dismount_edges.items()
+            if fi - int(e.get('last_bound_frame', fi)) > keep_frames
+        ]
+        for pid in stale:
+            del self._dismount_edges[pid]
 
     def _mark_violator(self, actor_key, center, ttl, until_plate_found=False, action=None):
         # 寫入或延長違規者 TTL；center 用來避免 ID 重用造成誤標。
@@ -1562,7 +1990,7 @@ class GlobalLitterTracker:
                 score *= THROWER_PREVIOUS_BONUS
 
             if start_2d is not None and end_2d is not None:
-                score *= self._trajectory_direction_factor_2d(actor_anchor, start_2d, end_2d)
+                score *= self._direction_factor(actor_anchor, start_2d, end_2d, history, homography)
                 
             release_like = self._release_origin_near_actor(history, actor)
             if release_like:
@@ -1685,6 +2113,12 @@ class GlobalLitterTracker:
 
     def _estimate_ground_homography(self, actors, litter_anchor):
         # 用畫面中的車輛底部點估計簡化 homography；無車輛時退回穩定的等比例投影。
+        # BEV 基板開啟且累積觀測足夠時，改用跨幀穩定平面(固定機位一次性標定)，消除逐幀抖動。
+        if self._bev_stable_enabled:
+            stable = self._stable_ground_homography()
+            if stable is not None:
+                return stable
+
         vehicle_bottoms = []
         vehicle_heights = []
 
@@ -1724,6 +2158,37 @@ class GlobalLitterTracker:
             [0.0, 1.0, -horizon_y],
         ], dtype=np.float32)
 
+    def _stable_ground_homography(self):
+        # 固定機位一次性 BEV 標定：用跨幀累積的車輛底邊擬合單一穩定地面平面並快取。
+        # 與 _estimate_ground_homography 同一套公式，差別在統計量來自整段累積而非單幀，
+        # 且 ground_ref_y 由累積底邊決定(平面屬相機幾何，與個別 litter 無關)。
+        # 觀測數不足回 None，由呼叫端 fallback 回每幀估計。
+        with self._bev_lock:
+            n = len(self._bev_bottoms)
+            if n < self._bev_min_obs:
+                return None
+            if (
+                self._bev_cached_homography is None or
+                (n - self._bev_cache_count) >= self._bev_recompute_every
+            ):
+                bottom_x = np.asarray([p[0] for p in self._bev_bottoms], dtype=np.float32)
+                bottom_y = np.asarray([p[1] for p in self._bev_bottoms], dtype=np.float32)
+                heights = np.asarray(self._bev_heights, dtype=np.float32)
+                median_h = float(np.median(heights)) if heights.size else 80.0
+                y_spread = float(np.max(bottom_y) - np.min(bottom_y)) if bottom_y.size > 1 else 0.0
+                center_x = float(np.median(bottom_x))
+                ground_ref_y = float(np.max(bottom_y))
+                horizon_offset = max(80.0, median_h * 1.2, y_spread * 1.5)
+                horizon_y = float(np.min(bottom_y)) - horizon_offset
+                ground_scale = max(ground_ref_y - horizon_y, 80.0)
+                self._bev_cached_homography = np.asarray([
+                    [ground_scale, 0.0, -ground_scale * center_x],
+                    [0.0, -ground_scale, ground_scale * ground_ref_y],
+                    [0.0, 1.0, -horizon_y],
+                ], dtype=np.float32)
+                self._bev_cache_count = n
+            return self._bev_cached_homography
+
     def _project_point(self, point, homography):
         # 將影像點投影到 pseudo-ground，並避免深度接近 0 造成數值爆炸。
         if point is None:
@@ -1746,6 +2211,51 @@ class GlobalLitterTracker:
             return max(ax2 - ax1, 1.0)
 
         return max(math.hypot(right[0] - left[0], right[1] - left[1]), 1.0)
+
+    def _direction_factor(self, actor_anchor, start_2d, end_2d, history, homography=None):
+        # 反追蹤方向因子 dispatch：開啟 revvel 時用早期速度反向外插(連續因子)，
+        # 否則(或資訊不足)退回舊的 start→end 3 級 cosine 分桶。
+        # 傳入 homography 且 BEV 開啟時，方向 cosine 在 BEV 度量空間計算(物理一致)。
+        if self._revvel_enabled:
+            factor = self._reverse_velocity_factor(actor_anchor, history, homography)
+            if factor is not None:
+                return factor
+        return self._trajectory_direction_factor_2d(actor_anchor, start_2d, end_2d)
+
+    def _reverse_velocity_factor(self, actor_anchor, history, homography=None):
+        # OCM 式：用 litter 早期軌跡速度反向外插出「來源方向」，評分 actor 是否落在反向射線上。
+        # 回傳 None 代表資訊不足(軌跡太短/近乎靜止)，由 dispatch 退回舊因子。
+        if not history or len(history) < 3:
+            return None
+        k = min(len(history), self._revvel_early_pts)
+        p0 = history[0]          # birth/釋放點
+        pk = history[k - 1]      # 早期軌跡點：釋放後前段，最保留拋擲方向
+        # 速度有效性 gate 在「影像空間」判斷(門檻以像素校準，BEV 尺度不適用)。
+        if math.hypot(float(pk[0]) - float(p0[0]), float(pk[1]) - float(p0[1])) < self._revvel_min_speed:
+            return None          # 近乎靜止 → 無方向資訊
+        # 方向 cosine 在 BEV 度量空間算(物理一致，消除透視扭曲)；無 BEV 時退回影像空間。
+        anchor = actor_anchor
+        if homography is not None and self._bev_stable_enabled:
+            p0 = self._project_point(p0, homography) or p0
+            pk = self._project_point(pk, homography) or pk
+            anchor = self._project_point(actor_anchor, homography) or actor_anchor
+        vx = float(pk[0]) - float(p0[0])
+        vy = float(pk[1]) - float(p0[1])
+        vlen = math.hypot(vx, vy)
+        if vlen < 1e-6:
+            return None
+        # 反向單位速度向量(指回拋擲來源)。
+        rx, ry = -vx / vlen, -vy / vlen
+        ax = float(anchor[0]) - float(p0[0])
+        ay = float(anchor[1]) - float(p0[1])
+        alen = math.hypot(ax, ay)
+        if alen < 1e-6:
+            return self._revvel_max_bonus   # actor 幾乎就在釋放點 → 最強 bonus
+        # cosine：actor 方向與反向速度的對齊度。+1=actor 正好在來源方向(最可能)，
+        # -1=actor 在 litter 飛行前方(非來源)。scale-free，近遠景一致。
+        cos = (ax * rx + ay * ry) / alen
+        factor = 1.0 - self._revvel_gain * cos
+        return max(self._revvel_max_bonus, min(self._revvel_max_penalty, factor))
 
     @staticmethod
     def _trajectory_direction_factor_2d(actor_anchor, start_2d, end_2d):

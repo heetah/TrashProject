@@ -1,25 +1,53 @@
-# -*- coding: utf-8 -*-
-# 主流程入口：負責模型載入、影片讀寫、逐幀/批次推理、輸出壓縮與耗時統計。
 import cv2
 import json
-import numpy as np
 import os
-import queue
-import subprocess
-import threading
-from tqdm import tqdm
-from pathlib import Path
 import argparse
+from pathlib import Path
 from collections import defaultdict, deque
+from tqdm import tqdm
 
 from ultralytics import YOLO
 from ultralytics import RTDETR
 
-from detect import BBOX_DEVICE, BBOX_HALF, TRASH_DEVICE, TRASH_HALF, detect, detect_batch
+from detect import detect_batch
 from litterTracker import GlobalLitterTracker
 from action import STGCNActionModule
 from licensePlate import disable_license_plate_models, preload_license_plate_models, wait_for_plate_jobs
 from timeUtils import PipelineProfiler
+
+from examine import (
+    SUPPORTED_BATCH_SIZES,
+    DEFAULT_FG_MASK_SCALE,
+    DEFAULT_MOTION_DIFF_THRESHOLD,
+    DEFAULT_MOTION_DILATE_ITERATIONS,
+    DEFAULT_MOTION_BLUR_KERNEL,
+    DEFAULT_MOTION_OPEN_KERNEL,
+    DEFAULT_MOTION_OPEN_ITERATIONS,
+    DEFAULT_MOTION_CLOSE_KERNEL,
+    DEFAULT_MOTION_CLOSE_ITERATIONS,
+    DEFAULT_MOTION_MIN_COMPONENT_AREA,
+    DEFAULT_MOTION_MIN_LARGEST_COMPONENT_RATIO,
+    DEFAULT_READER_QUEUE_SIZE,
+    DEFAULT_CAPTURE_BUFFER_SIZE,
+    MotionMaskBuilder,
+    AsyncFFmpegVideoWriter,
+    AsyncVideoFrameReader,
+    _set_ffmpeg_bin,
+    _select_ffmpeg_bin,
+    _estimate_actor_batch_size,
+    _model_path_candidates,
+    _model_path_candidates_for_batches,
+    _load_model_with_warmup,
+    _warmup_bbox_model,
+    _warmup_trash_model,
+    _engine_batch_size_from_path,
+    _read_engine_input_shape,
+    _apply_engine_overrides,
+    _get_model_input_channels,
+    _get_model_warmup_imgsz,
+    _resolve_video_path,
+    _open_video_capture,
+)
 
 # 畫面標註顏色設定：各類別在輸出影片中的 bbox 顏色。
 COLORS = {
@@ -30,9 +58,8 @@ COLORS = {
 }
 
 # 預設模型路徑：batch 1 使用一般權重；batch N 使用 batch 匯出/訓練資料夾中的權重。
-SUPPORTED_BATCH_SIZES = (1, 2, 4, 8)
 POSE_MODEL_PATH = '/home/se_copilot/trashProject/modules_weight/yolo26x-pose.pt'
-STGCN_WEIGHT_PATH = '/home/se_copilot/trashProject/modules_weight/stgcnpp_urinate_2class_best.pth'
+STGCN_WEIGHT_PATH = '/home/se_copilot/trashProject/modules_weight/best_stgcn_0623.pth'
 STGCN_CONFIG_PATH = '/home/se_copilot/trashProject/mmaction2/configs/skeleton/stgcnpp/custom_trash_stgcnpp.py'
 
 MODEL_BBOX_PATH = '/home/se_copilot/trashProject/modules_weight/best-yolo-seg_v3.pt'
@@ -41,966 +68,19 @@ MODEL_BBOX_PATH_BATCH = '/home/se_copilot/trashProject/modules_weight/batch/best
 # best-rtdetr-4c.pt 無 batch/ 版本；batch engine 由 export_tensorrt.py 在同目錄產出 best-rtdetr-4c_b8.engine。
 MODEL_TRASH_PATH_BATCH = '/home/se_copilot/trashProject/modules_weight/best-rtdetr-4c.pt'
 
-DEFAULT_FG_MASK_SCALE = 0.5
-DEFAULT_MOTION_DIFF_THRESHOLD = 10
-DEFAULT_MOTION_DILATE_ITERATIONS = 2
-DEFAULT_MOTION_BLUR_KERNEL = 0
-DEFAULT_MOTION_OPEN_KERNEL = 3
-DEFAULT_MOTION_OPEN_ITERATIONS = 0
-DEFAULT_MOTION_CLOSE_KERNEL = 0
-DEFAULT_MOTION_CLOSE_ITERATIONS = 0
-DEFAULT_MOTION_MIN_COMPONENT_AREA = 4
-DEFAULT_MOTION_MIN_LARGEST_COMPONENT_RATIO = 0.25
-DEFAULT_READER_QUEUE_SIZE = 32
-DEFAULT_CAPTURE_BUFFER_SIZE = 8
-LEGACY_RESOURCE_ROOT = Path("/mnt/8tb_hdd/under115a")
-
-# torch 是選用依賴：若不可用，TensorRT engine 檢查會自動略過。
-try:
-    import torch
-except Exception:
-    torch = None
-
-
-def _set_env_if_present(name, value):
-    # CLI 有傳值才寫入環境變數，避免覆蓋使用者原本的設定。
-    if value is not None:
-        os.environ[name] = str(value)
-
-
-def _resolve_video_path(file_arg):
-    # 支援 AGENTS.md 的 resources/foo.mp4、單純檔名與舊 /mnt/8tb_hdd/under115a/resources 來源。
-    raw = Path(str(file_arg)).expanduser()
-    if raw.is_absolute():
-        return str(raw)
-
-    candidates = [raw]
-    if len(raw.parts) == 1:
-        candidates.insert(0, Path("resources") / raw)
-        candidates.insert(1, LEGACY_RESOURCE_ROOT / "resources" / raw)
-    elif raw.parts[0] == "resources":
-        candidates.append(LEGACY_RESOURCE_ROOT / raw)
-
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
-    return str(candidates[0])
-
-
-def _odd_kernel_size(value):
-    # OpenCV morphology / blur kernel 需要正奇數；小於 3 視為關閉。
-    value = int(value or 0)
-    if value < 3:
-        return 0
-    return value if value % 2 == 1 else value + 1
-
-
-def _video_accel_value(name):
-    # OpenCV VideoCapture 硬解參數；平台/編譯不支援時回傳 None 走 fallback。
-    accel_name = str(name or "any").strip().lower()
-    if accel_name in ("none", "off", "false", "0"):
-        return getattr(cv2, "VIDEO_ACCELERATION_NONE", 0)
-    if accel_name in ("any", "auto", "on", "true", "1"):
-        return getattr(cv2, "VIDEO_ACCELERATION_ANY", None)
-    if accel_name == "vaapi":
-        return getattr(cv2, "VIDEO_ACCELERATION_VAAPI", None)
-    if accel_name in ("mfx", "qsv"):
-        return getattr(cv2, "VIDEO_ACCELERATION_MFX", None)
-    if accel_name == "d3d11":
-        return getattr(cv2, "VIDEO_ACCELERATION_D3D11", None)
-    raise ValueError(f"Unsupported video hardware acceleration mode: {name}")
-
-
-def _append_capture_param(params, prop_name, value):
-    prop = getattr(cv2, prop_name, None)
-    if prop is None or value is None:
-        return
-    params.extend([int(prop), int(value)])
-
-
-def _open_video_capture(video_path, hw_accel="any", hw_device=None,
-                        buffer_size=DEFAULT_CAPTURE_BUFFER_SIZE,
-                        read_threads=0, profiler=None):
-    # OpenCV FFmpeg backend 可用硬體解碼時先試；失敗保留軟解，frame 順序與數量不變。
-    api_preference = getattr(cv2, "CAP_FFMPEG", 0)
-    params = []
-    accel_value = _video_accel_value(hw_accel)
-    if accel_value is not None:
-        _append_capture_param(params, "CAP_PROP_HW_ACCELERATION", accel_value)
-        if hw_device is not None and int(hw_device) >= 0:
-            _append_capture_param(params, "CAP_PROP_HW_DEVICE", int(hw_device))
-    if read_threads and int(read_threads) > 0:
-        _append_capture_param(params, "CAP_PROP_N_THREADS", int(read_threads))
-
-    cap = None
-    open_error = None
-    if params:
-        try:
-            with profiler.time_block("video.open_capture_hw"):
-                cap = cv2.VideoCapture(str(video_path), api_preference, params)
-        except Exception as exc:
-            open_error = exc
-            cap = None
-
-    if cap is None or not cap.isOpened():
-        if cap is not None:
-            cap.release()
-        if open_error is not None:
-            print(f"Warning: hardware VideoCapture open failed; fallback to software decode: {open_error}")
-        with profiler.time_block("video.open_capture_fallback"):
-            cap = cv2.VideoCapture(str(video_path), api_preference)
-        if not cap.isOpened():
-            cap.release()
-            with profiler.time_block("video.open_capture_fallback"):
-                cap = cv2.VideoCapture(str(video_path))
-
-    if buffer_size and int(buffer_size) > 0:
-        buffer_prop = getattr(cv2, "CAP_PROP_BUFFERSIZE", None)
-        if buffer_prop is not None:
-            cap.set(buffer_prop, int(buffer_size))
-
-    try:
-        backend_name = cap.getBackendName()
-    except Exception:
-        backend_name = "unknown"
-    return cap, backend_name
-
-
-def _can_try_tensorrt_engine(engine_path):
-    # TensorRT engine 需要 CUDA + tensorrt 套件；缺任一項就回退 .pt 權重。
-    if torch is None or not torch.cuda.is_available() or torch.cuda.device_count() <= 0:
-        print(f"Warning: CUDA is unavailable; skip TensorRT engine {engine_path}.")
-        return False
-
-    try:
-        import tensorrt  # noqa: F401
-    except Exception as exc:
-        print(f"Warning: TensorRT import failed; skip engine {engine_path}: {exc}")
-        return False
-
-    return True
-
-
-def _engine_path_for_batch(model_path, batch_size):
-    # batch 1 使用同名 .engine；batch N 使用 *_bN.engine，避免不同 batch engine 互相覆蓋。
-    path = Path(model_path)
-    if int(batch_size) <= 1:
-        return path.with_suffix(".engine")
-    return path.with_name(f"{path.stem}_b{int(batch_size)}.engine")
-
-
-def _engine_batch_size_from_path(model_path, fallback=1):
-    # 從 *_bN.engine 還原 TensorRT fixed batch；.pt 則用呼叫端期望 batch。
-    path = Path(model_path)
-    if path.suffix != ".engine":
-        return max(int(fallback or 1), 1)
-    stem = path.stem
-    if "_b" in stem:
-        maybe_batch = stem.rsplit("_b", 1)[1]
-        if maybe_batch.isdigit():
-            return int(maybe_batch)
-    return 1
-
-
-def _round_supported_batch_size(target):
-    target = max(int(target or 1), 1)
-    for batch_size in SUPPORTED_BATCH_SIZES:
-        if batch_size >= target:
-            return batch_size
-    return SUPPORTED_BATCH_SIZES[-1]
-
-
-def _estimate_actor_batch_size(pipeline_batch_size, yolo_seg_frame_skip):
-    # actor 可跳幀；batch 8 + skip 2 實際只需 4 張 actor 推理，不應強迫塞 b8。
-    pipeline_batch_size = max(int(pipeline_batch_size or 1), 1)
-    skip = max(int(yolo_seg_frame_skip or 1), 1)
-    target = (pipeline_batch_size + skip - 1) // skip
-    return _round_supported_batch_size(target)
-
-
-def _model_path_candidates(model_path, prefer_engine=True, batch_size=1):
-    return _model_path_candidates_for_batches(model_path, prefer_engine, [batch_size])
-
-
-def _model_path_candidates_for_batches(model_path, prefer_engine=True, batch_sizes=None):
-    # 建立模型候選順序：優先 engine，失敗或不存在時回退原始權重。
-    path = Path(model_path)
-    candidates = []
-    batch_sizes = list(batch_sizes or [1])
-
-    if prefer_engine and path.suffix == ".pt":
-        seen_batches = set()
-        for batch_size in batch_sizes:
-            batch_size = max(int(batch_size or 1), 1)
-            if batch_size in seen_batches:
-                continue
-            seen_batches.add(batch_size)
-            engine_path = _engine_path_for_batch(path, batch_size)
-            if engine_path.exists():
-                if _can_try_tensorrt_engine(engine_path):
-                    candidates.append(str(engine_path))
-            else:
-                print(f"Warning: TensorRT engine not found for {path} at batch={batch_size}.")
-
-    candidates.append(str(path))
-
-    if prefer_engine and path.suffix == ".engine":
-        if _can_try_tensorrt_engine(path):
-            candidates.insert(0, str(path))
-        else:
-            candidates = []
-        pt_path = path.with_suffix(".pt")
-        if pt_path.exists():
-            candidates.append(str(pt_path))
-
-    unique_candidates = []
-    for candidate in candidates:
-        if candidate not in unique_candidates:
-            unique_candidates.append(candidate)
-    return unique_candidates
-
-
-def _load_model_with_warmup(label, candidates, model_factory, warmup_func, profiler):
-    # 逐一嘗試候選模型；成功載入後立即 warmup，讓正式影片處理不吃第一次推理成本。
-    last_error = None
-    for idx, model_path in enumerate(candidates):
-        try:
-            if idx > 0:
-                print(f"{label}: retrying with fallback model {model_path}")
-            with profiler.time_block(f"model_load.{label}"):
-                model = model_factory(model_path)
-            with profiler.time_block(f"model_warmup.{label}"):
-                warmup_func(model, model_path)
-            print(f"{label}: loaded and warmed up {model_path}")
-            return model, model_path
-        except Exception as exc:
-            last_error = exc
-            print(f"{label}: failed to initialize {model_path}: {exc}")
-
-    raise RuntimeError(f"{label}: all model candidates failed: {candidates}") from last_error
-
-
-_FFMPEG_ENCODER_CACHE = {}
-_FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
-
-
-def _set_ffmpeg_bin(ffmpeg_bin):
-    # conda env 內的 ffmpeg 可能沒有 NVENC；允許 main.py 改用指定 binary。
-    global _FFMPEG_BIN
-    if ffmpeg_bin:
-        _FFMPEG_BIN = str(ffmpeg_bin)
-
-
-def _ffmpeg_available_encoders(ffmpeg_bin=None):
-    # 只探測一次 ffmpeg 支援的 encoder，避免每次開 writer 都重跑清單。
-    ffmpeg_bin = str(ffmpeg_bin or _FFMPEG_BIN)
-    if ffmpeg_bin in _FFMPEG_ENCODER_CACHE:
-        return _FFMPEG_ENCODER_CACHE[ffmpeg_bin]
-
-    try:
-        result = subprocess.run(
-            [ffmpeg_bin, '-hide_banner', '-encoders'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=True,
-        )
-    except Exception:
-        _FFMPEG_ENCODER_CACHE[ffmpeg_bin] = set()
-        return _FFMPEG_ENCODER_CACHE[ffmpeg_bin]
-
-    encoders = set()
-    for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 2 and len(parts[0]) == 6 and parts[0][0] in 'VASD':
-            encoders.add(parts[1])
-
-    _FFMPEG_ENCODER_CACHE[ffmpeg_bin] = encoders
-    return _FFMPEG_ENCODER_CACHE[ffmpeg_bin]
-
-
-def _ffmpeg_encoder_available(encoder_name, ffmpeg_bin=None):
-    # 讓 writer 可以先選可用 encoder，再決定要不要退回 x264。
-    return str(encoder_name or '').strip() in _ffmpeg_available_encoders(ffmpeg_bin)
-
-
-def _select_ffmpeg_bin(preferred=None):
-    # rtdetr conda ffmpeg 常缺 NVENC；若系統 ffmpeg 有 h264_nvenc，auto 改用系統版。
-    preferred = str(preferred).strip() if preferred else None
-    if preferred:
-        return preferred
-
-    env_bin = os.environ.get("FFMPEG_BIN")
-    if env_bin:
-        return env_bin
-
-    default_bin = "ffmpeg"
-    system_bin = "/usr/bin/ffmpeg"
-    if _ffmpeg_encoder_available("h264_nvenc", default_bin):
-        return default_bin
-    if Path(system_bin).exists() and _ffmpeg_encoder_available("h264_nvenc", system_bin):
-        print(f"FFmpeg auto-selected {system_bin} for NVENC support.")
-        return system_bin
-    return default_bin
-
-
-def _resolve_video_encoder(preferred="auto", frame_width=None, frame_height=None, ffmpeg_bin=None):
-    # auto 優先用 NVENC，若 ffmpeg 沒有或使用者指定其他值，就回退到 libx264。
-    preferred_name = str(preferred or 'auto').strip().lower()
-
-    width = int(frame_width or 0)
-    height = int(frame_height or 0)
-    nvenc_supported = min(width, height) >= 128 if width > 0 and height > 0 else True
-
-    if preferred_name in ('h264_nvenc', 'hevc_nvenc', 'libx264'):
-        if preferred_name in ('h264_nvenc', 'hevc_nvenc') and not nvenc_supported:
-            print(
-                f"Warning: Frame size {width}x{height} is too small for NVENC; fallback to libx264."
-            )
-            return 'libx264'
-        if _ffmpeg_encoder_available(preferred_name, ffmpeg_bin):
-            return preferred_name
-        print(f"Warning: FFmpeg encoder {preferred_name} unavailable; fallback to libx264.")
-        return 'libx264'
-
-    if preferred_name not in ('', 'auto'):
-        print(f"Warning: Unsupported video encoder {preferred_name}; fallback to auto selection.")
-
-    for candidate in ('h264_nvenc', 'hevc_nvenc', 'libx264'):
-        if candidate in ('h264_nvenc', 'hevc_nvenc') and not nvenc_supported:
-            continue
-        if _ffmpeg_encoder_available(candidate, ffmpeg_bin):
-            return candidate
-
-    print("Warning: No preferred FFmpeg encoder found; fallback to libx264.")
-    return 'libx264'
-
-
-def _nvenc_preset_from_generic(preset_name):
-    # 將原本 x264-style preset 名稱映射成 NVENC 可接受的 p1~p7。
-    preset = str(preset_name or '').strip().lower()
-    if preset in ('p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7'):
-        return preset
-    preset_map = {
-        'ultrafast': 'p1',
-        'superfast': 'p1',
-        'veryfast': 'p1',
-        'faster': 'p2',
-        'fast': 'p2',
-        'medium': 'p4',
-        'slow': 'p5',
-        'slower': 'p6',
-        'veryslow': 'p7',
-    }
-    return preset_map.get(preset, 'p1')
-
-
-def _build_ffmpeg_video_encoder_args(encoder_name, preset="fast", crf=23):
-    # 依 encoder 類型組出參數；只改輸出編碼，不動前面偵測與渲染流程。
-    quality = max(0, min(int(crf), 51))
-    if encoder_name in ('h264_nvenc', 'hevc_nvenc'):
-        return [
-            '-vcodec', encoder_name,
-            '-preset', _nvenc_preset_from_generic(preset),
-            '-rc', 'vbr',
-            '-cq', str(quality),
-            '-b:v', '0',
-        ]
-
-    return [
-        '-vcodec', 'libx264',
-        '-preset', str(preset),
-        '-crf', str(quality),
-    ]
-
-
-class AsyncFFmpegVideoWriter:
-    # 背景 FFmpeg writer：主執行緒只排隊 frame，編碼與 muxing 由背景 thread 處理。
-    def __init__(self, output_path, width, height, fps, profiler=None,
-                 queue_size=16, preset="fast", crf=23, encoder="auto", ffmpeg_bin=None):
-        self.output_path = str(output_path)
-        self.width = int(width)
-        self.height = int(height)
-        self.fps = float(fps)
-        self.profiler = profiler
-        self.ffmpeg_bin = str(ffmpeg_bin or _FFMPEG_BIN)
-        self._queue = queue.Queue(maxsize=max(int(queue_size or 1), 1))
-        self._stop_token = object()
-        self._error = None
-        self._closed = False
-        self._process = None
-        self.encoder_name = _resolve_video_encoder(
-            encoder,
-            frame_width=self.width,
-            frame_height=self.height,
-            ffmpeg_bin=self.ffmpeg_bin,
-        )
-        encoder_args = _build_ffmpeg_video_encoder_args(self.encoder_name, preset=preset, crf=crf)
-
-        print(f"FFmpeg binary: {self.ffmpeg_bin}")
-        print(f"FFmpeg video encoder selected: {self.encoder_name}")
-
-        ffmpeg_cmd = [
-            self.ffmpeg_bin, '-y',
-            '-f', 'rawvideo',
-            '-vcodec', 'rawvideo',
-            '-pix_fmt', 'bgr24',
-            '-s', f'{self.width}x{self.height}',
-            '-r', str(self.fps),
-            '-i', '-',
-            '-an',
-            *encoder_args,
-            '-pix_fmt', 'yuv420p',
-            '-movflags', '+faststart',
-            self.output_path,
-        ]
-
-        with profiler.time_block("video.open_ffmpeg_writer"):
-            self._process = subprocess.Popen(
-                ffmpeg_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-
-        self._thread = threading.Thread(target=self._worker, name="ffmpeg-writer", daemon=True)
-        self._thread.start()
-
-    def write(self, frame):
-        if self._closed:
-            raise RuntimeError("FFmpeg writer is already closed.")
-        if self._error is not None:
-            raise RuntimeError("FFmpeg writer failed.") from self._error
-        if frame.shape[1] != self.width or frame.shape[0] != self.height:
-            raise ValueError(f"Frame size mismatch: got {frame.shape[1]}x{frame.shape[0]}, expected {self.width}x{self.height}")
-
-        # 確保傳給 FFmpeg 的資料是連續 BGR buffer，避免 stdin.write 時產生格式問題。
-        if not frame.flags.c_contiguous:
-            frame = np.ascontiguousarray(frame)
-        with self.profiler.time_block("frame.queue_output_frame"):
-            self._queue.put(frame)
-
-    def close(self):
-        if self._closed:
-            return
-        self._closed = True
-        self._queue.put(self._stop_token)
-        with self.profiler.time_block("encode.ffmpeg_pipe_close"):
-            self._thread.join()
-            if self._process.stdin is not None:
-                self._process.stdin.close()
-            return_code = self._process.wait()
-        if self._error is not None:
-            raise RuntimeError("FFmpeg writer failed.") from self._error
-        if return_code != 0:
-            raise RuntimeError(f"FFmpeg exited with code {return_code}")
-
-    def _worker(self):
-        try:
-            while True:
-                frame = self._queue.get()
-                try:
-                    if frame is self._stop_token:
-                        break
-                    with self.profiler.time_block("frame.ffmpeg_stdin_write"):
-                        self._process.stdin.write(memoryview(frame))
-                finally:
-                    self._queue.task_done()
-        except Exception as exc:
-            self._error = exc
-        finally:
-            try:
-                if self._process.stdin is not None:
-                    self._process.stdin.flush()
-            except Exception as exc:
-                if self._error is None:
-                    self._error = exc
-
-
-class MotionMaskBuilder:
-    # 前景 mask 建立器：預設用 temporal diff 加速；必要時可切回原 MOG2。
-    def __init__(self, mode="temporal", scale_factor=DEFAULT_FG_MASK_SCALE,
-                 diff_threshold=DEFAULT_MOTION_DIFF_THRESHOLD,
-                 dilate_iterations=DEFAULT_MOTION_DILATE_ITERATIONS,
-                 blur_kernel_size=DEFAULT_MOTION_BLUR_KERNEL,
-                 open_kernel_size=DEFAULT_MOTION_OPEN_KERNEL,
-                 open_iterations=DEFAULT_MOTION_OPEN_ITERATIONS,
-                 close_kernel_size=DEFAULT_MOTION_CLOSE_KERNEL,
-                 close_iterations=DEFAULT_MOTION_CLOSE_ITERATIONS,
-                 mog2_history=300, mog2_var_threshold=25, mog2_detect_shadows=True):
-        self.mode = str(mode or "temporal").lower()
-        self.scale_factor = float(scale_factor or 1.0)
-        self.diff_threshold = int(diff_threshold)
-        self.dilate_iterations = max(int(dilate_iterations or 0), 0)
-        self.blur_kernel_size = _odd_kernel_size(blur_kernel_size)
-        self.open_iterations = max(int(open_iterations or 0), 0)
-        self.close_iterations = max(int(close_iterations or 0), 0)
-        self.prev_gray = None
-        self.temporal_kernel = np.ones((3, 3), dtype=np.uint8) if self.dilate_iterations > 0 else None
-        open_kernel_size = _odd_kernel_size(open_kernel_size)
-        close_kernel_size = _odd_kernel_size(close_kernel_size)
-        self.open_kernel = (
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_kernel_size, open_kernel_size))
-            if self.open_iterations > 0 and open_kernel_size > 0
-            else None
-        )
-        self.close_kernel = (
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel_size, close_kernel_size))
-            if self.close_iterations > 0 and close_kernel_size > 0
-            else None
-        )
-        self.back_sub = None
-
-        if self.mode == "mog2":
-            self.back_sub = cv2.createBackgroundSubtractorMOG2(
-                history=int(mog2_history),
-                varThreshold=float(mog2_var_threshold),
-                detectShadows=bool(mog2_detect_shadows),
-            )
-        elif self.mode != "temporal":
-            raise ValueError(f"Unsupported motion mask mode: {mode}")
-
-    def build(self, frame, profiler):
-        if self.mode == "mog2":
-            return self._build_mog2(frame, profiler)
-        return self._build_temporal(frame, profiler)
-
-    def _scaled_frame(self, frame, profiler):
-        if self.scale_factor == 1.0:
-            return frame
-        with profiler.time_block("frame.motion_resize"):
-            return cv2.resize(frame, (0, 0), fx=self.scale_factor, fy=self.scale_factor)
-
-    def _build_mog2(self, frame, profiler):
-        # 原始 MOG2 路徑：保留給需要逐像素背景模型時回退使用。
-        mask_frame = self._scaled_frame(frame, profiler)
-        with profiler.time_block("frame.foreground_mog2_apply"):
-            fg_mask = self.back_sub.apply(mask_frame, learningRate=0.005)
-        with profiler.time_block("frame.foreground_threshold"):
-            _, fg_mask = cv2.threshold(fg_mask, 254, 255, cv2.THRESH_BINARY)
-        fg_mask = self._cleanup_mask(fg_mask, profiler)
-        return fg_mask
-
-    def _build_temporal(self, frame, profiler):
-        # 快速路徑：只比較相鄰幀灰階差異，符合目前「litter 是否正在移動」用途。
-        mask_frame = self._scaled_frame(frame, profiler)
-        with profiler.time_block("frame.motion_gray"):
-            gray = cv2.cvtColor(mask_frame, cv2.COLOR_BGR2GRAY)
-        if self.blur_kernel_size > 0:
-            with profiler.time_block("frame.motion_blur"):
-                gray = cv2.GaussianBlur(gray, (self.blur_kernel_size, self.blur_kernel_size), 0)
-
-        if self.prev_gray is None or self.prev_gray.shape != gray.shape:
-            self.prev_gray = gray
-            return np.full(gray.shape, 255, dtype=np.uint8)
-
-        with profiler.time_block("frame.motion_absdiff"):
-            diff = cv2.absdiff(gray, self.prev_gray)
-        self.prev_gray = gray
-
-        with profiler.time_block("frame.motion_threshold"):
-            _, motion_mask = cv2.threshold(diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
-        motion_mask = self._cleanup_mask(motion_mask, profiler)
-        if self.temporal_kernel is not None:
-            with profiler.time_block("frame.motion_dilate"):
-                motion_mask = cv2.dilate(motion_mask, self.temporal_kernel, iterations=self.dilate_iterations)
-        return motion_mask
-
-    def _cleanup_mask(self, motion_mask, profiler):
-        # 先 opening 去掉孤立亮點，再視需要 closing 補小洞；典型監視器噪聲濾波。
-        if self.open_kernel is not None:
-            with profiler.time_block("frame.motion_open"):
-                motion_mask = cv2.morphologyEx(
-                    motion_mask,
-                    cv2.MORPH_OPEN,
-                    self.open_kernel,
-                    iterations=self.open_iterations,
-                )
-        if self.close_kernel is not None:
-            with profiler.time_block("frame.motion_close"):
-                motion_mask = cv2.morphologyEx(
-                    motion_mask,
-                    cv2.MORPH_CLOSE,
-                    self.close_kernel,
-                    iterations=self.close_iterations,
-                )
-        return motion_mask
-
-
-class AsyncVideoFrameReader:
-    # 背景讀取/解碼/前景 mask thread：主流程跑推理時，下一批 frame 已先準備好。
-    def __init__(self, cap, motion_masker, profiler, queue_size=DEFAULT_READER_QUEUE_SIZE):
-        self.cap = cap
-        self.motion_masker = motion_masker
-        self.profiler = profiler
-        self._queue = queue.Queue(maxsize=max(int(queue_size or 1), 1))
-        self._stop_event = threading.Event()
-        self._sentinel = object()
-        self._error = None
-        self._done = False
-        self._thread = threading.Thread(target=self._worker, name="video-reader", daemon=True)
-        self._thread.start()
-
-    def read_batch(self, batch_size):
-        if self._done:
-            if self._error is not None:
-                raise RuntimeError("Async video reader failed.") from self._error
-            return [], []
-
-        frames = []
-        fg_masks = []
-        target = max(int(batch_size or 1), 1)
-        while len(frames) < target:
-            with self.profiler.time_block("frame.reader_dequeue"):
-                item = self._queue.get()
-            try:
-                if item is self._sentinel:
-                    self._done = True
-                    break
-                frame, fg_mask = item
-                frames.append(frame)
-                fg_masks.append(fg_mask)
-            finally:
-                self._queue.task_done()
-
-        if self._done and self._error is not None and not frames:
-            raise RuntimeError("Async video reader failed.") from self._error
-        return frames, fg_masks
-
-    def close(self):
-        self._stop_event.set()
-        self._thread.join(timeout=2.0)
-
-    def _put(self, item):
-        while not self._stop_event.is_set():
-            try:
-                self._queue.put(item, timeout=0.1)
-                return True
-            except queue.Full:
-                continue
-        return False
-
-    def _worker(self):
-        try:
-            while not self._stop_event.is_set():
-                with self.profiler.time_block("frame.read"):
-                    ret, frame = self.cap.read()
-                if not ret:
-                    break
-
-                with self.profiler.time_block("frame.foreground_mask"):
-                    fg_mask = self.motion_masker.build(frame, self.profiler)
-                if not self._put((frame, fg_mask)):
-                    break
-        except Exception as exc:
-            self._error = exc
-        finally:
-            try:
-                self.cap.release()
-            finally:
-                self._put(self._sentinel)
-
-
-def _batched_dummy_frame(batch_size, imgsz=640, channels=3):
-    # warmup 使用假 frame；batch 模式需傳入 list，才能讓 backend 建立正確 batch shape。
-    dummy_frame = np.zeros((int(imgsz), int(imgsz), int(channels)), dtype=np.uint8)
-    if int(batch_size) <= 1:
-        return dummy_frame
-    return [dummy_frame.copy() for _ in range(int(batch_size))]
-
-
-def _read_engine_input_shape(engine_path):
-    # 讀取 engine input binding shape，回傳 (batch, channels, h, w) 或 None。
-    # 優先從 ultralytics metadata prefix JSON 讀取（快速，不需要起 TRT Runtime）；
-    # 舊格式 engine 沒有 prefix 時才退回 TRT Runtime 讀取 binding shape。
-    #
-    # ultralytics metadata prefix 格式：
-    #   [4-byte little-endian signed length][UTF-8 JSON][raw TRT serialized bytes]
-    path = Path(engine_path)
-    if path.suffix != ".engine":
-        return None
-    try:
-        import json as _json
-        with open(str(path), "rb") as f:
-            raw = f.read()
-
-        # ── 嘗試讀取 metadata prefix ──────────────────────────────────────────
-        meta_len = int.from_bytes(raw[:4], byteorder="little", signed=True)
-        if 0 < meta_len < 65536:
-            try:
-                meta = _json.loads(raw[4:4 + meta_len].decode("utf-8"))
-                imgsz_raw = meta.get("imgsz")
-                channels = int(meta.get("channels", 3))
-                batch = int(meta.get("batch", 1))
-                if imgsz_raw is not None:
-                    if isinstance(imgsz_raw, (list, tuple)) and len(imgsz_raw) >= 2:
-                        h, w = int(imgsz_raw[0]), int(imgsz_raw[1])
-                    else:
-                        h = w = int(imgsz_raw)
-                    shape = (batch, channels, h, w)
-                    print(f"Engine input shape from metadata: {shape}")
-                    return shape
-            except Exception:
-                pass
-            # metadata prefix 存在但 imgsz 缺失 → 跳過 prefix，用 TRT 讀 binding
-            trt_bytes = raw[4 + meta_len:]
-        else:
-            # 沒有 metadata prefix（舊格式 engine）→ 直接 TRT 解析
-            trt_bytes = raw
-
-        # ── TRT Runtime fallback ───────────────────────────────────────────────
-        import tensorrt as trt  # noqa: F401 – optional import
-        trt_logger = trt.Logger(trt.Logger.ERROR)
-        runtime = trt.Runtime(trt_logger)
-        engine = runtime.deserialize_cuda_engine(trt_bytes)
-        if engine is None:
-            return None
-        if hasattr(engine, "num_io_tensors"):  # TRT 10+
-            name = engine.get_tensor_name(0)
-            shape = tuple(engine.get_tensor_shape(name))
-        else:
-            shape = tuple(engine.get_binding_shape(0))
-        print(f"Engine input shape from TRT: {shape}")
-        return shape  # (batch, ch, h, w)
-    except Exception as exc:
-        print(f"Warning: could not read engine input shape from {path}: {exc}")
-        return None
-
-
-def _apply_engine_overrides(model, model_path):
-    # engine 載入後，用 TRT binding shape 補回 imgsz override，讓後續 predict() 前處理正確。
-    shape = _read_engine_input_shape(model_path)
-    if shape is None or len(shape) != 4:
-        return
-    _, ch, h, w = shape
-    imgsz = max(h, w)
-    model.overrides["imgsz"] = imgsz
-    print(f"Applied engine overrides: imgsz={imgsz}, input_channels={ch}")
-
-
-def _get_model_input_channels(model) -> int:
-    """讀取模型的 input channel 數，優先從 .pt checkpoint yaml 取，再試 AutoBackend backend。
-    4c 模型的 .pt 內 yaml["channels"] = 4；找不到時回傳 3（標準 3-channel 模型預設）。
-    """
-    # .pt 路徑：model.model 是 PyTorch YOLO/RTDETR 模型，yaml 存有 channels key
-    try:
-        ch = model.model.yaml.get("channels", None)
-        if ch is not None:
-            return int(ch)
-    except Exception:
-        pass
-    # engine 路徑：AutoBackend backend 的 channels 屬性（由 apply_metadata 設定）
-    try:
-        return int(model.predictor.model.backend.channels)
-    except Exception:
-        pass
-    return 3
-
-
-def _get_model_warmup_imgsz(model) -> int:
-    """讀取模型應使用的 warmup imgsz。
-    優先從 model.overrides（.pt checkpoint 有；engine 需 _apply_engine_overrides 設定過）讀取，
-    再試 model.backend.imgsz（engine metadata），最後回退到 640。
-    """
-    try:
-        raw = model.overrides.get("imgsz", None)
-        if raw is not None:
-            if isinstance(raw, (list, tuple)):
-                return max(int(v) for v in raw)
-            return int(raw)
-    except Exception:
-        pass
-    try:
-        raw = model.predictor.model.backend.imgsz
-        if isinstance(raw, (list, tuple)):
-            return max(int(v) for v in raw)
-        return int(raw)
-    except Exception:
-        pass
-    return 640
-
-
-import contextlib
-
-@contextlib.contextmanager
-def _engine_channel_patch(expected_channels):
-    # 暫時 patch BasePredictor.setup_model，在 AutoBackend 建立後立刻設 channels，
-    # 讓 ultralytics 內部 warmup 用正確的 channels 呼叫 engine。
-    # 只在 trash engine 載入期間有效，結束後還原。
-    try:
-        from ultralytics.engine.predictor import BasePredictor as _BP
-    except Exception:
-        yield
-        return
-
-    _original = _BP.setup_model
-
-    def _patched(self, model, verbose=True):
-        _original(self, model, verbose=verbose)
-        try:
-            if hasattr(self.model, "bindings") and "images" in self.model.bindings:
-                ch = int(self.model.bindings["images"].shape[1])
-                self.model.channels = ch
-                print(f"[engine_channel_patch] Set AutoBackend.channels={ch}")
-        except Exception as exc:
-            print(f"[engine_channel_patch] Warning: {exc}")
-
-    _BP.setup_model = _patched
-    try:
-        yield
-    finally:
-        _BP.setup_model = _original
-
 
 def _default_model_paths_for_batch(batch_size):
-    # 使用者未手動指定模型時，依 --batch 自動切換成對應權重。
+    # 使用者未手動指定模型時，依 batch 自動切換成對應權重。
     if int(batch_size) > 1:
         return MODEL_BBOX_PATH_BATCH, MODEL_TRASH_PATH_BATCH
     return MODEL_BBOX_PATH, MODEL_TRASH_PATH
 
 
-def _warmup_bbox_model(model, batch_size=1):
-    # YOLO actor model warmup：預先觸發 CUDA/TensorRT kernel 初始化。
-    dummy_source = _batched_dummy_frame(batch_size)
-    model.predict(
-        dummy_source,
-        conf=0.01,
-        device=BBOX_DEVICE,
-        half=BBOX_HALF,
-        verbose=False,
-    )
-
-
-def _warmup_trash_model(model, batch_size=1, imgsz=640, channels=3):
-    # RTDETR litter model warmup：確保垃圾模型在正式迴圈前已初始化。
-    # engine 傳入 imgsz/channels 才能產生符合 binding shape 的 dummy frame。
-    dummy_source = _batched_dummy_frame(batch_size, imgsz=imgsz, channels=channels)
-    model.predict(
-        dummy_source,
-        conf=0.01,
-        device=TRASH_DEVICE,
-        half=TRASH_HALF,
-        verbose=False,
-        imgsz=imgsz,
-    )
-
-
-def _read_frame_batch(cap, motion_masker, batch_size, profiler):
-    # 一次讀取 batch_size 幀，同步產生每幀的前景遮罩，供後續 motion filter 使用。
-    frames = []
-    fg_masks = []
-    for _ in range(int(batch_size)):
-        with profiler.time_block("frame.read"):
-            ret, frame = cap.read()
-        if not ret:
-            break
-
-        with profiler.time_block("frame.foreground_mask"):
-            fg_mask = motion_masker.build(frame, profiler)
-
-        frames.append(frame)
-        fg_masks.append(fg_mask)
-
-    return frames, fg_masks
-
-
 if __name__ == "__main__":
-    # CLI 參數：控制模型、batch 模式、STGCN、車牌辨識與偵測信心門檻。
     parser = argparse.ArgumentParser()
     parser.add_argument("file", nargs="?", help="video path or file name in resources/", default="TThrow.mp4")
-    parser.add_argument("--output-root", default="output", help="root directory for annotated outputs")
-    parser.add_argument("--pose-model", default=POSE_MODEL_PATH, help="YOLO pose model path")
-    parser.add_argument("--stgcn-weight", default=STGCN_WEIGHT_PATH, help="STGCN++ checkpoint path")
-    parser.add_argument("--stgcn-config", default=STGCN_CONFIG_PATH, help="STGCN++ config path")
-    parser.add_argument("--action-threshold", type=float, default=0.5, help="raw STGCN urinate confidence threshold")
-    parser.add_argument("--action-window", type=int, default=30, help="STGCN sequence window size")
-    parser.add_argument("--urination-window-sec", type=float, default=10.0,
-                        help="lookback seconds for sustained urinate confirmation")
-    parser.add_argument("--urination-min-sec", type=float, default=8.0,
-                        help="required urinate seconds inside --urination-window-sec before alert")
-    parser.add_argument("--action-device", default=os.environ.get("ACTION_DEVICE"), help="ACTION_DEVICE override, e.g. cuda:0 or cpu")
-    parser.add_argument("--action-predict-interval", type=int, default=None, help="run STGCN every N frames after the sequence window is full")
-    parser.add_argument("--action-pose-imgsz", type=int, default=None, help="optional YOLO pose imgsz override")
-    parser.add_argument("--disable-action", action="store_true", help="Disable STGCN action recognition; enabled by default")
-    parser.add_argument("--yolo-seg-frame-skip", type=int, default=2, help="run YOLO-seg actor tracking every N frames")
-    parser.add_argument("--bbox-model", default=None, help="YOLO-seg actor model path")
-    parser.add_argument("--trash-model", default=None, help="RTDETR litter model path")
-    parser.add_argument("--no-engine", action="store_true", help="Use .pt weights even when a sibling .engine exists")
-    parser.add_argument("--batch", "--batch-size", dest="batch_size", type=int, default=8,
-                        choices=SUPPORTED_BATCH_SIZES,
-                        help="pipeline batch size; default 8 with fast detector path enabled")
-    parser.add_argument("--actor-batch", type=int, default=None, choices=SUPPORTED_BATCH_SIZES,
-                        help="YOLO actor TensorRT batch size; auto uses ceil(batch / yolo_seg_frame_skip)")
-    parser.add_argument("--actor-mode", choices=("track", "predict"), default="track",
-                        help="track preserves BoT-SORT ids; predict is faster and uses lightweight IoU ids")
-    parser.add_argument("--actor-track-iou", type=float, default=0.3,
-                        help="IoU threshold for actor ids when --actor-mode predict")
-    parser.add_argument("--extreme-speed-off", action="store_true",
-                        help="Disable default fast detector path and keep actor track plus RTDETR zero repair behavior")
-    parser.add_argument("--rtdetr-zero-repair", choices=("adjacent", "off", "all"), default="all",
-                        help="RTDETR batch mixed-zero repair: adjacent balances speed/recall, off is fastest, all keeps old behavior")
-    parser.add_argument("--bbox-conf", type=float, default=0.45, help="YOLO-seg actor confidence threshold")
-    parser.add_argument("--trash-conf", type=float, default=0.4, help="RTDETR litter confidence threshold")
-    parser.add_argument("--disable-plate", action="store_true", help="Disable license plate detection/OCR for faster litter-only processing")
-    parser.add_argument("--skip-plate-preload", action="store_true", help="Do not preload license plate detector/OCR models")
-    parser.add_argument("--fg-mask-scale", type=float, default=DEFAULT_FG_MASK_SCALE,
-                        help="motion mask scale; 0.5 keeps previous low-res mask behavior")
-    parser.add_argument("--motion-mask-mode", choices=("temporal", "mog2"), default="temporal",
-                        help="temporal uses fast frame differencing; mog2 uses the previous background subtractor")
-    parser.add_argument("--motion-diff-threshold", type=int, default=DEFAULT_MOTION_DIFF_THRESHOLD,
-                        help="pixel difference threshold for temporal motion mask")
-    parser.add_argument("--motion-dilate-iterations", type=int, default=DEFAULT_MOTION_DILATE_ITERATIONS,
-                        help="dilation iterations for temporal motion mask")
-    parser.add_argument("--motion-blur-kernel", type=int, default=DEFAULT_MOTION_BLUR_KERNEL,
-                        help="odd Gaussian blur kernel before frame differencing; <3 disables")
-    parser.add_argument("--motion-open-kernel", type=int, default=DEFAULT_MOTION_OPEN_KERNEL,
-                        help="odd morphology opening kernel for motion noise removal; <3 disables")
-    parser.add_argument("--motion-open-iterations", type=int, default=DEFAULT_MOTION_OPEN_ITERATIONS,
-                        help="morphology opening iterations for motion noise removal")
-    parser.add_argument("--motion-close-kernel", type=int, default=DEFAULT_MOTION_CLOSE_KERNEL,
-                        help="odd morphology closing kernel for motion mask hole filling; <3 disables")
-    parser.add_argument("--motion-close-iterations", type=int, default=DEFAULT_MOTION_CLOSE_ITERATIONS,
-                        help="morphology closing iterations for motion mask")
-    parser.add_argument("--motion-min-component-area", type=int, default=DEFAULT_MOTION_MIN_COMPONENT_AREA,
-                        help="minimum connected motion component area inside litter bbox")
-    parser.add_argument("--motion-min-largest-component-ratio", type=float,
-                        default=DEFAULT_MOTION_MIN_LARGEST_COMPONENT_RATIO,
-                        help="minimum largest-component / motion-pixels ratio inside litter bbox")
-    parser.add_argument("--mog2-no-shadows", action="store_true",
-                        help="disable MOG2 shadow detection when --motion-mask-mode mog2")
-    parser.add_argument("--video-hw-accel", default="any",
-                        choices=("any", "none", "vaapi", "mfx", "qsv", "d3d11"),
-                        help="OpenCV FFmpeg hardware decode hint; falls back to software if unsupported")
-    parser.add_argument("--video-hw-device", type=int, default=None,
-                        help="hardware decode device index when backend supports CAP_PROP_HW_DEVICE")
-    parser.add_argument("--video-read-threads", type=int, default=0,
-                        help="FFmpeg decode thread hint when backend supports CAP_PROP_N_THREADS; 0 keeps backend default")
-    parser.add_argument("--capture-buffer-size", type=int, default=DEFAULT_CAPTURE_BUFFER_SIZE,
-                        help="VideoCapture buffer hint")
-    parser.add_argument("--disable-async-reader", action="store_true",
-                        help="read/decode frames synchronously instead of using background prefetch")
-    parser.add_argument("--reader-queue-size", type=int, default=DEFAULT_READER_QUEUE_SIZE,
-                        help="background decoded-frame queue size")
-    parser.add_argument("--writer-queue-size", type=int, default=16,
-                        help="number of annotated frames buffered before FFmpeg writer blocks")
-    parser.add_argument("--max-frames", type=int, default=None,
-                        help="process only the first N frames for quick benchmark/debug runs")
-    parser.add_argument("--ffmpeg-bin", default=None,
-                        help="ffmpeg binary path; auto uses /usr/bin/ffmpeg when it has NVENC and conda ffmpeg does not")
-    parser.add_argument("--video-encoder", default="auto",
-                        choices=("auto", "h264_nvenc", "hevc_nvenc", "libx264"),
-                        help="FFmpeg video encoder for annotated output")
-    parser.add_argument("--summary-json", default=None,
-                        help="write machine-readable per-video summary JSON to this path")
-    parser.add_argument("--debug-tracker", action="store_true",
-                        help="Enable per-frame confirmation debug output from GlobalLitterTracker")
     args = parser.parse_args()
-    if args.urination_min_sec > args.urination_window_sec:
-        parser.error("--urination-min-sec cannot be greater than --urination-window-sec")
-    if not args.extreme_speed_off:
-        args.actor_mode = "predict"
-        args.rtdetr_zero_repair = "off"
-    _set_ffmpeg_bin(_select_ffmpeg_bin(args.ffmpeg_bin))
+    _set_ffmpeg_bin(_select_ffmpeg_bin(None))
 
     # 資源句柄與計數器集中管理，finally 可安全釋放攝影機與輸出檔。
     profiler = PipelineProfiler(enabled=True)
@@ -1013,70 +93,63 @@ if __name__ == "__main__":
 
     try:
         with profiler.time_block("pipeline.total_wall"):
-            # 將 action 相關 CLI 覆寫同步到環境變數，供 action.py 內部讀取。
-            _set_env_if_present("ACTION_DEVICE", args.action_device)
-            _set_env_if_present("ACTION_PREDICT_INTERVAL", args.action_predict_interval)
-            _set_env_if_present("ACTION_POSE_IMGSZ", args.action_pose_imgsz)
+            # 固定參數：batch=8，vehicle gate 永遠開啟（VEHICLE_GATE 預設 "1"），
+            # 快速偵測路徑（actor_mode=predict, rtdetr_zero_repair=off）永遠啟用。
+            _BATCH_SIZE = 8
+            _YOLO_SEG_FRAME_SKIP = 2
+            _ACTOR_MODE = "predict"
+            _RTDETR_ZERO_REPAIR = "off"
+            _RTDETR_ENABLED = os.environ.get("RTDETR_ENABLED", "1") != "0"
 
-            prefer_engine = not args.no_engine
-            # 若使用者未指定 --bbox-model/--trash-model，依 batch size 自動選擇預設權重。
-            default_bbox_model_path, default_trash_model_path = _default_model_paths_for_batch(args.batch_size)
-            bbox_model_path_arg = args.bbox_model or default_bbox_model_path
-            trash_model_path_arg = args.trash_model or default_trash_model_path
-            desired_actor_batch_size = args.actor_batch or _estimate_actor_batch_size(
-                args.batch_size,
-                args.yolo_seg_frame_skip,
-            )
+            prefer_engine = True
+            default_bbox_model_path, default_trash_model_path = _default_model_paths_for_batch(_BATCH_SIZE)
+            desired_actor_batch_size = _estimate_actor_batch_size(_BATCH_SIZE, _YOLO_SEG_FRAME_SKIP)
             bbox_candidate_batches = [desired_actor_batch_size]
-            if args.actor_mode == "predict":
-                for candidate_batch in sorted(SUPPORTED_BATCH_SIZES, reverse=True):
-                    if (
-                        candidate_batch < desired_actor_batch_size and
-                        desired_actor_batch_size % candidate_batch == 0
-                    ):
-                        bbox_candidate_batches.append(candidate_batch)
-            if args.batch_size not in bbox_candidate_batches:
-                bbox_candidate_batches.append(args.batch_size)
+            for candidate_batch in sorted(SUPPORTED_BATCH_SIZES, reverse=True):
+                if (
+                    candidate_batch < desired_actor_batch_size and
+                    desired_actor_batch_size % candidate_batch == 0
+                ):
+                    bbox_candidate_batches.append(candidate_batch)
+            if _BATCH_SIZE not in bbox_candidate_batches:
+                bbox_candidate_batches.append(_BATCH_SIZE)
             bbox_model_candidates = _model_path_candidates_for_batches(
-                bbox_model_path_arg,
+                default_bbox_model_path,
                 prefer_engine,
                 bbox_candidate_batches,
             )
-            trash_model_candidates = _model_path_candidates(trash_model_path_arg, prefer_engine, args.batch_size)
-            pose_model_candidates = _model_path_candidates(args.pose_model, prefer_engine, 1)
+            trash_model_candidates = _model_path_candidates(default_trash_model_path, prefer_engine, _BATCH_SIZE)
+            pose_model_candidates = _model_path_candidates(POSE_MODEL_PATH, prefer_engine, 1)
 
             print("Preloading all configured models before video processing...")
-            print(f"Pipeline batch size: {args.batch_size}")
-            print(f"Actor mode: {args.actor_mode}")
+            print(f"Pipeline batch size: {_BATCH_SIZE}")
+            print(f"Actor mode: {_ACTOR_MODE}")
             print(f"Actor target batch size: {desired_actor_batch_size}")
-            print(f"Default BBOX model for batch {args.batch_size}: {default_bbox_model_path}")
-            print(f"Default Trash model for batch {args.batch_size}: {default_trash_model_path}")
+            print(f"Default BBOX model for batch {_BATCH_SIZE}: {default_bbox_model_path}")
+            print(f"Default Trash model for batch {_BATCH_SIZE}: {default_trash_model_path}")
             print(f"BBOX candidates: {bbox_model_candidates}")
             print(f"Trash candidates: {trash_model_candidates}")
             print(f"Pose candidates: {pose_model_candidates}")
-            print(f"RTDETR batch zero repair: {args.rtdetr_zero_repair}")
-            if not args.extreme_speed_off:
-                print("Extreme speed: detector fast path enabled; STGCN/OCR keep their normal enable flags.")
-            action_module = None
-            if not args.disable_action:
-                # STGCN 先載入 pose model 與 skeleton classifier，後續只在偵測到 person 時更新。
-                print(f"Pose model candidates: {pose_model_candidates}")
-                print(f"STGCN weight: {args.stgcn_weight}")
-                with profiler.time_block("model_load.action_module_total"):
-                    action_module = STGCNActionModule(
-                        pose_model_path=pose_model_candidates,
-                        stgcn_weight_path=args.stgcn_weight,
-                        stgcn_config_path=args.stgcn_config,
-                        action_threshold=args.action_threshold,
-                        window_size=args.action_window,
-                        urination_window_sec=args.urination_window_sec,
-                        urination_min_sec=args.urination_min_sec,
-                        device=args.action_device,
-                        profiler=profiler,
-                    )
-                action_module.warmup(profiler=profiler)
-            else:
-                print("STGCN action module skipped by --disable-action.")
+            print(f"RTDETR batch zero repair: {_RTDETR_ZERO_REPAIR}")
+            print("Extreme speed: detector fast path enabled; STGCN/OCR keep their normal enable flags.")
+            # STGCN 先載入 pose model 與 skeleton classifier，後續只在偵測到 person 時更新。
+            print(f"Pose model candidates: {pose_model_candidates}")
+            print(f"STGCN weight: {STGCN_WEIGHT_PATH}")
+            with profiler.time_block("model_load.action_module_total"):
+                action_module = STGCNActionModule(
+                    pose_model_path=pose_model_candidates,
+                    stgcn_weight_path=STGCN_WEIGHT_PATH,
+                    stgcn_config_path=STGCN_CONFIG_PATH,
+                    action_threshold=0.5,
+                    urinate_conf_high=None,
+                    urinate_conf_low=None,
+                    window_size=100,
+                    urination_window_sec=8.0,
+                    urination_min_sec=5.0,
+                    device=os.environ.get("ACTION_DEVICE"),
+                    profiler=profiler,
+                )
+            action_module.warmup(profiler=profiler)
 
             # 主要兩個偵測模型：actor 使用 YOLO-seg，垃圾使用 RTDETR。
             model_bbox, bbox_model_path = _load_model_with_warmup(
@@ -1093,77 +166,72 @@ if __name__ == "__main__":
                 bbox_model_path,
                 desired_actor_batch_size,
             )
-            # engine 載入前先讀 input shape，取得正確的 imgsz 和 channels 供 warmup 使用。
-            # 用 TRT Runtime 讀取，不需要呼叫 predict()。
-            _trash_engine_shape = _read_engine_input_shape(trash_model_candidates[0]) if trash_model_candidates else None
-            _trash_warmup_imgsz = int(_trash_engine_shape[2]) if _trash_engine_shape else 640
-            _trash_warmup_channels = int(_trash_engine_shape[1]) if _trash_engine_shape else 3
+            if _RTDETR_ENABLED:
+                # engine 載入前先讀 input shape，取得正確的 imgsz 和 channels 供 warmup 使用。
+                # 用 TRT Runtime 讀取，不需要呼叫 predict()。
+                _trash_engine_shape = _read_engine_input_shape(trash_model_candidates[0]) if trash_model_candidates else None
+                _trash_warmup_imgsz = int(_trash_engine_shape[2]) if _trash_engine_shape else 640
+                _trash_warmup_channels = int(_trash_engine_shape[1]) if _trash_engine_shape else 3
 
-            def _trash_warmup(model, model_path):
-                # 依實際 engine binding shape 建 dummy frame。
-                # _read_engine_input_shape 先從 metadata JSON 讀取（快速），
-                # 找不到才退回 TRT Runtime 解析；.pt 路徑從 model yaml 讀 channels/imgsz。
-                engine_shape = _read_engine_input_shape(model_path)
-                if engine_shape is not None:
-                    _apply_engine_overrides(model, model_path)
-                    imgsz = int(engine_shape[2])
-                    channels = int(engine_shape[1])
-                else:
-                    # .pt 或無法讀取 shape 的 engine：從模型本身讀取 channels / imgsz
-                    channels = _get_model_input_channels(model)
-                    imgsz = _get_model_warmup_imgsz(model)
-                    if imgsz != 640:
-                        model.overrides["imgsz"] = imgsz
-                    print(f"[trash_warmup] fallback: imgsz={imgsz}, channels={channels}")
-                _warmup_trash_model(
-                    model,
-                    _engine_batch_size_from_path(model_path, args.batch_size),
-                    imgsz=imgsz,
-                    channels=channels,
+                def _trash_warmup(model, model_path):
+                    engine_shape = _read_engine_input_shape(model_path)
+                    if engine_shape is not None:
+                        _apply_engine_overrides(model, model_path)
+                        imgsz = int(engine_shape[2])
+                        channels = int(engine_shape[1])
+                    else:
+                        channels = _get_model_input_channels(model)
+                        imgsz = _get_model_warmup_imgsz(model)
+                        if imgsz != 640:
+                            model.overrides["imgsz"] = imgsz
+                        print(f"[trash_warmup] fallback: imgsz={imgsz}, channels={channels}")
+                    _warmup_trash_model(
+                        model,
+                        _engine_batch_size_from_path(model_path, _BATCH_SIZE),
+                        imgsz=imgsz,
+                        channels=channels,
+                    )
+
+                model_trash, trash_model_path = _load_model_with_warmup(
+                    "trash_rtdetr",
+                    trash_model_candidates,
+                    RTDETR,
+                    _trash_warmup,
+                    profiler,
                 )
-
-            model_trash, trash_model_path = _load_model_with_warmup(
-                "trash_rtdetr",
-                trash_model_candidates,
-                RTDETR,
-                _trash_warmup,
-                profiler,
-            )
-            trash_runtime_batch_size = _engine_batch_size_from_path(
-                trash_model_path,
-                args.batch_size,
-            )
-            print(f"BBOX model selected: {bbox_model_path}")
-            print(f"Trash model selected: {trash_model_path}")
-            print(f"BBOX runtime batch size: {bbox_runtime_batch_size}")
-            print(f"Trash runtime batch size: {trash_runtime_batch_size}")
-            if args.disable_plate:
-                # 車牌 OCR 可停用，減少只測 litter pipeline 時的背景執行成本。
-                disable_license_plate_models()
-                print("License plate detector/OCR disabled by --disable-plate.")
-            elif not args.skip_plate_preload:
+                trash_runtime_batch_size = _engine_batch_size_from_path(
+                    trash_model_path,
+                    _BATCH_SIZE,
+                )
+                print(f"Trash model selected: {trash_model_path}")
+                print(f"Trash runtime batch size: {trash_runtime_batch_size}")
                 preload_license_plate_models(profiler=profiler)
             else:
-                print("License plate detector/OCR preload skipped by --skip-plate-preload.")
+                model_trash = None
+                trash_runtime_batch_size = _BATCH_SIZE
+                print("RTDETR disabled (RTDETR_ENABLED=0): skipping trash model and plate OCR.")
+            print(f"BBOX model selected: {bbox_model_path}")
+            print(f"BBOX runtime batch size: {bbox_runtime_batch_size}")
 
             with profiler.time_block("setup.motion_masker"):
                 # motion mask 只用於判定 litter bbox 是否有動態像素；confirmed 規則仍由 tracker 控制。
                 motion_masker = MotionMaskBuilder(
-                    mode=args.motion_mask_mode,
-                    scale_factor=args.fg_mask_scale,
-                    diff_threshold=args.motion_diff_threshold,
-                    dilate_iterations=args.motion_dilate_iterations,
-                    blur_kernel_size=args.motion_blur_kernel,
-                    open_kernel_size=args.motion_open_kernel,
-                    open_iterations=args.motion_open_iterations,
-                    close_kernel_size=args.motion_close_kernel,
-                    close_iterations=args.motion_close_iterations,
-                    mog2_detect_shadows=not args.mog2_no_shadows,
+                    mode="temporal",
+                    scale_factor=DEFAULT_FG_MASK_SCALE,
+                    diff_threshold=DEFAULT_MOTION_DIFF_THRESHOLD,
+                    dilate_iterations=DEFAULT_MOTION_DILATE_ITERATIONS,
+                    blur_kernel_size=DEFAULT_MOTION_BLUR_KERNEL,
+                    open_kernel_size=DEFAULT_MOTION_OPEN_KERNEL,
+                    open_iterations=DEFAULT_MOTION_OPEN_ITERATIONS,
+                    close_kernel_size=DEFAULT_MOTION_CLOSE_KERNEL,
+                    close_iterations=DEFAULT_MOTION_CLOSE_ITERATIONS,
+                    mog2_detect_shadows=True,
                 )
 
             # === 影片處理參數設定 ===
             video_path = _resolve_video_path(args.file)
-            output_dir = Path(args.output_root).expanduser()
+            # 預設輸出到 CWD；iterate-new.py 透過 subprocess cwd= 控制落點。
+            output_dir = Path(os.environ.get("OUTPUT_ROOT", ".")).expanduser()
             with profiler.time_block("setup.output_dir"):
                 output_dir.mkdir(parents=True, exist_ok=True)
             final_output = str(output_dir / f"{Path(video_path).stem}_annotated.mp4")
@@ -1172,10 +240,10 @@ if __name__ == "__main__":
                 # 讀取影片屬性；fps 無效時用 30 避免 writer 初始化失敗。
                 cap, capture_backend = _open_video_capture(
                     video_path,
-                    hw_accel=args.video_hw_accel,
-                    hw_device=args.video_hw_device,
-                    buffer_size=args.capture_buffer_size,
-                    read_threads=args.video_read_threads,
+                    hw_accel="any",
+                    hw_device=None,
+                    buffer_size=DEFAULT_CAPTURE_BUFFER_SIZE,
+                    read_threads=0,
                     profiler=profiler,
                 )
                 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -1189,9 +257,7 @@ if __name__ == "__main__":
                 raise RuntimeError(f"Invalid video size for {video_path}: {width}x{height}")
             print(
                 f"VideoCapture backend: {capture_backend}; "
-                f"hw_accel={args.video_hw_accel}; "
-                f"async_reader={not args.disable_async_reader}; "
-                f"reader_queue={args.reader_queue_size}"
+                f"hw_accel=any; async_reader=True; reader_queue={DEFAULT_READER_QUEUE_SIZE}"
             )
 
             with profiler.time_block("video.open_writer"):
@@ -1202,18 +268,15 @@ if __name__ == "__main__":
                     height,
                     fps,
                     profiler=profiler,
-                    queue_size=args.writer_queue_size,
+                    queue_size=16,
                     preset="fast",
                     crf=23,
-                    encoder=args.video_encoder,
-                    ffmpeg_bin=_FFMPEG_BIN,
+                    encoder="auto",
                 )
 
             # 垃圾反追蹤物件初始化
             with profiler.time_block("setup.litter_tracker"):
                 litter_tracker = GlobalLitterTracker(distance_threshold=250, fps=fps)
-                if getattr(args, 'debug_tracker', False):
-                    litter_tracker._debug = True
 
             # 紀錄車輛歷史軌跡
             vehicle_history = defaultdict(lambda: {
@@ -1253,110 +316,58 @@ if __name__ == "__main__":
             rtdetr_batch_context = {}
             frame_index = 0
             last_frame = None  # Track previous frame for 4-channel litter detection
-            if not args.disable_async_reader:
-                with profiler.time_block("video.start_async_reader"):
-                    frame_reader = AsyncVideoFrameReader(
-                        cap,
-                        motion_masker,
-                        profiler,
-                        queue_size=args.reader_queue_size,
-                    )
-                cap = None
+            with profiler.time_block("video.start_async_reader"):
+                frame_reader = AsyncVideoFrameReader(
+                    cap,
+                    motion_masker,
+                    profiler,
+                    queue_size=DEFAULT_READER_QUEUE_SIZE,
+                )
+            cap = None
 
-            # 影片主迴圈：batch 1 走 detect；batch N 走 detect_batch。
+            # 影片主迴圈：batch=8 走 detect_batch。
             with profiler.time_block("process.video_loop_total"):
-                progress_total = total_frames
-                if args.max_frames is not None and int(args.max_frames) > 0:
-                    progress_total = min(total_frames, int(args.max_frames)) if total_frames > 0 else int(args.max_frames)
-                with tqdm(total = progress_total, desc = "Processing Video... ", unit="frame") as pbar:
+                with tqdm(total=total_frames, desc="Processing Video... ", unit="frame") as pbar:
                     while True:
-                        if args.max_frames is not None and processed_frames >= int(args.max_frames):
-                            break
-                        if frame_reader is not None:
-                            frames, fg_masks = frame_reader.read_batch(args.batch_size)
-                        else:
-                            frames, fg_masks = _read_frame_batch(
-                                cap,
-                                motion_masker,
-                                args.batch_size,
-                                profiler,
-                            )
+                        frames, fg_masks = frame_reader.read_batch(_BATCH_SIZE)
                         if not frames:
                             break
-                        if args.max_frames is not None:
-                            remaining_frames = int(args.max_frames) - processed_frames
-                            if remaining_frames <= 0:
-                                break
-                            if len(frames) > remaining_frames:
-                                frames = frames[:remaining_frames]
-                                fg_masks = fg_masks[:remaining_frames]
 
                         with profiler.time_block("detect.total"):
-                            if args.batch_size > 1:
-                                # Create prev_frames list: first frame's prev is last_frame from previous batch
-                                prev_frames = [last_frame] + frames[:-1]
-                                annotated_frames = detect_batch(
-                                    frames, model_bbox, model_trash, COLORS,
-                                    fg_masks, litter_tracker, vehicle_history,
-                                    fps=fps,
-                                    violator_display_cache=violator_display_cache,
-                                    violator_display_ttl=60,
-                                    violator_display_max_jump=80.0,
-                                    action_module=action_module,
-                                    frame_start_index=frame_index,
-                                    yolo_seg_frame_skip=args.yolo_seg_frame_skip,
-                                    yolo_seg_cache=yolo_seg_cache,
-                                    bbox_conf=args.bbox_conf,
-                                    trash_conf=args.trash_conf,
-                                    profiler=profiler,
-                                    moving_threshold=0.25,
-                                    core_moving_threshold=0.3,
-                                    motion_min_component_area=args.motion_min_component_area,
-                                    motion_min_largest_component_ratio=args.motion_min_largest_component_ratio,
-                                    batch_size=args.batch_size,
-                                    bbox_batch_size=bbox_runtime_batch_size,
-                                    trash_batch_size=trash_runtime_batch_size,
-                                    fg_mask_scale=args.fg_mask_scale,
-                                    stats=detection_stats,
-                                    rtdetr_zero_repair=args.rtdetr_zero_repair,
-                                    rtdetr_batch_context=rtdetr_batch_context,
-                                    actor_mode=args.actor_mode,
-                                    actor_track_iou=args.actor_track_iou,
-                                    prev_frames=prev_frames,
-                                )
-                                # Update last_frame for next batch
-                                if frames:
-                                    last_frame = frames[-1]
-                            else:
-                                annotated_frames = [
-                                    detect(
-                                        frames[0], model_bbox, model_trash, COLORS,
-                                        fg_masks[0], litter_tracker, vehicle_history,
-                                        fps=fps,
-                                        violator_display_cache=violator_display_cache,
-                                        violator_display_ttl=60,
-                                        violator_display_max_jump=80.0,
-                                        action_module=action_module,
-                                        frame_index=frame_index,
-                                        yolo_seg_frame_skip=args.yolo_seg_frame_skip,
-                                        yolo_seg_cache=yolo_seg_cache,
-                                        bbox_conf=args.bbox_conf,
-                                        trash_conf=args.trash_conf,
-                                        profiler=profiler,
-                                        moving_threshold=0.25,
-                                        core_moving_threshold=0.3,
-                                        motion_min_component_area=args.motion_min_component_area,
-                                        motion_min_largest_component_ratio=args.motion_min_largest_component_ratio,
-                                        fg_mask_scale=args.fg_mask_scale,
-                                        stats=detection_stats,
-                                        actor_mode=args.actor_mode,
-                                        actor_track_iou=args.actor_track_iou,
-                                        prev_frame=last_frame,
-                                    )
-                                ]
-                                # Update last_frame for next iteration
-                                if frames:
-                                    last_frame = frames[0]
+                            # Create prev_frames list: first frame's prev is last_frame from previous batch
+                            prev_frames = [last_frame] + frames[:-1]
+                            annotated_frames = detect_batch(
+                                frames, model_bbox, model_trash, COLORS,
+                                fg_masks, litter_tracker, vehicle_history,
+                                fps=fps,
+                                violator_display_cache=violator_display_cache,
+                                violator_display_ttl=60,
+                                violator_display_max_jump=80.0,
+                                action_module=action_module,
+                                frame_start_index=frame_index,
+                                yolo_seg_frame_skip=_YOLO_SEG_FRAME_SKIP,
+                                yolo_seg_cache=yolo_seg_cache,
+                                bbox_conf=0.45,
+                                trash_conf=0.4,
+                                profiler=profiler,
+                                moving_threshold=0.25,
+                                core_moving_threshold=0.3,
+                                motion_min_component_area=DEFAULT_MOTION_MIN_COMPONENT_AREA,
+                                motion_min_largest_component_ratio=DEFAULT_MOTION_MIN_LARGEST_COMPONENT_RATIO,
+                                batch_size=_BATCH_SIZE,
+                                bbox_batch_size=bbox_runtime_batch_size,
+                                trash_batch_size=trash_runtime_batch_size,
+                                fg_mask_scale=DEFAULT_FG_MASK_SCALE,
+                                stats=detection_stats,
+                                rtdetr_zero_repair=_RTDETR_ZERO_REPAIR,
+                                rtdetr_batch_context=rtdetr_batch_context,
+                                actor_mode=_ACTOR_MODE,
+                                actor_track_iou=0.3,
+                                prev_frames=prev_frames,
+                            )
+                            # Update last_frame for next batch
+                            if frames:
+                                last_frame = frames[-1]
 
                         with profiler.time_block("frame.write_output"):
                             # detect_batch 可能回傳多幀；保持輸出順序與讀取順序一致。
@@ -1406,16 +417,17 @@ if __name__ == "__main__":
                 f"stgcn_urinate_blocked_on_vehicle={detection_stats.get('stgcn_urinate_blocked_on_vehicle', 0)}, "
                 f"stgcn_urinate_confirmed={stgcn_urinate_confirmed}, "
                 f"stgcn_alerts={detection_stats.get('stgcn_alerts', 0)}, "
-                f"stgcn_registered_violators={detection_stats.get('stgcn_registered_violators', 0)}"
+                f"stgcn_registered_violators={detection_stats.get('stgcn_registered_violators', 0)}, "
+                f"vehicle_gate_skipped_frames={detection_stats.get('vehicle_gate_skipped_frames', 0)}"
             )
             run_summary = {
                 "input_video": str(video_path),
                 "output_video": str(final_output),
                 "processed_frames": int(processed_frames),
                 "total_frames": int(total_frames),
-                "rtdetr_enabled": True,
-                "stgcn_pose_enabled": not bool(args.disable_action),
-                "plate_enabled": not bool(args.disable_plate),
+                "rtdetr_enabled": _RTDETR_ENABLED,
+                "stgcn_pose_enabled": True,
+                "plate_enabled": _RTDETR_ENABLED,
                 "raw_litter_candidates": int(detection_stats.get('raw_litter_candidates', 0)),
                 "filtered_litter_candidates": int(detection_stats.get('filtered_litter_candidates', 0)),
                 "confirmed_litter_ids": len(confirmed_litter_ids),
@@ -1441,6 +453,7 @@ if __name__ == "__main__":
                 "stgcn_urinate_confirmed": stgcn_urinate_confirmed,
                 "stgcn_alerts": int(detection_stats.get('stgcn_alerts', 0)),
                 "stgcn_registered_violators": int(detection_stats.get('stgcn_registered_violators', 0)),
+                "vehicle_gate_skipped_frames": int(detection_stats.get('vehicle_gate_skipped_frames', 0)),
                 "has_urinate": stgcn_urinate > 0 or stgcn_urinate_confirmed > 0,
                 "has_littering": False,
                 "has_confirm_litter": len(confirmed_litter_ids) > 0,
@@ -1449,13 +462,29 @@ if __name__ == "__main__":
                 "has_keypoints": int(detection_stats.get('stgcn_pose_matches', 0)) > 0,
                 "has_person": int(detection_stats.get('person_detections', 0)) > 0,
             }
-            if args.summary_json:
-                summary_path = Path(args.summary_json).expanduser()
-                summary_path.parent.mkdir(parents=True, exist_ok=True)
-                summary_path.write_text(
-                    json.dumps(run_summary, ensure_ascii=False, indent=2, sort_keys=True),
-                    encoding="utf-8",
-                )
+            # Offline Person↔Vehicle 關聯(PV_ASSOC=1):全片事件錨定 1對1 配對寫入 summary。
+            # 關閉時 finalize 回 None → run_summary 不變 → JSON byte-identical。
+            if litter_tracker is not None and hasattr(litter_tracker, "finalize_associations"):
+                pv_assoc = litter_tracker.finalize_associations()
+                if pv_assoc is not None:
+                    run_summary["person_vehicle_assoc"] = pv_assoc
+                    print(
+                        "Person-Vehicle association: "
+                        f"persons={pv_assoc['persons']}, "
+                        f"confirmed_vehicles={pv_assoc['confirmed_vehicles']}, "
+                        f"bound={pv_assoc['bound_persons']}, "
+                        f"unbound={pv_assoc['unbound_persons']}, "
+                        f"litter_events={pv_assoc['litter_events']}"
+                    )
+
+            # Summary JSON 固定寫在輸出影片同目錄：{stem}_summary.json
+            summary_path = Path(final_output).with_name(
+                Path(final_output).stem + "_summary.json"
+            )
+            summary_path.write_text(
+                json.dumps(run_summary, ensure_ascii=False, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
 
             if litter_tracker is not None:
                 litter_tracker.close()

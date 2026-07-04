@@ -1,16 +1,19 @@
 import argparse
 import csv
 import json
+import os
 import subprocess
+import sys
+import time
 import unicodedata
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
 
-DEFAULT_ROOT_DIR = Path("/mnt/8tb_hdd/under115a/litter_vidshort/litter")
-DEFAULT_OUTPUT_DIR = Path("/mnt/8tb_hdd/under115a/output/litter-all-test")
-DEFAULT_MAIN_PY = Path("/home/se_copilot/trashProject/scripts-old-test-copy/main.py")
+DEFAULT_ROOT_DIR = Path("/mnt/8tb_hdd/under115a/resources/urinate_long_test")
+DEFAULT_OUTPUT_DIR = Path("/mnt/8tb_hdd/under115a/output/urinate_long_test_iterate0625")
+DEFAULT_MAIN_PY = Path("/home/se_copilot/trashProject/scripts-old-test/main.py")
 DEFAULT_CLASSES = ("litter",)
 DEFAULT_EXTENSIONS = (".mp4", ".avi")
 
@@ -59,19 +62,25 @@ def parse_args():
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--main-py", default=str(DEFAULT_MAIN_PY))
     parser.add_argument("--python-bin", default="python")
-    parser.add_argument("--classes", nargs="*", default=list(DEFAULT_CLASSES))
-    parser.add_argument("--case-class", default="litter")
+    parser.add_argument(
+        "--classes",
+        nargs="*",
+        default=None,
+        help="optional filter: only process clips whose inferred class (sub-folder name) is in this list; default processes all",
+    )
+    parser.add_argument(
+        "--case-class",
+        default=None,
+        help="force this ground-truth class for every clip; default infers it from the clip's folder (sub-dir name, or root folder name for clips directly under --root-dir)",
+    )
     parser.add_argument("--extensions", nargs="*", default=list(DEFAULT_EXTENSIONS))
     parser.add_argument("--output-csv", default=None)
     parser.add_argument(
         "--rtdetr",
         choices=("on", "off"),
         default="on",
-        help="scripts-old-test always runs RTDETR; kept for legacy main.py compatibility",
+        help="off: disable RTDETR litter detection and plate OCR (sets RTDETR_ENABLED=0); scripts-old-stgcn uses --enable-rtdetr flag instead",
     )
-    parser.add_argument("--stgcn-pose", choices=("on", "off"), default="on")
-    parser.add_argument("--max-frames", type=int, default=None)
-    parser.add_argument("--batch", type=int, choices=(1, 2, 4, 8), default=None)
     parser.add_argument(
         "--limit",
         type=int,
@@ -90,6 +99,22 @@ def parse_args():
         default=[],
         help="extra argument passed to scripts-old-test/main.py; repeat for multiple args",
     )
+    parser.add_argument(
+        "--per-clip-timeout",
+        type=float,
+        default=None,
+        help="kill main.py and mark the clip failed (returncode 124) if it runs longer than N seconds; guards against a single deadlock stalling the whole batch",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="skip clips whose summary json already exists and parses (crash recovery / incremental); does NOT re-run them",
+    )
+    parser.add_argument(
+        "--capture-logs",
+        action="store_true",
+        help="redirect each clip's main.py stdout/stderr to summaries/<name>.log instead of the terminal",
+    )
     return parser.parse_args()
 
 
@@ -97,9 +122,24 @@ def is_generated_clip(path):
     return "_clips" in path.stem
 
 
+def infer_case_class(root_dir, file_path, override=None):
+    # ��冽�� ground-truth class嚗�--case-class 憿臬��閬�撖怠�芸��嚗���血����� clip �����典��鞈����憭曉��
+    # 嚗�撌Ｙ�������� root 銝�蝚砌��撅文����桅��嚗�clip ��湔�交�曉�� root ������ root 鞈����憭曉��嚗����
+    if override:
+        return override
+    try:
+        rel = file_path.relative_to(root_dir)
+    except ValueError:
+        return root_dir.name or "unknown"
+    if len(rel.parts) > 1:
+        return rel.parts[0]
+    return root_dir.name or "unknown"
+
+
 def iter_video_files(root_dir, classes, extensions, case_class):
+    # ���餈湔�����������敶梁��嚗�class ��梯�����憭暹�冽�瘀��--classes ��交�����靘����雿���粹��瞈曄�賢����柴��
     extension_set = {ext.lower() if ext.startswith(".") else f".{ext.lower()}" for ext in extensions}
-    direct_files = []
+    class_filter = {str(c) for c in classes} if classes else None
     for file_path in sorted(root_dir.rglob("*")):
         if not file_path.is_file():
             continue
@@ -107,57 +147,89 @@ def iter_video_files(root_dir, classes, extensions, case_class):
             continue
         if is_generated_clip(file_path):
             continue
-        direct_files.append(file_path)
-
-    if direct_files:
-        for file_path in direct_files:
-            yield case_class, file_path
-        return
-
-    for cls in classes:
-        cls_dir = root_dir / cls
-        if not cls_dir.exists():
-            print(f"skip missing class dir: {cls_dir}")
+        cls = infer_case_class(root_dir, file_path, override=case_class)
+        if class_filter is not None and cls not in class_filter:
             continue
-        for file_path in sorted(cls_dir.rglob("*")):
-            if not file_path.is_file():
-                continue
-            if file_path.suffix.lower() not in extension_set:
-                continue
-            if is_generated_clip(file_path):
-                continue
-            yield cls, file_path
+        yield cls, file_path
 
 
-def summary_path_for(summary_dir, root_dir, cls, file_path):
+def format_duration(seconds):
+    seconds = int(round(max(0.0, float(seconds))))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def write_manifest(output_csv, args, root_dir, main_py, total):
+    # 蝝�������甈� iterate �����舫����曇��閮�嚗�argv���敶梢�輻����������啣��霈���詻��git SHA��������菜��璅����
+    relevant_env = {
+        key: value
+        for key, value in sorted(os.environ.items())
+        if key.startswith(("ACTION_", "LITTER_", "PLATE_", "YOLO_")) or key.endswith("_DEVICE")
+    }
+    git_sha = ""
     try:
-        rel_path = file_path.relative_to(root_dir)
-    except ValueError:
-        rel_path = Path(cls) / file_path.name
-    safe_name = "__".join(rel_path.with_suffix("").parts) + ".json"
-    return summary_dir / safe_name
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(Path(main_py).parent),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode == 0:
+            git_sha = proc.stdout.strip()
+    except Exception:
+        pass
+
+    manifest = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "argv": sys.argv,
+        "root_dir": str(root_dir),
+        "main_py": str(main_py),
+        "output_csv": str(output_csv),
+        "total_clips": total,
+        "skip_existing": bool(args.skip_existing),
+        "capture_logs": bool(args.capture_logs),
+        "per_clip_timeout": args.per_clip_timeout,
+        "main_args": list(args.main_arg),
+        "relevant_env": relevant_env,
+        "git_sha": git_sha,
+    }
+    manifest_path = output_csv.with_name(output_csv.stem + "_manifest.json")
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    return manifest_path
 
 
-def build_command(args, root_dir, main_py, cls, file_path, summary_json):
+def summary_path_for(output_dir, root_dir, cls, file_path):
+    # main.py ��芸��������嚗�{output_dir}/{stem}_annotated_summary.json
+    return output_dir / f"{file_path.stem}_annotated_summary.json"
+
+
+def build_command(args, root_dir, main_py, cls, file_path):
+    # main.py ��芣�亙��敶梁��頝臬��嚗�頛詨�箇�桅����� subprocess cwd= ��批�塚��summary JSON ��芸�����������
     cmd = [
         args.python_bin,
         str(main_py),
         str(file_path),
-        "--output-root",
-        str(args.output_dir),
-        "--summary-json",
-        str(summary_json),
     ]
     if args.rtdetr == "on" and "scripts-old-stgcn" in str(main_py):
         cmd.append("--enable-rtdetr")
-    if args.stgcn_pose == "off":
-        cmd.append("--disable-action")
-    if args.max_frames is not None:
-        cmd.extend(["--max-frames", str(args.max_frames)])
-    if args.batch is not None:
-        cmd.extend(["--batch", str(args.batch)])
     cmd.extend(args.main_arg)
     return cmd
+
+
+def build_subprocess_env(args):
+    # 撠� --rtdetr off 頧���� RTDETR_ENABLED=0 env var嚗�scripts-old-test/main.py 霈����甇文�潦��
+    if args.rtdetr == "off":
+        return {**os.environ, "RTDETR_ENABLED": "0"}
+    return None  # None ��� subprocess 蝜潭�輻�園�脩�� env嚗����閮剖����剁��
 
 
 def bool_text(value):
@@ -360,6 +432,15 @@ def print_final_tables(rows, output_csv, class_order, table_limit):
         build_class_rows(rows, class_order),
     )
 
+    failures = [row for row in rows if str(row.get("ok", "0")) != "1"]
+    if failures:
+        print_table(
+            "Failures",
+            ["Class", "File", "returncode"],
+            [[row["case_class"], row["file_name"], row["returncode"]] for row in failures],
+            {"File": 56},
+        )
+
     visible_rows = rows if table_limit == 0 else rows[:max(int(table_limit), 0)]
     case_rows = [
         [
@@ -388,26 +469,83 @@ def print_final_tables(rows, output_csv, class_order, table_limit):
 
 def main():
     args = parse_args()
-    root_dir = Path(args.root_dir).expanduser()
-    output_dir = Path(args.output_dir).expanduser()
-    main_py = Path(args.main_py).expanduser()
+    # ��券�刻圾������蝯�撠�頝臬��嚗�subprocess 隞� cwd=output_dir ��瑁��嚗���詨����� main_py / 敶梁��頝臬�����閫������航炊���
+    root_dir = Path(args.root_dir).expanduser().resolve()
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    main_py = Path(args.main_py).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     output_csv = (
-        Path(args.output_csv).expanduser()
+        Path(args.output_csv).expanduser().resolve()
         if args.output_csv
         else output_dir / f"iterate_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     )
-    summary_dir = output_csv.with_suffix("") / "summaries"
+
+    files = list(iter_video_files(root_dir, args.classes, args.extensions, args.case_class))
+    if args.limit is not None:
+        files = files[: max(int(args.limit), 0)]
+    total = len(files)
+
+    manifest_path = write_manifest(output_csv, args, root_dir, main_py, total)
+    print(f"manifest: {manifest_path}")
+    print(f"queued {total} clip(s) from {root_dir}")
 
     rows = []
-    for cls, file_path in iter_video_files(root_dir, args.classes, args.extensions, args.case_class):
-        if args.limit is not None and len(rows) >= max(int(args.limit), 0):
-            break
-        summary_json = summary_path_for(summary_dir, root_dir, cls, file_path)
+    run_start = time.monotonic()
+    durations = []
+    for idx, (cls, file_path) in enumerate(files, start=1):
+        # main.py ��芸�������� summary JSON ��� cwd嚗�= output_dir嚗�銝�
+        summary_json = summary_path_for(output_dir, root_dir, cls, file_path)
+
+        # ��琿��蝥�頝�嚗�summary 撌脣����其����航圾��� ��� ��湔�交窒��剁��銝����頝����
+        if args.skip_existing and summary_json.exists():
+            try:
+                summary = json.loads(summary_json.read_text(encoding="utf-8"))
+                print(f"[{idx}/{total}] skip existing: [{cls}] {file_path.name}")
+                row = build_row(cls, file_path, 0, summary_json, summary, output_dir)
+                rows.append(row)
+                write_csv(output_csv, rows)
+                continue
+            except json.JSONDecodeError:
+                pass  # 憯������� summary ��� ���頝�
+
         summary_json.unlink(missing_ok=True)
-        cmd = build_command(args, root_dir, main_py, cls, file_path, summary_json)
-        print(f"run: [{cls}] {file_path}")
-        result = subprocess.run(cmd, check=False, cwd=str(output_dir))
+        cmd = build_command(args, root_dir, main_py, cls, file_path)
+
+        eta = ""
+        if durations:
+            avg = sum(durations) / len(durations)
+            eta = f" (eta ~{format_duration(avg * (total - idx + 1))})"
+        print(f"[{idx}/{total}] run: [{cls}] {file_path.name}{eta}")
+
+        clip_start = time.monotonic()
+        returncode = 0
+        log_handle = None
+        log_path = output_dir / f"{file_path.stem}_annotated_summary.log"
+        subprocess_env = build_subprocess_env(args)
+        try:
+            if args.capture_logs:
+                log_handle = log_path.open("w", encoding="utf-8")
+                result = subprocess.run(
+                    cmd, check=False, cwd=str(output_dir),
+                    stdout=log_handle, stderr=subprocess.STDOUT,
+                    timeout=args.per_clip_timeout,
+                    env=subprocess_env,
+                )
+            else:
+                result = subprocess.run(
+                    cmd, check=False, cwd=str(output_dir),
+                    timeout=args.per_clip_timeout,
+                    env=subprocess_env,
+                )
+            returncode = result.returncode
+        except subprocess.TimeoutExpired:
+            returncode = 124
+            print(f"[{idx}/{total}] TIMEOUT after {args.per_clip_timeout}s: {file_path.name}")
+        finally:
+            if log_handle is not None:
+                log_handle.close()
+        clip_elapsed = time.monotonic() - clip_start
+        durations.append(clip_elapsed)
 
         summary = {}
         if summary_json.exists():
@@ -415,21 +553,24 @@ def main():
                 summary = json.loads(summary_json.read_text(encoding="utf-8"))
             except json.JSONDecodeError as exc:
                 print(f"summary json parse failed: {summary_json}: {exc}")
-        else:
+        elif returncode == 0:
             print(f"summary json missing: {summary_json}")
 
-        row = build_row(cls, file_path, result.returncode, summary_json, summary, output_dir)
+        row = build_row(cls, file_path, returncode, summary_json, summary, output_dir)
         rows.append(row)
         write_csv(output_csv, rows)
         print(
             "case result: "
             f"ok={row['ok']} raw={row['raw_litter_detected']} confirm={row['confirm_litter']} "
             f"thrower={row['backtracked_thrower']} person={row['has_person']} "
-            f"keypoints={row['has_keypoints']} urinate={row['has_urinate']}"
+            f"keypoints={row['has_keypoints']} urinate={row['has_urinate']} "
+            f"| {format_duration(clip_elapsed)} | elapsed {format_duration(time.monotonic() - run_start)}"
         )
 
     write_csv(output_csv, rows)
-    print_final_tables(rows, output_csv, args.classes or [args.case_class], args.table_limit)
+    class_order = sorted({row["case_class"] for row in rows})
+    print_final_tables(rows, output_csv, class_order, args.table_limit)
+    print(f"\nTotal wall: {format_duration(time.monotonic() - run_start)} for {total} clip(s).")
 
 
 if __name__ == "__main__":

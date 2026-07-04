@@ -106,6 +106,42 @@ BBOX_HALF = _can_use_half(BBOX_DEVICE)
 TRASH_HALF = _can_use_half(TRASH_DEVICE)
 
 
+def _float_env(name, default):
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+# 車牌開罰前提：只有畫面「最近一段時間內出現過 vehicle/scooter」才跑後續昂貴判斷
+# （YOLO-Pose + STGCN 動作、RTDETR litter 偵測/確認、車牌 OCR）。因為開罰需要追蹤到車牌，
+# 沒有車輛/機車時這些判斷都無法開罰，直接略過以省算力並避免行人場景的誤判。
+# VEHICLE_GATE=0 可整個關閉（回到無條件偵測）；VEHICLE_GATE_TTL_SEC 控制「最近出現過」的秒數窗。
+# 用函式即時讀取（而非模組常數），讓 main.py 在 import detect 之後設定的環境變數/CLI 仍生效。
+def _vehicle_gate_enabled():
+    return os.environ.get("VEHICLE_GATE", "1") != "0"
+
+
+def _vehicle_gate_ttl_frames(fps):
+    return max(1, int(round(_float_env("VEHICLE_GATE_TTL_SEC", 3.0) * float(fps or 30.0))))
+
+
+def _vehicle_gate_any_active(actor_pairs, frame_indices, yolo_seg_cache, fps):
+    # 批次層級預判：這批是否有任何一幀「最近 TTL 秒內出現過車輛」。用來決定整批是否略過
+    # RTDETR。讀取（不修改）yolo_seg_cache 的 last_vehicle_frame_index 作為跨批承接，逐幀
+    # 更新方式與 detect() 完全一致，確保結果相符。
+    if not _vehicle_gate_enabled():
+        return True
+    ttl = _vehicle_gate_ttl_frames(fps)
+    last_fi = yolo_seg_cache.get('last_vehicle_frame_index')
+    for (_persons, vehicles), frame_index in zip(actor_pairs, frame_indices):
+        if vehicles:
+            last_fi = frame_index
+        if last_fi is not None and (frame_index - int(last_fi)) <= ttl:
+            return True
+    return False
+
+
 def _model_class_name(model, cls_id):
     # 將模型 class id 轉成專案需要的 actor 類別，兼容自訂模型與 COCO fallback。
     names = getattr(model, "names", {})
@@ -380,9 +416,12 @@ def detect(frame, model_bbox, model_trash,
             if violator_display_cache[actor_key]['ttl'] <= 0:
                 del violator_display_cache[actor_key]
 
-    # 第一段：YOLO actor tracking。若 batch 外層已預先計算，直接使用 precomputed 結果。
+    # 第一段：actor 來源。
+    #   - vehicle / scooter：YOLO-Seg (yolo26)，可跳幀快取。
+    #   - person：當 action_module 存在時改由 YOLO-Pose 偵測+追蹤（單次推理含 keypoints），
+    #     不再使用 YOLO-Seg 的 person，也省去 pose↔seg 的 IoU 配對；action 停用時才退回 seg person。
     if precomputed_persons is not None and precomputed_vehicles is not None:
-        persons = _clone_actors(precomputed_persons)
+        seg_persons = _clone_actors(precomputed_persons)
         vehicles = _clone_actors(precomputed_vehicles)
     else:
         should_run_yolo_seg = (
@@ -403,7 +442,7 @@ def detect(frame, model_bbox, model_trash,
                     )
                 with profile_block(profiler, "detect.yolo_actor_parse"):
                     actor_detections = _extract_actor_detections(results, model_bbox)
-                    persons, vehicles = _assign_fast_actor_track_ids(
+                    seg_persons, vehicles = _assign_fast_actor_track_ids(
                         actor_detections,
                         yolo_seg_cache,
                         iou_threshold=actor_track_iou,
@@ -420,15 +459,43 @@ def detect(frame, model_bbox, model_trash,
                         tracker = "botsort.yaml"
                     )
                 with profile_block(profiler, "detect.yolo_actor_parse"):
-                    persons, vehicles = _extract_actor_tracks(results, model_bbox)
-            yolo_seg_cache['persons'] = _clone_actors(persons)
+                    seg_persons, vehicles = _extract_actor_tracks(results, model_bbox)
+            yolo_seg_cache['persons'] = _clone_actors(seg_persons)
             yolo_seg_cache['vehicles'] = _clone_actors(vehicles)
             yolo_seg_cache['frame_index'] = frame_index
         else:
             # 快取重用：保留上次 actor 狀態，讓跳幀不會讓畫面完全沒有 actor。
             with profile_block(profiler, "detect.yolo_actor_cache_reuse"):
-                persons = _clone_actors(yolo_seg_cache.get('persons', []))
+                seg_persons = _clone_actors(yolo_seg_cache.get('persons', []))
                 vehicles = _clone_actors(yolo_seg_cache.get('vehicles', []))
+
+    # 車輛閘門：記錄最近一次看到 vehicle/scooter 的幀，再判斷是否在 TTL 秒數窗內。
+    # vehicle_active=False 時，後續 pose/STGCN/litter/OCR 全部略過（沒有車牌可開罰）。
+    if vehicles:
+        yolo_seg_cache['last_vehicle_frame_index'] = frame_index
+    if not _vehicle_gate_enabled():
+        vehicle_active = True
+    else:
+        last_vehicle_fi = yolo_seg_cache.get('last_vehicle_frame_index')
+        vehicle_active = (
+            last_vehicle_fi is not None and
+            (frame_index - int(last_vehicle_fi)) <= _vehicle_gate_ttl_frames(fps)
+        )
+    if stats is not None and not vehicle_active:
+        stats['vehicle_gate_skipped_frames'] = stats.get('vehicle_gate_skipped_frames', 0) + 1
+
+    # person 來源切換：YOLO-Pose 為主（STGCN 需要連續 keypoints）；action 停用時退回 YOLO-Seg
+    # person。車輛閘門關閉時略過 pose 偵測（省算力，且沒有車牌無法開罰）。
+    frame_skeletons = None
+    if not vehicle_active:
+        persons = []
+    elif action_module is not None:
+        with profile_block(profiler, "detect.pose_person_detect"):
+            persons, frame_skeletons = action_module.detect_persons(
+                frame, profiler=profiler, stats=stats
+            )
+    else:
+        persons = seg_persons
 
     annotated_frame = frame.copy()
     box_thickness = 4
@@ -463,15 +530,17 @@ def detect(frame, model_bbox, model_trash,
         stats['person_frame_hits'] = stats.get('person_frame_hits', 0) + 1
         stats['person_detections'] = stats.get('person_detections', 0) + len(persons)
 
-    # 如果有動作模組，先取得每個人的動作資訊，供後續違規判斷使用
+    # 如果有動作模組，先取得每個人的動作資訊，供後續違規判斷使用。
+    # persons 與 frame_skeletons 皆來自上方 detect_persons（同一次 YOLO-Pose 推理），依 track_id 對齊。
     person_action_map = {}
-    if action_module is not None:
-        with profile_block(profiler, "detect.action_update"):
-            person_action_map = action_module.update(
+    if action_module is not None and vehicle_active:
+        with profile_block(profiler, "detect.action_classify"):
+            person_action_map = action_module.classify_actions(
                 frame,
                 persons,
+                frame_skeletons,
                 fps=fps,
-                blocked_urination_track_ids=person_vehicle_map.keys(),
+                blocked_urination_track_ids=(),  # 車輛關聯不封鎖 urinate：台灣小便場景 100% 在停車場/路邊有車輛
                 profiler=profiler,
                 stats=stats,
             )
@@ -503,17 +572,19 @@ def detect(frame, model_bbox, model_trash,
         if stats is not None and shake_active:
             stats['shake_frames'] = stats.get('shake_frames', 0) + 1
 
-    # 第三段：RTDETR 全圖偵測垃圾。
+    # 第三段：RTDETR 全圖偵測垃圾。車輛閘門關閉時整段略過（不丟 litter 候選 → 不會 confirm/開罰）。
     current_frame_litters = []
 
-    # 直接使用全圖進行 RTDETR 追蹤/偵測
-    if precomputed_trash_results is None:
+    if not vehicle_active or model_trash is None:
+        # 沒有可開罰的車輛，或 RTDETR 已停用（model_trash is None）→ 跳過 litter 偵測。
+        chunk_results = []
+    elif precomputed_trash_results is None:
         with profile_block(profiler, "detect.rtdetr_litter_predict"):
             # 計算像素變化圖，並創建 4 通道輸入 (RGB + change map)
             change_map = compute_pixel_change_map(prev_frame, frame)
             # 將 BGR frame 和 change_map 堆疊成 (H, W, 4)
             frame_4ch = np.dstack((frame, change_map))
-            
+
             chunk_results = model_trash.predict(
                 frame_4ch,      # 傳入 (H, W, 4) 格式
                 conf=trash_conf,
@@ -973,6 +1044,8 @@ def _run_batched_trash_predict(model_trash, frames, trash_conf, export_batch_siz
                                zero_repair_context=None, stats=None, prev_frames=None):
     # 批次 RTDETR litter predict；尾端不足 batch 時用最後一幀 padding，輸出再裁回原長度。
     # 創建 4 通道輸入：將每幀的 BGR 與變化圖 (change map) 堆疊成 (H, W, 4) 格式。
+    if model_trash is None:
+        return [[] for _ in frames]
     if prev_frames is None:
         prev_frames = [None] * len(frames)
     
@@ -1235,17 +1308,24 @@ def detect_batch(frames, model_bbox, model_trash,
         profiler=profiler,
         stats=stats,
     )
-    trash_results = _run_batched_trash_predict(
-        model_trash,
-        frames,
-        trash_conf,
-        trash_batch_size,
-        profiler=profiler,
-        zero_repair=rtdetr_zero_repair,
-        zero_repair_context=rtdetr_batch_context,
-        stats=stats,
-        prev_frames=prev_frames,
-    )
+    # 車輛閘門：整批都沒有「最近出現過車輛」的幀時，整批跳過 RTDETR litter 推理（最貴的一段）。
+    # 混合批（部分幀有車輛）仍跑整批 RTDETR，由每幀 detect() 的閘門逐幀略過判斷，避免破壞
+    # zero-repair 的相鄰幀假設。逐幀層級的 pose/STGCN 仍各自被 detect() 閘門略過。
+    if _vehicle_gate_any_active(actor_pairs, frame_indices, yolo_seg_cache, fps):
+        trash_results = _run_batched_trash_predict(
+            model_trash,
+            frames,
+            trash_conf,
+            trash_batch_size,
+            profiler=profiler,
+            zero_repair=rtdetr_zero_repair,
+            zero_repair_context=rtdetr_batch_context,
+            stats=stats,
+            prev_frames=prev_frames,
+        )
+    else:
+        _add_stat(stats, "vehicle_gate_skipped_trash_batches")
+        trash_results = [[] for _ in frames]
 
     annotated_frames = []
     # 批次推理完成後，逐幀套用相同的 motion/holding/tracker/render 後處理。

@@ -13,7 +13,7 @@ from ultralytics import RTDETR, YOLO
 
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_BBOX_MODEL = "modules_weight/best-yolo-seg_v3.pt"
-DEFAULT_TRASH_MODEL = "modules_weight/best-rtdetr-seg.pt"
+DEFAULT_TRASH_MODEL = "modules_weight/best-rtdetr-4c.pt"
 COLORS = {
     "litter": (128, 0, 128),
     "person": (255, 200, 128),
@@ -90,7 +90,8 @@ def _foreground_mask(back_sub, frame):
 
 
 def _run_video(args, detect_mod, tracker_mod, model_bbox, model_trash, video_name):
-    video_path = REPO_ROOT / "resources" / video_name
+    p = Path(video_name)
+    video_path = p if p.is_absolute() else REPO_ROOT / "resources" / video_name
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise FileNotFoundError(f"Unable to open video: {video_path}")

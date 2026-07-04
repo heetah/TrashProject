@@ -29,6 +29,14 @@ def _int_env(name, default):
         return int(default)
 
 
+def _float_env(name, default):
+    # 讀取浮點環境變數；格式錯誤時回退預設值。
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def _safe_fps(fps, default=30.0):
     try:
         fps_value = float(fps)
@@ -66,24 +74,6 @@ def _select_device(device=None):
 
     return requested
 
-
-def iou_xyxy(box_a, box_b):
-    # bbox IoU：用來把 YOLO pose 偵測到的人與主流程 person track 對齊。
-    ax1, ay1, ax2, ay2 = box_a
-    bx1, by1, bx2, by2 = box_b
-    inter_x1 = max(ax1, bx1)
-    inter_y1 = max(ay1, by1)
-    inter_x2 = min(ax2, bx2)
-    inter_y2 = min(ay2, by2)
-    inter_w = max(0, inter_x2 - inter_x1)
-    inter_h = max(0, inter_y2 - inter_y1)
-    inter_area = inter_w * inter_h
-    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
-    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
-    union = area_a + area_b - inter_area
-    return 0.0 if union <= 0 else inter_area / union
-
-
 class STGCNActionModule:
     # 封裝模型載入、pose 擷取、骨架序列快取、STGCN 推理與 alert 維持。
     def __init__(
@@ -91,13 +81,15 @@ class STGCNActionModule:
         pose_model_path,
         stgcn_weight_path,
         stgcn_config_path,
-        # STGCN 判定為 urinate 後，conf 需 >= 0.5（預設值）且累積滿時間才會啟動違規警報。
+        # STGCN 判定為 urinate 後，conf 需 >= high 門檻（預設 0.5）且累積滿時間才會啟動違規警報。
         action_threshold=0.5,
+        urinate_conf_high=None,
+        urinate_conf_low=None,
         track_iou_threshold=0.2,
-        window_size=25,
+        window_size=100,
         alert_frames=35,
-        urination_window_sec=10.0,
-        urination_min_sec=8.0,
+        urination_window_sec=8.0,
+        urination_min_sec=5.0,
         device=None,
         profiler=None,
     ):
@@ -110,13 +102,38 @@ class STGCNActionModule:
         self.pose_imgsz = _int_env("ACTION_POSE_IMGSZ", 0)
         self.action_threshold = float(action_threshold)
         self.track_iou_threshold = float(track_iou_threshold)
-        # 【關鍵修正】訓練資料是裁切到人物的短片（人物幾乎填滿畫面），
-        # 推論時骨架卻來自整張寬景 frame。預設啟用 person-bbox 正規化，
-        # 把骨架平移縮放到人物自身範圍，與訓練分布對齊。設 ACTION_BBOX_NORM=0 可關閉。
+        # urinate 雙門檻（double thresholding / 遲滯）：
+        #   conf >= high          → strong，開啟一段連續 urinate 區間；
+        #   low <= conf < high    → weak，只有在 strong 已開啟的區間內才採信（補回信心暫降的幀）；
+        #   預測為 normal          → 中斷該區間。
+        # 可用 ACTION_URINATE_CONF_HIGH / ACTION_URINATE_CONF_LOW 覆寫。
+        high = urinate_conf_high if urinate_conf_high is not None else _float_env(
+            "ACTION_URINATE_CONF_HIGH", self.action_threshold
+        )
+        low = urinate_conf_low if urinate_conf_low is not None else _float_env(
+            "ACTION_URINATE_CONF_LOW", 0.3
+        )
+        self.urinate_conf_high = float(high)
+        self.urinate_conf_low = min(float(low), self.urinate_conf_high)
+        # 【正規化】當前訓練 pkl（garbage_new_nohead_balanced.pkl）是對「人物裁切短片」跑 YOLO-Pose，
+        # 存的是 crop 空間座標，img_shape 為裁切尺寸（如 478×286）。PreNormalize2D 以 img_shape
+        # 中心做位移+縮放：訓練時人體填滿 crop → x_norm ≈ [-1,1]。若推論時傳全幀 img_shape
+        # (1080×1920)，人體只佔一小角，歸一化結果完全不同 → 模型全輸出 normal。
+        # 因此預設開啟 bbox 正規化（ACTION_BBOX_NORM=1）：用關鍵點外接框當 crop 尺寸，
+        # 與訓練分布一致。若之後重新用全幀訓練，可設 ACTION_BBOX_NORM=0 關閉。
         self.bbox_normalize = _int_env("ACTION_BBOX_NORM", 1) != 0
         self.bbox_norm_pad = 0.15
         self.bbox_norm_conf = 0.3
+        # 關鍵點時序補值/平滑：對 window 內低信心關鍵點做線性內插，再做輕量移動平均去抖。
+        self.kp_smooth_enable = _int_env("ACTION_KP_SMOOTH", 1) != 0
+        self.kp_smooth_window = max(1, _int_env("ACTION_KP_SMOOTH_WIN", 3))
+        self.kp_interp_conf = _float_env("ACTION_KP_INTERP_CONF", 0.3)
         self.window_size = int(window_size)
+        # 【時間 stride 對齊】訓練 UniformSampleFrames(clip_len=100) 是把「整段 clip」稀疏取樣成
+        # 100 幀；推論若只餵最近 100 連續幀(stride=1, ~3.3s)會與較長訓練 clip 的時間覆蓋/速度分布
+        # 不一致。ACTION_SAMPLE_SPAN 設成 > window_size 時，改為從最近 span 幀「等間隔取樣」window_size
+        # 幀，擴大時間覆蓋並貼近訓練取樣方式。預設 = window_size（行為不變，可 A/B 開啟）。
+        self.sample_span = max(self.window_size, _int_env("ACTION_SAMPLE_SPAN", self.window_size))
         self.alert_frames = int(alert_frames)
         self.urination_window_sec = max(0.0, float(urination_window_sec))
         self.urination_min_sec = max(0.0, float(urination_min_sec))
@@ -127,6 +144,8 @@ class STGCNActionModule:
         self.track_history = {}
         self.urination_history = {}
         self.urination_positive_counts = {}
+        # urinate 雙門檻遲滯狀態：track 目前是否處於 strong 觸發的連續區間。
+        self.urination_active = {}
         self.alert_counter = {}
         self.alert_action = {}
         self.last_action = {}
@@ -248,6 +267,60 @@ class STGCNActionModule:
         except Exception:
             return None
 
+    def _sample_window(self, skeleton_list):
+        # 從 buffer（最多 sample_span 幀）等間隔取出 window_size 幀，貼近訓練的
+        # UniformSampleFrames(test_mode) 取樣（整段均勻覆蓋）。當 buffer 長度 == window_size
+        # 時退化為原本的「連續 window_size 幀」。
+        n = len(skeleton_list)
+        if n <= self.window_size:
+            return np.array(skeleton_list)
+        idx = np.linspace(0, n - 1, self.window_size)
+        idx = np.round(idx).astype(int)
+        idx = np.clip(idx, 0, n - 1)
+        return np.array([skeleton_list[j] for j in idx])
+
+    @staticmethod
+    def _moving_average_time(arr, k):
+        # arr: (T, V)；沿時間軸做邊緣感知移動平均（window k，奇數），降低關鍵點抖動。
+        T = arr.shape[0]
+        if k < 3 or T < k:
+            return arr
+        pad = k // 2
+        kernel = np.ones(k, dtype=np.float32) / float(k)
+        padded = np.pad(arr, ((pad, pad), (0, 0)), mode="edge")
+        out = np.empty_like(arr)
+        for v in range(arr.shape[1]):
+            out[:, v] = np.convolve(padded[:, v], kernel, mode="valid")
+        return out
+
+    def _interpolate_and_smooth(self, skeleton_sequence):
+        # 對整個 window 的骨架序列做時序補值與平滑：
+        #   1. 每個關節在信心 < kp_interp_conf 的幀，用同一關節在有效幀間做線性內插；
+        #   2. 全程都無效的關節保持原值（多半為 0），不硬補；
+        #   3. 補完後對 x/y 做輕量移動平均去抖。confidence 通道保持不變。
+        seq = np.asarray(skeleton_sequence, dtype=np.float32).copy()
+        if seq.ndim != 3 or seq.shape[0] < 2:
+            return seq
+        T, V, _ = seq.shape
+        conf = seq[..., 2]
+        valid = conf >= self.kp_interp_conf
+        xs = seq[..., 0]
+        ys = seq[..., 1]
+        t_idx = np.arange(T)
+        for v in range(V):
+            m = valid[:, v]
+            n_valid = int(m.sum())
+            if n_valid == 0 or n_valid == T:
+                continue
+            xs[:, v] = np.interp(t_idx, t_idx[m], xs[m, v])
+            ys[:, v] = np.interp(t_idx, t_idx[m], ys[m, v])
+        if self.kp_smooth_enable and self.kp_smooth_window >= 3:
+            xs = self._moving_average_time(xs, self.kp_smooth_window)
+            ys = self._moving_average_time(ys, self.kp_smooth_window)
+        seq[..., 0] = xs
+        seq[..., 1] = ys
+        return seq
+
     def _bbox_normalize(self, keypoints, scores, img_shape):
         # 以整個 window 內可信關鍵點的外接框，把骨架平移/縮放成「人物填滿畫面」。
         # 回傳 (平移後的關鍵點, (h, w))，與訓練時裁切短片的正規化方式一致。
@@ -285,18 +358,28 @@ class STGCNActionModule:
             if img_shape is None:
                 img_shape = (1080, 1920)
             img_shape = (int(img_shape[0]), int(img_shape[1]))
+            # 先做時序補值/平滑，再進入正規化與 MMACTION2 pipeline。
+            skeleton_sequence = self._interpolate_and_smooth(skeleton_sequence)
             keypoints = skeleton_sequence[..., :2].astype(np.float32)
             scores = skeleton_sequence[..., 2].astype(np.float32)
+            scores[:, :5] = 0.0  # suppress head nodes (nose/eyes/ears) to match training
             if self.bbox_normalize:
                 keypoints, img_shape = self._bbox_normalize(keypoints, scores, img_shape)
             active_profiler = profiler if profiler is not None else self.profiler
             with profile_block(active_profiler, profile_name):
+                # Training pkl stores (num_person=2, T, V, 2); second slot is zeros when only
+                # one person is tracked. Must match that format at inference or the model gives
+                # wrong predictions (single-person (1,V,2) vs padded (2,V,2) behave differently
+                # due to cross-person edges in the STGCN graph).
+                T, V = keypoints.shape[:2]
+                kp_pad = np.zeros((1, V, 2), dtype=np.float32)
+                sc_pad = np.zeros((1, V), dtype=np.float32)
                 pose_results = []
-                for i in range(skeleton_sequence.shape[0]):
+                for i in range(T):
                     pose_results.append(
                         {
-                            "keypoints": keypoints[i : i + 1].astype(np.float32),
-                            "keypoint_scores": scores[i : i + 1].astype(np.float32),
+                            "keypoints": np.concatenate([keypoints[i : i + 1], kp_pad], axis=0),
+                            "keypoint_scores": np.concatenate([scores[i : i + 1], sc_pad], axis=0),
                         }
                     )
                 result = self.inference_skeleton(self.model, pose_results, img_shape=img_shape)
@@ -370,6 +453,7 @@ class STGCNActionModule:
         if history is not None:
             history.clear()
         self.urination_positive_counts[track_id] = 0
+        self.urination_active[track_id] = False
         action, _ = self.last_action.get(track_id, ("normal", 0.0))
         if self._is_urination_action(action):
             self.last_action[track_id] = ("normal", 0.0)
@@ -377,11 +461,33 @@ class STGCNActionModule:
             self.alert_counter[track_id] = 0
             self.alert_action[track_id] = None
 
+    def _resolve_urination_positive(self, track_id, action, conf, stats=None):
+        # double thresholding（遲滯）：以 strong 幀開啟連續區間，weak 幀只在區間內採信，
+        # 預測為 normal 則中斷區間。回傳本幀是否計為 positive 證據。
+        is_urinate = self._is_urination_action(action)
+        conf = float(conf)
+        active = self.urination_active.get(track_id, False)
+        if is_urinate and conf >= self.urinate_conf_high:
+            active = True
+            positive = True
+            _add_stat(stats, "stgcn_urinate_strong")
+        elif is_urinate and conf >= self.urinate_conf_low:
+            # weak candidate：僅在 strong 已觸發的區間內補回，否則視為雜訊丟棄。
+            positive = active
+            _add_stat(stats, "stgcn_urinate_weak_kept" if positive else "stgcn_urinate_weak_dropped")
+        else:
+            # 預測為 normal（argmax=normal）才中斷區間；urinate 但低於 low 門檻僅不計分、不中斷。
+            if not is_urinate:
+                active = False
+            positive = False
+        self.urination_active[track_id] = active
+        return positive
+
     def _record_urination_evidence(self, track_id, action, conf, fps, stats=None):
         # urinate 需在最近 10 秒內累積至少 8 秒 positive，避免單次 STGCN 閃爍誤報。
         fps_value = _safe_fps(fps)
         now_sec = self.frame_index / fps_value
-        positive = self._is_urination_action(action) and float(conf) >= self.action_threshold
+        positive = self._resolve_urination_positive(track_id, action, conf, stats=stats)
         history = self.urination_history.setdefault(track_id, deque())
         if track_id not in self.urination_positive_counts:
             self.urination_positive_counts[track_id] = 0
@@ -408,25 +514,88 @@ class STGCNActionModule:
         )
         return confirmed, positive_sec, observed_sec
 
-    def update(
+    def detect_persons(self, frame, profiler=None, stats=None):
+        """YOLO-Pose 同時負責 person 偵測 + 追蹤 + 關鍵點擷取（單次推理，免 IoU 配對）。
+
+        回傳 (persons, frame_skeletons)：
+          persons         : [{'box': xyxy(np.float32), 'track_id': int, 'cls': 'person',
+                              'mask_poly': None, 'pose_conf': float}]，作為主流程唯一的 person 來源。
+          frame_skeletons : {track_id: skeleton(17,3) ndarray}，供 classify_actions 對齊使用。
+        並推進 self.frame_index（每幀一次，維持 urinate 時間累積連續）。
+        """
+        active_profiler = profiler if profiler is not None else self.profiler
+        self.frame_index += 1
+        persons = []
+        frame_skeletons = {}
+        if not self.loaded or self.pose_model is None:
+            # pose 不可用：回傳空 person，由主流程決定是否 fallback 到 YOLO-Seg。
+            return persons, frame_skeletons
+
+        pose_kwargs = {
+            "conf": 0.3,
+            "persist": True,
+            "verbose": False,
+            "device": self.pose_device,
+            "half": self.pose_half,
+            "tracker": "botsort.yaml",
+        }
+        if self.pose_imgsz > 0:
+            pose_kwargs["imgsz"] = self.pose_imgsz
+
+        with profile_block(active_profiler, "action.pose_track"):
+            # 在整張 frame 上偵測+追蹤 person，keypoints 為全畫面絕對座標（與訓練分布一致）。
+            pose_results = self.pose_model.track(frame, **pose_kwargs)
+        pose_result = pose_results[0] if pose_results else None
+        if pose_result is None or pose_result.boxes is None or pose_result.boxes.id is None:
+            # tracker 尚未指派 id（如首幀或全低信心）→ 本幀無可用 person。
+            return persons, frame_skeletons
+
+        with profile_block(active_profiler, "action.pose_parse"):
+            boxes_xyxy = pose_result.boxes.xyxy.cpu().numpy()
+            track_ids = pose_result.boxes.id.cpu().numpy().astype(int)
+            if pose_result.boxes.conf is not None:
+                box_conf = pose_result.boxes.conf.cpu().numpy()
+            else:
+                box_conf = np.ones(len(track_ids), dtype=np.float32)
+            for idx in range(len(track_ids)):
+                track_id = int(track_ids[idx])
+                if track_id < 0:
+                    continue
+                skeleton = self._extract_skeleton(pose_result, idx)
+                if skeleton is None:
+                    continue
+                frame_skeletons[track_id] = skeleton
+                persons.append({
+                    "box": boxes_xyxy[idx].astype(np.float32),
+                    "track_id": track_id,
+                    "cls": "person",
+                    # pose 沒有 segmentation polygon；holding/tracker 會自動退回 bbox 錨點。
+                    "mask_poly": None,
+                    "pose_conf": float(box_conf[idx]),
+                })
+        _add_stat(stats, "stgcn_pose_boxes", len(persons))
+        return persons, frame_skeletons
+
+    def classify_actions(
         self,
         frame,
         persons,
+        frame_skeletons,
         fps=30.0,
         blocked_urination_track_ids=None,
         profiler=None,
         stats=None,
     ):
+        """以 detect_persons 取得的 persons + frame_skeletons 跑 STGCN。
+
+        骨架已依 track_id 對齊（無需 IoU），回傳
+        {track_id: {'action','raw_action','conf','stgcn_conf','alert', ...}}。
         """
-        persons：格式為 {'box': xyxy, 'track_id': int, ...} 的 list。
-        回傳：{track_id: {'action': str, 'conf': float, 'stgcn_conf': float, 'alert': bool}}。
-        """
-        # 每幀更新入口：追蹤每個 person 的骨架 history，視 interval 決定是否跑 STGCN。
         active_profiler = profiler if profiler is not None else self.profiler
         blocked_urination_track_ids = self._normalize_track_id_set(blocked_urination_track_ids)
-        with profile_block(active_profiler, "action.update_total"):
-            action_map = {}
-            self.frame_index += 1
+        frame_skeletons = frame_skeletons or {}
+        action_map = {}
+        with profile_block(active_profiler, "action.classify_total"):
             if not persons:
                 return action_map
             _add_stat(stats, "stgcn_person_frames", len(persons))
@@ -445,76 +614,50 @@ class STGCNActionModule:
                     }
                 return action_map
 
-            pose_kwargs = {
-                "conf": 0.3,
-                "stream": False,
-                "verbose": False,
-                "device": self.pose_device,
-                "half": self.pose_half,
-            }
-            if self.pose_imgsz > 0:
-                pose_kwargs["imgsz"] = self.pose_imgsz
-
-            with profile_block(active_profiler, "action.pose_predict"):
-                # 對整張 frame 跑 pose，再用 IoU 配對回主流程的 tracked person。
-                pose_results = self.pose_model.predict(frame, **pose_kwargs)
-            pose_result = pose_results[0] if pose_results else None
-            pose_boxes = []
-            with profile_block(active_profiler, "action.pose_parse"):
-                if pose_result is not None and pose_result.boxes is not None and len(pose_result.boxes) > 0:
-                    for pxyxy in pose_result.boxes.xyxy:
-                        pose_boxes.append([int(c) for c in pxyxy])
-            _add_stat(stats, "stgcn_pose_boxes", len(pose_boxes))
-
-            with profile_block(active_profiler, "action.track_match_and_state"):
+            with profile_block(active_profiler, "action.track_state"):
                 # 逐一更新每個 tracked person 的骨架序列與最近一次動作結果。
                 for person in persons:
                     track_id = person.get("track_id")
                     if track_id is None or int(track_id) < 0:
                         continue
                     track_id = int(track_id)
-                    x1, y1, x2, y2 = map(int, person["box"])
 
                     if track_id not in self.track_history:
-                        self.track_history[track_id] = deque(maxlen=self.window_size)
+                        self.track_history[track_id] = deque(maxlen=self.sample_span)
                         self.alert_counter[track_id] = 0
                         self.last_action[track_id] = ("normal", 0.0)
                         self.alert_action[track_id] = None
                         self.urination_history[track_id] = deque()
                         self.urination_positive_counts[track_id] = 0
+                        self.urination_active[track_id] = False
 
                     urination_blocked = track_id in blocked_urination_track_ids
                     if urination_blocked:
                         self._clear_urination_state(track_id)
 
-                    best_idx = -1
-                    best_iou = 0.0
-                    for idx, pbox in enumerate(pose_boxes):
-                        score = iou_xyxy([x1, y1, x2, y2], pbox)
-                        if score > best_iou:
-                            best_iou = score
-                            best_idx = idx
-
-                    if best_idx >= 0 and best_iou >= self.track_iou_threshold and pose_result is not None:
-                        skeleton = self._extract_skeleton(pose_result, best_idx)
-                        if skeleton is not None:
-                            self.track_history[track_id].append(skeleton)
-                            _add_stat(stats, "stgcn_pose_matches")
+                    # 骨架由 detect_persons 依 track_id 直接對齊，免 IoU 配對。
+                    skeleton = frame_skeletons.get(track_id)
+                    if skeleton is not None:
+                        self.track_history[track_id].append(skeleton)
+                        _add_stat(stats, "stgcn_pose_matches")
                     else:
                         _add_stat(stats, "stgcn_pose_unmatched")
 
+                    buffer_len = len(self.track_history[track_id])
                     should_predict = (
-                        len(self.track_history[track_id]) == self.window_size and
+                        buffer_len >= self.window_size and
                         (self.frame_index % self.predict_interval) == 0
                     )
-                    if len(self.track_history[track_id]) == self.window_size:
+                    if buffer_len >= self.window_size:
                         _add_stat(stats, "stgcn_window_ready")
                     if should_predict:
                         # 序列滿窗且到達推理間隔時才跑 STGCN，降低每幀推理成本。
+                        # 從 buffer（最多 sample_span 幀）等間隔取 window_size 幀，對齊訓練取樣。
                         _add_stat(stats, "stgcn_predict_calls")
+                        sampled = self._sample_window(list(self.track_history[track_id]))
                         with torch.inference_mode():
                             action, conf = self._predict_action(
-                                np.array(list(self.track_history[track_id])),
+                                sampled,
                                 img_shape=frame.shape[:2],
                                 profiler=active_profiler,
                             )

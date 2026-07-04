@@ -39,12 +39,14 @@ Input Video
   -> Background Frame Reader Thread
   -> Frame Queue
   -> Main Inference Thread
-  -> YOLO-Seg Actor Detection
+  -> YOLO-Pose Person Detection + Tracking (person actors + keypoints, single pass)
       -> Person Branch
-          -> YOLO-Pose Keypoint Extraction
-          -> Accumulate Keypoints by Person Track ID
+          -> Keypoints aligned to person Track ID (no IoU matching)
+          -> Temporal Interpolation + Smoothing of keypoints
+          -> Accumulate Keypoints by Person Track ID (window = 100 frames)
           -> STGCN Action Recognition
           -> Output: normal / urinate only
+  -> YOLO-Seg (yolo26) Vehicle / Scooter Detection
       -> Vehicle / Scooter Branch
           -> Vehicle-Person Association
       -> Litter Branch
@@ -58,20 +60,42 @@ Input Video
           -> Output Annotated Video
 ```
 
+## Vehicle Gate (downstream detection prerequisite)
+
+Because issuing a fine requires a license plate, the expensive downstream detection only
+runs when a `vehicle`/`scooter` has appeared recently:
+
+- The YOLO-Seg actor pass (vehicle/scooter detection) **always** runs — it is the gate input.
+- `vehicle_active` = a vehicle/scooter was seen within the last `VEHICLE_GATE_TTL_SEC` seconds
+  (default `3.0`; a short TTL so a vehicle that just left or briefly flickered still counts,
+  and litter that lands just after it leaves is still attributable).
+- When `vehicle_active` is **false**, the frame skips **all** of: YOLO-Pose person detection,
+  STGCN action, RTDETR litter detection/confirmation, thrower backtrack, and plate OCR.
+  In batch mode a fully-idle batch skips the RTDETR batch entirely.
+- Controls: `VEHICLE_GATE=0` (or `--no-vehicle-gate`) disables the gate (unconditional
+  detection, legacy behavior); `--vehicle-gate-ttl-sec` / `VEHICLE_GATE_TTL_SEC` sets the window.
+- Implication: pedestrian-only scenes (no vehicle, e.g. many `urinate_case*` clips) produce
+  no STGCN/litter output by design. Use `--no-vehicle-gate` to evaluate STGCN/urinate or litter
+  in isolation.
+
 ## Responsibility Split
 
 ### Person Action Branch
 
 Responsible for:
 
-- detecting / tracking person actors from YOLO-Seg output,
-- extracting person keypoints using YOLO-Pose,
-- accumulating keypoint sequences by `track_id`,
+- detecting AND tracking person actors with YOLO-Pose (single pass; YOLO-Pose is the
+  only source of person detection, tracking, and keypoints going forward),
+- aligning keypoints to person `track_id` directly from the pose result (no pose-vs-seg
+  IoU matching),
+- applying temporal interpolation + light smoothing to keypoints before STGCN,
+- accumulating keypoint sequences by `track_id` (window = 100 frames, matching training
+  `clip_len=100`),
 - running STGCN only after enough keypoint frames are available,
 - classifying person action as only:
   - `normal`
   - `urinate`
-- confirming `urinate` only with sustained temporal evidence.
+- confirming `urinate` only with sustained temporal evidence (double-threshold hysteresis).
 
 Not responsible for:
 
@@ -106,16 +130,22 @@ Not responsible for:
 
 Responsible for:
 
-- tracking vehicle/scooter actors,
+- detecting AND tracking vehicle/scooter actors with YOLO-Seg (`yolo26`); the seg model
+  owns only vehicle/scooter actors now — its `person` outputs are not used while STGCN
+  action is enabled (person actors come from YOLO-Pose),
 - filtering tiny or invalid vehicle candidates,
 - associating nearby person and vehicle/scooter actors,
 - supporting later violation attribution and OCR crop selection.
 
 Not responsible for:
 
+- person detection or tracking (owned by YOLO-Pose when action is enabled),
 - STGCN action recognition,
 - keypoint extraction,
 - direct litter confirmation.
+
+> When `--disable-action` is set there is no YOLO-Pose pass, so person actors fall back to
+> the YOLO-Seg `person` class to keep litter thrower backtracking working.
 
 ### OCR Branch
 
@@ -195,6 +225,13 @@ conda run -n rtdetr python scripts-old-test/main.py resources/resize.mp4 --batch
 - Noise fixes should strengthen motion/shape/component evidence, not only lower thresholds.
 - Draw only confirmed litter as confirmed. Avoid showing pending candidates as if final.
 - Never trigger littering violation from STGCN output.
+- `LITTER_REQUIRE_VEHICLE` (env, default `0` = off): when `1`, a confirmed litter only
+  escalates to a violation (thrower/vehicle red box + plate OCR) if the thrower is associated
+  with a vehicle/scooter (is a vehicle/scooter, or a person bound to one via
+  `person_vehicle_map`). Pedestrian-only throwers are not escalated. This targets false
+  littering on pedestrian/urinate scenes; the litter object tracking/`state='confirmed'` is
+  unchanged (the small `Litter N (confirmed)` box may still draw). Off by default so litter
+  regression clips (`resize.mp4`, `manyFast.mp4`, …) are unaffected unless explicitly enabled.
 
 ## STGCN Semantics
 
@@ -208,21 +245,36 @@ ACTION_CLASSES = {0: "normal", 1: "urinate"}
 
 - Do not classify, alert, or visualize `littering` action through STGCN.
 - Littering violations come from confirmed litter tracker/behavior evidence, not STGCN action output.
-- `urinate` requires sustained evidence. Current preferred rule:
-  - default 8 second temporal window,
-  - at least 6 seconds positive `urinate` evidence.
-- If current code still uses older policy values, such as 10 second window and 8 seconds positive, do not change silently. Confirm the intended threshold in the task or preserve existing code behavior.
+- `urinate` requires sustained evidence over a temporal window (current code: 8 s window /
+  5 s positive via `--urination-window-sec` / `--urination-min-sec`; relaxed from 10 s / 8 s
+  to recover recall — normal clips show 0 % urinate frames so this does not add normal-clip
+  FP). Do not change these silently; confirm intended thresholds in the task.
+- `urinate` per-frame evidence uses **double-threshold hysteresis** (`--urinate-conf-high`,
+  default = `--action-threshold` = 0.5; `--urinate-conf-low`, default 0.3):
+  - a `strong` frame (`conf >= high`) opens an active run and counts as positive,
+  - a `weak` frame (`low <= conf < high`) counts as positive only while a run is active
+    (recovers brief confidence dips),
+  - a predicted-`normal` frame closes the run.
 - Suppress `urinate` for person tracks linked to vehicle/scooter when that policy is active.
 - `ACTION_PREDICT_INTERVAL` reduces classifier cadence after sequence window is full; pose extraction can still dominate cost.
-- STGCN inference should run only after enough keypoint frames are collected, usually:
+- STGCN inference should run only after the sequence window is full. The window matches the
+  training pipeline's `clip_len`:
 
 ```python
-MIN_STGCN_FRAMES = 30
+MIN_STGCN_FRAMES = 100   # --action-window, matches custom_trash_stgcnpp.py clip_len=100
 ```
+
+- `ACTION_SAMPLE_SPAN` / `--action-sample-span` (default = window): when set `> window`, the
+  STGCN input is uniformly sampled `window` frames from the most recent N frames (widens
+  temporal coverage to match training `UniformSampleFrames`). A/B on val clips showed **no
+  effect** on recall (span 100/200/300 gave identical urinate%), so it is left at the default;
+  keep as an experiment hook, not a fix.
 
 ## YOLO-Pose Keypoint Semantics
 
-- YOLO-Pose is the only current source of person keypoints for STGCN.
+- YOLO-Pose is the only current source of person detection, tracking, AND keypoints for
+  STGCN. It runs `.track()` once per frame; persons and keypoints come from the same pass
+  and are aligned by `track_id` (no IoU matching against YOLO-Seg).
 - Expected keypoint buffer concept:
 
 ```python
@@ -235,10 +287,18 @@ person_kps_buffer[track_id].append({
 ```
 
 - Convert YOLO-Pose keypoints into the STGCN input layout before inference.
+- **Normalization must match training.** The training pkl (`extract_pose.py`) stores
+  full-frame YOLO-Pose keypoints with `img_shape = (frame_h, frame_w)`, normalized by
+  `PreNormalize2D` over the whole frame. Inference therefore uses full-frame normalization
+  by default (`ACTION_BBOX_NORM=0`). Person-bbox normalization (`ACTION_BBOX_NORM=1`) is only
+  correct if training data is re-generated as person-cropped clips.
+- Keypoints are interpolated + smoothed before STGCN (per-joint linear interpolation of
+  low-confidence frames inside the window, then light moving-average de-jitter). Tunable via
+  `ACTION_KP_SMOOTH`, `ACTION_KP_SMOOTH_WIN`, `ACTION_KP_INTERP_CONF`.
 - If keypoints are missing, low-confidence, or unstable:
   - do not invent a violation,
-  - skip the frame or apply existing interpolation / smoothing only if already supported,
-  - keep logs clear about skipped pose frames.
+  - interpolation/smoothing handles short gaps; a joint with no valid frame stays as-is,
+  - keep logs clear about skipped/unmatched pose frames (`stgcn_pose_unmatched`).
 
 ## RTMW Legacy Semantics
 
