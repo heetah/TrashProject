@@ -139,12 +139,30 @@ class STGCNActionModule:
         self.urination_min_sec = max(0.0, float(urination_min_sec))
         if self.urination_min_sec > self.urination_window_sec:
             raise ValueError("urination_min_sec cannot exceed urination_window_sec")
+        # 【top-p 證據累積】ACTION_URINATE_TOPP=1（預設）：確認機制從「遲滯二值 positive 秒數」
+        # 改為「機率質量累積」——每幀累積 urinate 類別機率 p_t（2-class softmax 下 normal 幀
+        # 貢獻 1-conf，不再歸零），視窗內 Σ p_t / fps ≥ ACTION_URINATE_TOPP_MASS（機率·秒，
+        # 預設 = urination_min_sec）即確認。中途誤判 normal 只「稀釋」證據、不再「中斷」區間，
+        # 對信心波動的緩衝更平滑。ACTION_URINATE_TOPP=0 退回舊遲滯二值模式。
+        self.urinate_topp_enabled = _int_env("ACTION_URINATE_TOPP", 1) != 0
+        # 質量門檻校準：binary 模式把一個 conf=0.55 的 strong 幀計滿 1.0 秒，top-p 只計 0.55，
+        # 等效召回點 ≈ urination_min_sec × E[conf|urinate] ≈ 5.0 × 0.7 = 3.5 機率·秒。
+        # FP 安全：normal 場景 p_t 多 < floor(0.2) 不累積，M ≈ 0，降門檻不增 normal FP
+        #（實測 normal_case108 M ≈ 0.9 << 3.5）。
+        self.urinate_topp_mass = max(0.0, _float_env(
+            "ACTION_URINATE_TOPP_MASS", 0.7 * self.urination_min_sec
+        ))
+        # 機率下限（雜訊閘）：p_t < floor 不累積，避免 normal 場景低基線機率緩慢堆積成 FP。
+        self.urinate_topp_floor = min(1.0, max(0.0, _float_env("ACTION_URINATE_TOPP_FLOOR", 0.2)))
+        # ACTION_EVIDENCE_DEBUG=1：定期印出各 track 的證據累積狀態（診斷確認門檻用）。
+        self._evidence_debug = _int_env("ACTION_EVIDENCE_DEBUG", 0) != 0
         self.predict_interval = max(1, _int_env("ACTION_PREDICT_INTERVAL", 1))
         self.frame_index = 0
         self.track_history = {}
         self.urination_history = {}
-        self.urination_positive_counts = {}
-        # urinate 雙門檻遲滯狀態：track 目前是否處於 strong 觸發的連續區間。
+        # float 證據累積：binary 模式 = 視窗內 positive 幀數；top-p 模式 = 視窗內 Σ p_t。
+        self.urination_evidence = {}
+        # urinate 雙門檻遲滯狀態：track 目前是否處於 strong 觸發的連續區間（僅 binary 模式用）。
         self.urination_active = {}
         self.alert_counter = {}
         self.alert_action = {}
@@ -452,7 +470,7 @@ class STGCNActionModule:
         history = self.urination_history.get(track_id)
         if history is not None:
             history.clear()
-        self.urination_positive_counts[track_id] = 0
+        self.urination_evidence[track_id] = 0.0
         self.urination_active[track_id] = False
         action, _ = self.last_action.get(track_id, ("normal", 0.0))
         if self._is_urination_action(action):
@@ -483,35 +501,58 @@ class STGCNActionModule:
         self.urination_active[track_id] = active
         return positive
 
+    def _urinate_probability(self, action, conf):
+        # 從 (argmax action, conf) 還原 2-class softmax 的 urinate 機率：
+        #   pred=urinate → p = conf；pred=normal → p = 1 - conf。
+        # 防護：conf < 0.5 的 normal 是 sentinel/fallback（模型未載入回傳 ("normal", 0.0)、
+        # 錯誤路徑 ("normal", 0.01)），非真 softmax 輸出，不可解讀成 p >= 0.5 的證據 → 回 0。
+        conf = float(conf)
+        if self._is_urination_action(action):
+            return conf
+        if conf >= 0.5:
+            return 1.0 - conf
+        return 0.0
+
     def _record_urination_evidence(self, track_id, action, conf, fps, stats=None):
-        # urinate 需在最近 10 秒內累積至少 8 秒 positive，避免單次 STGCN 閃爍誤報。
+        # urinate 需在最近 urination_window_sec 內累積足夠證據才確認，避免單次 STGCN 閃爍誤報。
+        # top-p 模式：累積 urinate 機率質量（機率·秒），誤判 normal 只稀釋、不中斷；
+        # binary 模式（ACTION_URINATE_TOPP=0）：沿用遲滯二值 positive 幀秒數。
         fps_value = _safe_fps(fps)
         now_sec = self.frame_index / fps_value
-        positive = self._resolve_urination_positive(track_id, action, conf, stats=stats)
+        if self.urinate_topp_enabled:
+            p_t = self._urinate_probability(action, conf)
+            contribution = p_t if p_t >= self.urinate_topp_floor else 0.0
+            required_sec = self.urinate_topp_mass
+        else:
+            positive = self._resolve_urination_positive(track_id, action, conf, stats=stats)
+            contribution = 1.0 if positive else 0.0
+            required_sec = self.urination_min_sec
         history = self.urination_history.setdefault(track_id, deque())
-        if track_id not in self.urination_positive_counts:
-            self.urination_positive_counts[track_id] = 0
+        if track_id not in self.urination_evidence:
+            self.urination_evidence[track_id] = 0.0
 
-        history.append((now_sec, positive))
-        if positive:
-            self.urination_positive_counts[track_id] += 1
+        history.append((now_sec, contribution))
+        if contribution > 0.0:
+            self.urination_evidence[track_id] += contribution
             _add_stat(stats, "stgcn_urination_evidence_frames")
 
         cutoff_sec = now_sec - self.urination_window_sec
         while history and history[0][0] < cutoff_sec:
-            _, stale_positive = history.popleft()
-            if stale_positive:
-                self.urination_positive_counts[track_id] = max(
-                    0,
-                    self.urination_positive_counts[track_id] - 1,
+            _, stale_contribution = history.popleft()
+            if stale_contribution > 0.0:
+                self.urination_evidence[track_id] = max(
+                    0.0,
+                    self.urination_evidence[track_id] - stale_contribution,
                 )
 
-        positive_sec = self.urination_positive_counts[track_id] / fps_value
+        positive_sec = self.urination_evidence[track_id] / fps_value
         observed_sec = min(self.urination_window_sec, len(history) / fps_value)
-        confirmed = (
-            self.urination_min_sec <= 0.0 or
-            positive_sec >= self.urination_min_sec
-        )
+        confirmed = required_sec <= 0.0 or positive_sec >= required_sec
+        if self._evidence_debug and (self.frame_index % 30 == 0 or confirmed):
+            print(
+                f"[EVID fi={self.frame_index} tid={track_id}] act={action} conf={float(conf):.2f} "
+                f"M={positive_sec:.2f}/{required_sec:.2f} obs={observed_sec:.1f} confirmed={confirmed}"
+            )
         return confirmed, positive_sec, observed_sec
 
     def detect_persons(self, frame, profiler=None, stats=None):
@@ -628,7 +669,7 @@ class STGCNActionModule:
                         self.last_action[track_id] = ("normal", 0.0)
                         self.alert_action[track_id] = None
                         self.urination_history[track_id] = deque()
-                        self.urination_positive_counts[track_id] = 0
+                        self.urination_evidence[track_id] = 0.0
                         self.urination_active[track_id] = False
 
                     urination_blocked = track_id in blocked_urination_track_ids
@@ -693,7 +734,10 @@ class STGCNActionModule:
                         "stgcn_conf": conf,
                         "urination_evidence_sec": urination_positive_sec,
                         "urination_observed_sec": urination_observed_sec,
-                        "urination_required_sec": self.urination_min_sec,
+                        "urination_required_sec": (
+                            self.urinate_topp_mass if self.urinate_topp_enabled
+                            else self.urination_min_sec
+                        ),
                     }
                     if self.alert_counter[track_id] > 0:
                         # alert_frames 讓違規標記維持數幀，避免單幀分類閃爍。
