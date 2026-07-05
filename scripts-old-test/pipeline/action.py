@@ -168,6 +168,8 @@ class STGCNActionModule:
         self.alert_counter = {}
         self.alert_action = {}
         self.last_action = {}
+        # 確認 urinate 事件記錄(events.jsonl 來源):每個確認 episode 一筆。
+        self._urinate_events = []
         self._logged_error = False
         self.action_classes = dict(ACTION_CLASSES)
         self.violation_actions = set(VIOLATION_ACTIONS)
@@ -719,6 +721,14 @@ class STGCNActionModule:
                         if not already_alerting_urination:
                             _add_stat(stats, "stgcn_alerts")
                             _add_stat(stats, "stgcn_urinate_confirmed")
+                            # 新確認的 urinate episode:記一筆事件(frame_index 為 action 模組
+                            # 內部幀計數,作為相對時間戳)。
+                            self._urinate_events.append({
+                                "track_id": int(track_id),
+                                "frame_index": int(self.frame_index),
+                                "conf": float(conf),
+                                "evidence_sec": float(urination_positive_sec),
+                            })
 
                     reported_action = action
                     if self._is_urination_action(action) and not urination_confirmed:
@@ -748,3 +758,7 @@ class STGCNActionModule:
                     action_map[track_id] = action_result
 
             return action_map
+
+    def get_urinate_events(self):
+        # 確認 urinate 事件(每個確認 episode 一筆)。events.jsonl 來源。
+        return list(self._urinate_events)

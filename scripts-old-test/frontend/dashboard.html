@@ -142,8 +142,13 @@ function renderEvents(){
     }else if(ev.type==="urinate"){
       row.appendChild(el("span","badge b-urinate","隨地便溺"));
       const body=el("div","body");
-      body.appendChild(el("div","title",`STGCN 確認便溺`));
-      body.appendChild(el("div","meta",`確認幀數 ${ev.confirmed_count}`));
+      if(ev.track_id!=null){
+        body.appendChild(el("div","title",`person #${ev.track_id} · STGCN 信心 ${(ev.conf??0).toFixed(2)}`));
+        body.appendChild(el("div","meta",`${fmtTime(ev.time_sec)} · frame ${ev.frame_index} · 證據累積 ${ev.evidence_sec} 秒`));
+      }else{
+        body.appendChild(el("div","title",`STGCN 確認便溺`));
+        body.appendChild(el("div","meta",`確認幀數 ${ev.confirmed_count}`));
+      }
       row.appendChild(body);
     }
     box.appendChild(row);

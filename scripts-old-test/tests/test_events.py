@@ -46,10 +46,24 @@ def test_litter_event_pedestrian_thrower_has_no_plate():
     assert events[0]["license_plate"] is None  # person 不查車牌
 
 
-def test_urinate_event_only_when_confirmed():
-    assert build_urinate_events({"stgcn_urinate_confirmed": 0}, fps=30) == []
-    out = build_urinate_events({"stgcn_urinate_confirmed": 5}, fps=30)
-    assert out == [{"type": "urinate", "frame_index": None, "time_sec": None, "confirmed_count": 5}]
+def test_urinate_aggregate_fallback_when_no_per_track():
+    assert build_urinate_events([], {"stgcn_urinate_confirmed": 0}, fps=30) == []
+    out = build_urinate_events([], {"stgcn_urinate_confirmed": 5}, fps=30)
+    assert out == [{"type": "urinate", "track_id": None, "frame_index": None,
+                    "time_sec": None, "confirmed_count": 5}]
+
+
+def test_urinate_per_track_events_preferred_and_sorted():
+    per_track = [
+        {"track_id": 2, "frame_index": 300, "conf": 0.71, "evidence_sec": 5.2},
+        {"track_id": 1, "frame_index": 120, "conf": 0.83, "evidence_sec": 6.0},
+    ]
+    out = build_urinate_events(per_track, {"stgcn_urinate_confirmed": 2}, fps=30)
+    assert [e["frame_index"] for e in out] == [120, 300]  # 依 frame 排序
+    assert out[0]["type"] == "urinate" and out[0]["track_id"] == 1
+    assert out[0]["time_sec"] == round(120 / 30, 2)
+    assert out[0]["conf"] == 0.83
+    assert "confirmed_count" not in out[0]  # per-track 模式不帶聚合欄位
 
 
 def test_build_run_events_sorts_litter_by_frame_then_urinate():
@@ -59,7 +73,7 @@ def test_build_run_events_sorts_litter_by_frame_then_urinate():
         {"litter_id": 1, "frame_index": 100, "bbox": [0, 0, 1, 1], "center": [0, 0],
          "thrower_key": None, "escalated": False},
     ]
-    events = build_run_events(litter_events, {}, {"stgcn_urinate_confirmed": 1}, fps=30)
+    events = build_run_events(litter_events, [], {}, {"stgcn_urinate_confirmed": 1}, fps=30)
     assert [e["type"] for e in events] == ["litter", "litter", "urinate"]
     assert [e["frame_index"] for e in events[:2]] == [100, 200]
 
@@ -68,6 +82,7 @@ def test_write_events_jsonl_roundtrip(tmp_path):
     events = build_run_events(
         [{"litter_id": 1, "frame_index": 5, "bbox": [1, 2, 3, 4], "center": [2, 3],
           "thrower_key": ["vehicle", 9], "escalated": True}],
+        [],
         {9: {"license_plate": "AB-99"}},
         {"stgcn_urinate_confirmed": 0},
         fps=15,

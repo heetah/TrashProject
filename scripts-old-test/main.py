@@ -496,6 +496,7 @@ if __name__ == "__main__":
             )
             run_events = build_run_events(
                 litter_tracker.get_litter_events() if litter_tracker is not None else [],
+                action_module.get_urinate_events() if action_module is not None else [],
                 vehicle_history,
                 run_summary,
                 fps,

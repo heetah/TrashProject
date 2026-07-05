@@ -53,24 +53,41 @@ def build_litter_events(litter_events, vehicle_history, fps):
     return out
 
 
-def build_urinate_events(run_summary, fps):
-    """run 內若有確認 urinate,產生一筆 run-level urinate 事件(v1 為聚合,無 per-track 明細)。"""
+def build_urinate_events(urinate_events, run_summary, fps):
+    """優先用 per-track 確認明細(action_module.get_urinate_events());沒有時退回 summary
+    聚合(相容舊行為:一筆 run-level urinate 事件)。"""
+    if urinate_events:
+        out = []
+        for ev in urinate_events:
+            fi = ev.get("frame_index")
+            out.append({
+                "type": "urinate",
+                "track_id": int(ev.get("track_id", -1)),
+                "frame_index": int(fi) if fi is not None else None,
+                "time_sec": _time_sec(fi, fps) if fi is not None else None,
+                "conf": round(float(ev.get("conf", 0.0)), 3),
+                "evidence_sec": round(float(ev.get("evidence_sec", 0.0)), 2),
+            })
+        out.sort(key=lambda e: e["frame_index"] if e["frame_index"] is not None else float("inf"))
+        return out
+
     confirmed = int((run_summary or {}).get("stgcn_urinate_confirmed", 0))
     if confirmed <= 0:
         return []
     return [{
         "type": "urinate",
+        "track_id": None,
         "frame_index": None,
         "time_sec": None,
         "confirmed_count": confirmed,
     }]
 
 
-def build_run_events(litter_events, vehicle_history, run_summary, fps):
-    """組合一次 run 的所有事件:litter 依 frame 排序,urinate 聚合事件接在後面。"""
+def build_run_events(litter_events, urinate_events, vehicle_history, run_summary, fps):
+    """組合一次 run 的所有事件:litter 依 frame 排序,urinate(per-track 或聚合)接在後面。"""
     events = build_litter_events(litter_events, vehicle_history, fps)
     events.sort(key=lambda e: e.get("frame_index") or 0)
-    events.extend(build_urinate_events(run_summary, fps))
+    events.extend(build_urinate_events(urinate_events, run_summary, fps))
     return events
 
 
