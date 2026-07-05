@@ -333,41 +333,11 @@ def _assign_fast_actor_track_ids(actors, yolo_seg_cache, iou_threshold=0.3, trac
     return _split_actors(assigned)
 
 
-def detect(frame, model_bbox, model_trash,
-           color_dict, fg_mask, litter_tracker, vehicle_history,
-           fps=30.0,
-           violator_display_cache=None, violator_display_ttl=60,
-           violator_display_max_jump=80.0,
-           action_module=None,
-           frame_index=None,
-           yolo_seg_frame_skip=2,
-           yolo_seg_cache=None,
-           bbox_conf=0.3,
-           trash_conf=0.5,
-           profiler=None,
-           moving_threshold=0.25,
-           core_moving_threshold=0.3,
-           motion_min_component_area=4,
-           motion_min_largest_component_ratio=0.25,
-           precomputed_persons=None,
-           precomputed_vehicles=None,
-           precomputed_trash_results=None,
-           fg_mask_scale=1.0,
-           stats=None,
-           actor_mode="track",
-           actor_track_iou=0.3,
-           prev_frame=None):
-    # 單幀偵測入口：負責一幀內完整 actor、litter、違規者、渲染流程。
-    if violator_display_cache is None:
-        violator_display_cache = {}
-    if yolo_seg_cache is None:
-        yolo_seg_cache = {}
-    if frame_index is None:
-        frame_index = int(yolo_seg_cache.get('next_frame_index', 0))
-        yolo_seg_cache['next_frame_index'] = frame_index + 1
-    yolo_seg_frame_skip = max(int(yolo_seg_frame_skip or 1), 1)
+# === detect() 各階段:由 detect() 依序編排,單一職責、可獨立測試 ===
+# 每個 _stage_* 保留原本的 profile_block 標籤,終端計時輸出不變。
 
-    # UI 顯示層快取：每幀倒數，讓違規框可持續顯示
+def _stage_decay_violator_cache(violator_display_cache, vehicle_history, violator_display_ttl, profiler):
+    # UI 顯示層快取:每幀倒數,讓違規框可持續顯示。
     with profile_block(profiler, "detect.violator_cache_decay"):
         for actor_key in list(violator_display_cache.keys()):
             cache_entry = violator_display_cache[actor_key]
@@ -383,61 +353,51 @@ def detect(frame, model_bbox, model_trash,
             if violator_display_cache[actor_key]['ttl'] <= 0:
                 del violator_display_cache[actor_key]
 
-    # 第一段：actor 來源。
-    #   - vehicle / scooter：YOLO-Seg (yolo26)，可跳幀快取。
-    #   - person：當 action_module 存在時改由 YOLO-Pose 偵測+追蹤（單次推理含 keypoints），
-    #     不再使用 YOLO-Seg 的 person，也省去 pose↔seg 的 IoU 配對；action 停用時才退回 seg person。
-    if precomputed_persons is not None and precomputed_vehicles is not None:
-        seg_persons = _clone_actors(precomputed_persons)
-        vehicles = _clone_actors(precomputed_vehicles)
-    else:
-        should_run_yolo_seg = (
-            frame_index % yolo_seg_frame_skip == 0 or
-            'persons' not in yolo_seg_cache or
-            'vehicles' not in yolo_seg_cache
-        )
-        if should_run_yolo_seg:
-            # 每 N 幀才跑 YOLO tracking，其餘幀沿用快取以降低耗時。
-            if actor_mode == "predict":
-                with profile_block(profiler, "detect.yolo_actor_predict"):
-                    results = model_bbox.predict(
-                        frame,
-                        conf=bbox_conf,
-                        device=BBOX_DEVICE,
-                        half=BBOX_HALF,
-                        verbose=False,
-                    )
-                with profile_block(profiler, "detect.yolo_actor_parse"):
-                    actor_detections = _extract_actor_detections(results, model_bbox)
-                    seg_persons, vehicles = _assign_fast_actor_track_ids(
-                        actor_detections,
-                        yolo_seg_cache,
-                        iou_threshold=actor_track_iou,
-                    )
-            else:
-                with profile_block(profiler, "detect.yolo_actor_track"):
-                    results = model_bbox.track(
-                        frame,
-                        persist = True,
-                        conf = bbox_conf,
-                        device = BBOX_DEVICE,
-                        half = BBOX_HALF,
-                        verbose = False,
-                        tracker = "botsort.yaml"
-                    )
-                with profile_block(profiler, "detect.yolo_actor_parse"):
-                    seg_persons, vehicles = _extract_actor_tracks(results, model_bbox)
-            yolo_seg_cache['persons'] = _clone_actors(seg_persons)
-            yolo_seg_cache['vehicles'] = _clone_actors(vehicles)
-            yolo_seg_cache['frame_index'] = frame_index
-        else:
-            # 快取重用：保留上次 actor 狀態，讓跳幀不會讓畫面完全沒有 actor。
-            with profile_block(profiler, "detect.yolo_actor_cache_reuse"):
-                seg_persons = _clone_actors(yolo_seg_cache.get('persons', []))
-                vehicles = _clone_actors(yolo_seg_cache.get('vehicles', []))
 
-    # 車輛閘門：記錄最近一次看到 vehicle/scooter 的幀，再判斷是否在 TTL 秒數窗內。
-    # vehicle_active=False 時，後續 pose/STGCN/litter/OCR 全部略過（沒有車牌可開罰）。
+def _stage_resolve_actor_sources(frame, model_bbox, precomputed_persons, precomputed_vehicles,
+                                 yolo_seg_cache, frame_index, yolo_seg_frame_skip,
+                                 actor_mode, bbox_conf, actor_track_iou, profiler):
+    # actor 來源:vehicle/scooter 由 YOLO-Seg(可跳幀快取)。回傳 (seg_persons, vehicles)。
+    if precomputed_persons is not None and precomputed_vehicles is not None:
+        return _clone_actors(precomputed_persons), _clone_actors(precomputed_vehicles)
+
+    should_run_yolo_seg = (
+        frame_index % yolo_seg_frame_skip == 0 or
+        'persons' not in yolo_seg_cache or
+        'vehicles' not in yolo_seg_cache
+    )
+    if should_run_yolo_seg:
+        if actor_mode == "predict":
+            with profile_block(profiler, "detect.yolo_actor_predict"):
+                results = model_bbox.predict(
+                    frame, conf=bbox_conf, device=BBOX_DEVICE, half=BBOX_HALF, verbose=False,
+                )
+            with profile_block(profiler, "detect.yolo_actor_parse"):
+                actor_detections = _extract_actor_detections(results, model_bbox)
+                seg_persons, vehicles = _assign_fast_actor_track_ids(
+                    actor_detections, yolo_seg_cache, iou_threshold=actor_track_iou,
+                )
+        else:
+            with profile_block(profiler, "detect.yolo_actor_track"):
+                results = model_bbox.track(
+                    frame, persist=True, conf=bbox_conf, device=BBOX_DEVICE,
+                    half=BBOX_HALF, verbose=False, tracker="botsort.yaml",
+                )
+            with profile_block(profiler, "detect.yolo_actor_parse"):
+                seg_persons, vehicles = _extract_actor_tracks(results, model_bbox)
+        yolo_seg_cache['persons'] = _clone_actors(seg_persons)
+        yolo_seg_cache['vehicles'] = _clone_actors(vehicles)
+        yolo_seg_cache['frame_index'] = frame_index
+        return seg_persons, vehicles
+
+    # 快取重用:保留上次 actor 狀態,讓跳幀不會讓畫面完全沒有 actor。
+    with profile_block(profiler, "detect.yolo_actor_cache_reuse"):
+        return (_clone_actors(yolo_seg_cache.get('persons', [])),
+                _clone_actors(yolo_seg_cache.get('vehicles', [])))
+
+
+def _stage_vehicle_gate(vehicles, yolo_seg_cache, frame_index, fps, stats):
+    # 車輛閘門:記錄最近看到 vehicle/scooter 的幀,判斷是否在 TTL 秒數窗內。
     if vehicles:
         yolo_seg_cache['last_vehicle_frame_index'] = frame_index
     if not _vehicle_gate_enabled():
@@ -450,71 +410,56 @@ def detect(frame, model_bbox, model_trash,
         )
     if stats is not None and not vehicle_active:
         stats['vehicle_gate_skipped_frames'] = stats.get('vehicle_gate_skipped_frames', 0) + 1
+    return vehicle_active
 
-    # person 來源切換：YOLO-Pose 為主（STGCN 需要連續 keypoints）；action 停用時退回 YOLO-Seg
-    # person。車輛閘門關閉時略過 pose 偵測（省算力，且沒有車牌無法開罰）。
-    frame_skeletons = None
+
+def _stage_resolve_persons(vehicle_active, action_module, frame, seg_persons, profiler, stats):
+    # person 來源:YOLO-Pose 為主(STGCN 需連續 keypoints);action 停用時退回 YOLO-Seg person。
+    # 車輛閘門關閉時略過 pose 偵測。回傳 (persons, frame_skeletons)。
     if not vehicle_active:
-        persons = []
-    elif action_module is not None:
+        return [], None
+    if action_module is not None:
         with profile_block(profiler, "detect.pose_person_detect"):
             persons, frame_skeletons = action_module.detect_persons(
                 frame, profiler=profiler, stats=stats
             )
-    else:
-        persons = seg_persons
+        return persons, frame_skeletons
+    return seg_persons, None
 
-    annotated_frame = frame.copy()
-    box_thickness = 4
-    font_scale = 1.0
-    text_thickness = 2
 
-    # 計算重疊比例，建立 person 到最重疊車輛的對應
+def _stage_person_vehicle_map(persons, vehicles, profiler):
+    # 建立 person 到最重疊車輛(IoM > 0.7)的對應。
     person_vehicle_map = {}
-
     with profile_block(profiler, "detect.person_vehicle_map"):
         if persons and vehicles:
             person_boxes = [p['box'] for p in persons]
             person_ids = [p['track_id'] for p in persons]
             vehicle_boxes = [v['box'] for v in vehicles]
-
-            # 將 vehicle 的 (cls, track_id) 組合成一個 list，方便後續建立對應關係
             detected_vehicle_keys = [(v['cls'], int(v['track_id'])) for v in vehicles]
-
-            # 計算所有 person 與 vehicle 之間的 IoM (Intersection over Minimum)
-            # 解決 IoU 在 person 完全包含在巨大 vehicle 框內時數值過低的問題
             iom_matrix = calculate_iom_matrix(person_boxes, vehicle_boxes)
-
             overlap_mask = np.any(iom_matrix > 0.7, axis=1)
-
             for i, has_overlap in enumerate(overlap_mask):
                 if has_overlap:
                     max_veh_idx = np.argmax(iom_matrix[i])
                     person_vehicle_map[person_ids[i]] = detected_vehicle_keys[max_veh_idx]
+    return person_vehicle_map
 
-    all_objects = persons + vehicles
-    if stats is not None and persons:
-        stats['person_frame_hits'] = stats.get('person_frame_hits', 0) + 1
-        stats['person_detections'] = stats.get('person_detections', 0) + len(persons)
 
-    # 如果有動作模組，先取得每個人的動作資訊，供後續違規判斷使用。
-    # persons 與 frame_skeletons 皆來自上方 detect_persons（同一次 YOLO-Pose 推理），依 track_id 對齊。
-    person_action_map = {}
-    if action_module is not None and vehicle_active:
-        with profile_block(profiler, "detect.action_classify"):
-            person_action_map = action_module.classify_actions(
-                frame,
-                persons,
-                frame_skeletons,
-                fps=fps,
-                blocked_urination_track_ids=(),  # 車輛關聯不封鎖 urinate：台灣小便場景 100% 在停車場/路邊有車輛
-                profiler=profiler,
-                stats=stats,
-            )
+def _stage_classify_actions(action_module, vehicle_active, frame, persons, frame_skeletons,
+                            fps, profiler, stats):
+    # 有動作模組時取得每個人的動作(normal/urinate),依 track_id 對齊。
+    if action_module is None or not vehicle_active:
+        return {}
+    with profile_block(profiler, "detect.action_classify"):
+        return action_module.classify_actions(
+            frame, persons, frame_skeletons, fps=fps,
+            blocked_urination_track_ids=(),  # 車輛關聯不封鎖 urinate:台灣小便場景 100% 有車輛
+            profiler=profiler, stats=stats,
+        )
 
-    tracking_objects = all_objects
 
-    # 第二段：更新車輛中心點歷史，供 holding 與後續相對運動判斷使用。
+def _stage_update_vehicle_history(all_objects, vehicle_history, profiler):
+    # 更新車輛中心點歷史,供 holding 與相對運動判斷。
     with profile_block(profiler, "detect.vehicle_history"):
         for obj in all_objects:
             if obj['cls'] in VEHICLE_LIKE_CLASSES:
@@ -523,10 +468,10 @@ def detect(frame, model_bbox, model_trash,
                 centroid = ((x1 + x2) / 2, (y1 + y2) / 2)
                 vehicle_history[track_id]['centroids'].append(centroid)
 
-    # 相機晃動偵測（監視器輕微晃動 → 全域位移 → 靜止物被誤判為丟擲）：
-    # 量測整幀主導位移；超過閾值即進入「晃動冷卻區間」，期間丟棄所有 litter 候選，
-    # 避免晃動跳動進入軌跡造成誤 confirm。穩定場景(含移動車輛)位移 <1px，永不觸發。
-    # 冷卻長度涵蓋偵測 gap 與晃動餘波。狀態存於 per-video 的 litter_tracker。
+
+def _stage_detect_shake(prev_frame, frame, litter_tracker, frame_index, fps, stats, profiler):
+    # 相機晃動偵測:整幀主導位移超過閾值 → 進入晃動冷卻,期間丟棄 litter 候選。
+    # 回傳 (shake_active, shake_mag, shake_threshold)。
     with profile_block(profiler, "detect.shake_detect"):
         shake_mag, _shake_resp = estimate_global_shift(prev_frame, frame)
         shake_threshold = max(SHAKE_SHIFT_FLOOR_PX, SHAKE_SHIFT_FRAC * float(frame.shape[1]))
@@ -538,61 +483,58 @@ def detect(frame, model_bbox, model_trash,
         shake_active = int(frame_index) <= getattr(litter_tracker, '_shake_until', -1)
         if stats is not None and shake_active:
             stats['shake_frames'] = stats.get('shake_frames', 0) + 1
+    return shake_active, shake_mag, shake_threshold
 
-    # 第三段：RTDETR 全圖偵測垃圾。車輛閘門關閉時整段略過（不丟 litter 候選 → 不會 confirm/開罰）。
+
+def _stage_collect_litter_candidates(vehicle_active, model_trash, precomputed_trash_results,
+                                     prev_frame, frame, trash_conf, stats, profiler):
+    # RTDETR 全圖偵測垃圾候選;車輛閘門關閉或無模型時回空。回傳 [[x1,y1,x2,y2,conf], ...]。
     current_frame_litters = []
-
     if not vehicle_active or model_trash is None:
-        # 沒有可開罰的車輛，或 RTDETR 已停用（model_trash is None）→ 跳過 litter 偵測。
         chunk_results = []
     elif precomputed_trash_results is None:
         with profile_block(profiler, "detect.rtdetr_litter_predict"):
-            # 計算像素變化圖，並創建 4 通道輸入 (RGB + change map)
+            # 計算像素變化圖,並創建 4 通道輸入 (RGB + change map)。
             change_map = compute_pixel_change_map(prev_frame, frame)
-            # 將 BGR frame 和 change_map 堆疊成 (H, W, 4)
             frame_4ch = np.dstack((frame, change_map))
-
             chunk_results = model_trash.predict(
-                frame_4ch,      # 傳入 (H, W, 4) 格式
-                conf=trash_conf,
-                device=TRASH_DEVICE,
-                half=TRASH_HALF,
-                verbose=False
+                frame_4ch, conf=trash_conf, device=TRASH_DEVICE, half=TRASH_HALF, verbose=False,
             )
     else:
         chunk_results = _as_result_list(precomputed_trash_results)
 
-    # 解析 RTDETR 結果：全圖推理不需要 ROI 座標偏移。
     with profile_block(profiler, "detect.rtdetr_parse"):
         for r_res in chunk_results:
             if r_res.boxes is None:
                 continue
-                
             for r_box in r_res.boxes:
                 r_cls_id = int(r_box.cls[0])
                 r_class_name = str(model_trash.names[r_cls_id]).strip().lower()
                 r_conf = float(r_box.conf[0])
-
                 if r_class_name == 'litter':
                     lx1, ly1, lx2, ly2 = map(int, r_box.xyxy[0])
                     bbox_width = lx2 - lx1
                     bbox_height = ly2 - ly1
-
-                    # 基礎 bbox 尺寸與長寬比過濾：去掉極端扁長或過小雜訊。
+                    # 基礎 bbox 尺寸與長寬比過濾:去掉極端扁長或過小雜訊。
                     aspect_ratio = bbox_width / max(bbox_height, 1e-6)
                     if aspect_ratio > 6.0 or aspect_ratio < 0.15 or bbox_width < 3 or bbox_height < 3:
                         continue
-                    
-                    # 座標已經是全域座標，直接加入本幀候選 litter。
                     current_frame_litters.append([lx1, ly1, lx2, ly2, r_conf])
 
     if stats is not None:
         stats['raw_litter_candidates'] = stats.get('raw_litter_candidates', 0) + len(current_frame_litters)
-                
-    # 第四段：motion + holding 前處理。只有真的在動、且不像仍被人車持有的 litter 才進 tracker。
+    return current_frame_litters
+
+
+def _stage_filter_litter_candidates(current_frame_litters, shake_active, shake_mag, shake_threshold,
+                                    fg_mask, fg_mask_scale, moving_threshold, core_moving_threshold,
+                                    motion_min_component_area, motion_min_largest_component_ratio,
+                                    litter_tracker, tracking_objects, vehicle_history,
+                                    frame_index, stats, profiler):
+    # motion + holding 前處理:只有真的在動、且不像仍被人車持有的 litter 才進 tracker。
     filtered_frame_litters = []
     with profile_block(profiler, "detect.motion_holding_filter"):
-        # 晃動冷卻區間內：整幀都在位移，litter 偵測不可靠 → 全數丟棄，不餵 tracker。
+        # 晃動冷卻區間內:整幀都在位移,litter 偵測不可靠 → 全數丟棄,不餵 tracker。
         shake_skip = shake_active
         if shake_skip and getattr(litter_tracker, '_debug', False):
             print(f"  [SHAKE_SKIP fi={frame_index} mag={shake_mag:.1f}px thr={shake_threshold:.1f} drop={len(current_frame_litters)}]")
@@ -600,37 +542,30 @@ def detect(frame, model_bbox, model_trash,
             lx1, ly1, lx2, ly2, _ = litter_box
             litter_w = max(int(lx2 - lx1), 1)
             litter_h = max(int(ly2 - ly1), 1)
-            # 檢查整個 litter bbox 的前景像素比例，先排除靜止舊垃圾。
+            # 檢查整個 litter bbox 的前景像素比例,先排除靜止舊垃圾。
             is_moving = motion_evidence(
-                fg_mask,
-                (int(lx1), int(ly1), int(lx2), int(ly2)),
-                threshold=moving_threshold,
-                mask_scale=fg_mask_scale,
+                fg_mask, (int(lx1), int(ly1), int(lx2), int(ly2)),
+                threshold=moving_threshold, mask_scale=fg_mask_scale,
                 min_component_area=motion_min_component_area,
                 min_largest_component_ratio=motion_min_largest_component_ratio,
             )
             if not is_moving:
                 continue
-
-            # 在中心區域再做一次 motion 驗證，抑制「旁邊人車移動」造成的舊垃圾誤觸發
+            # 在中心區域再做一次 motion 驗證,抑制「旁邊人車移動」造成的舊垃圾誤觸發。
             if litter_w >= 8 and litter_h >= 8:
                 core_x1 = int(lx1 + 0.2 * litter_w)
                 core_y1 = int(ly1 + 0.2 * litter_h)
                 core_x2 = int(lx2 - 0.2 * litter_w)
                 core_y2 = int(ly2 - 0.2 * litter_h)
-
                 is_core_moving = motion_evidence(
-                    fg_mask,
-                    (core_x1, core_y1, core_x2, core_y2),
-                    threshold=core_moving_threshold,
-                    mask_scale=fg_mask_scale,
+                    fg_mask, (core_x1, core_y1, core_x2, core_y2),
+                    threshold=core_moving_threshold, mask_scale=fg_mask_scale,
                     min_component_area=motion_min_component_area,
                     min_largest_component_ratio=motion_min_largest_component_ratio,
                 )
                 if not is_core_moving:
                     continue
-
-            # 從 tracker 取最近上一幀中心，供 holding 判斷相對位移與釋放方向。
+            # 從 tracker 取最近上一幀中心,供 holding 判斷相對位移與釋放方向。
             prev_litter_center = None
             prev_litter_missed = None
             prev_litter_history = None
@@ -643,31 +578,21 @@ def detect(frame, model_bbox, model_trash,
                     (float(prev_box[1]) + float(prev_box[3])) / 2.0,
                 )
                 dist = math.hypot(curr_center[0] - prev_center[0], curr_center[1] - prev_center[1])
-
-                # 若距離小於追蹤器的距離閾值或小於目前找到的最近距離，則更新 prev_litter_center
                 if dist < litter_tracker.distance_threshold and dist < min_prev_dist:
                     min_prev_dist = dist
                     prev_litter_center = prev_center
                     prev_litter_missed = int(l_data.get('missed', 0))
                     prev_litter_history = list(l_data.get('history', []))
-
-            # 垃圾候選 FP 篩選（集中於前處理；tracker 只負責追蹤、不再對候選做 FP 判斷）：
-            # 隨車部件（車燈/車身/後照鏡）與純水平條紋（橫越畫面的車/機車）不進 tracker。
-            # containment 為 per-frame 判別、對新生候選亦適用；streak/co-motion 需軌跡，
-            # 新生候選（無 prev history）會自動略過，避免誤殺剛丟出的垃圾第一點。
+            # 垃圾候選 FP 篩選:隨車部件與純水平條紋不進 tracker。新生候選(無 prev history)自動略過。
             is_fp_candidate, fp_reason = litter_candidate_is_vehicle_fp(
-                litter_box,
-                tracking_objects,
-                vehicle_history=vehicle_history,
+                litter_box, tracking_objects, vehicle_history=vehicle_history,
                 prev_litter_history=prev_litter_history,
             )
             if is_fp_candidate:
                 if getattr(litter_tracker, '_debug', False):
                     print(f"  [FP_DROP fi={frame_index} cx={curr_center[0]:.0f},{curr_center[1]:.0f} reason={fp_reason}]")
                 continue
-
-            # 新出現目標先進 tracker 建立一個 history anchor；第二幀起才能判斷它
-            # 是否相對車輛真的往下分離，避免把 resize.mp4 這類剛丟出的垃圾第一點擋掉。
+            # 新出現目標先進 tracker 建立 history anchor;第二幀起才能判斷相對車輛是否往下分離。
             if prev_litter_center is None:
                 if getattr(litter_tracker, '_debug', False):
                     lc_x = (lx1 + lx2) / 2.0
@@ -675,10 +600,8 @@ def detect(frame, model_bbox, model_trash,
                     print(f"  [BIRTH_PASS fi={frame_index} cx={lc_x:.0f},{lc_y:.0f}]")
                 filtered_frame_litters.append(litter_box)
                 continue
-
             is_holding_like, _hold_actor = litter_holding(
-                litter_box,
-                tracking_objects,
+                litter_box, tracking_objects,
                 prev_litter_center=prev_litter_center,
                 prev_litter_missed=prev_litter_missed,
                 prev_litter_history=prev_litter_history,
@@ -690,21 +613,22 @@ def detect(frame, model_bbox, model_trash,
                     lc_y2 = (ly1 + ly2) / 2.0
                     print(f"  [HOLDING fi={frame_index} cx={lc_x2:.0f},{lc_y2:.0f} actor={_hold_actor}]")
                 continue
-
             filtered_frame_litters.append(litter_box)
-
     if stats is not None:
         stats['filtered_litter_candidates'] = stats.get('filtered_litter_candidates', 0) + len(filtered_frame_litters)
+    return filtered_frame_litters
 
-    # 第五段：更新 GlobalLitterTracker，將 pending litter 依軌跡轉成 confirmed。
+
+def _stage_update_litter_tracker(litter_tracker, filtered_frame_litters, tracking_objects,
+                                 person_vehicle_map, frame_index, frame, vehicle_history,
+                                 stats, profiler):
+    # 更新 GlobalLitterTracker,將 pending litter 依軌跡轉成 confirmed。
+    # 回傳 (tracked_litters, active_violators)。
     with profile_block(profiler, "detect.litter_tracker_update"):
         tracked_litters, active_violators = litter_tracker.update(
-            filtered_frame_litters,
-            tracking_objects,
-            person_vehicle_map=person_vehicle_map,
-            frame_index=frame_index,
-            frame=frame,
-            vehicle_history=vehicle_history,
+            filtered_frame_litters, tracking_objects,
+            person_vehicle_map=person_vehicle_map, frame_index=frame_index,
+            frame=frame, vehicle_history=vehicle_history,
         )
     if stats is not None:
         confirmed_ids = [
@@ -741,21 +665,28 @@ def detect(frame, model_bbox, model_trash,
             stats['backtracked_thrower_frame_hits'] = (
                 stats.get('backtracked_thrower_frame_hits', 0) + 1
             )
-    if person_action_map:
-        # STGCN 若判定 person 正在違規動作，也可直接把人/車註冊成違規者。
-        with profile_block(profiler, "detect.stgcn_violator_register"):
-            stgcn_violators = litter_tracker.register_action_violators(
-                person_action_map,
-                tracking_objects,
-                person_vehicle_map=person_vehicle_map,
-                ttl=violator_display_ttl,
-                frame_index=frame_index,
-                vehicle_history=vehicle_history,
-            )
-        _add_stat(stats, "stgcn_registered_violators", len(stgcn_violators))
-        active_violators = set(active_violators) | stgcn_violators
+    return tracked_litters, active_violators
 
-    # 車牌辨識只對已鎖定違規者派工；避免每 10 幀掃描所有車輛造成不必要延遲。
+
+def _stage_register_action_violators(litter_tracker, person_action_map, tracking_objects,
+                                     person_vehicle_map, violator_display_ttl, frame_index,
+                                     vehicle_history, active_violators, stats, profiler):
+    # STGCN 判定違規動作時,把人/車註冊成違規者。回傳更新後的 active_violators。
+    if not person_action_map:
+        return active_violators
+    with profile_block(profiler, "detect.stgcn_violator_register"):
+        stgcn_violators = litter_tracker.register_action_violators(
+            person_action_map, tracking_objects,
+            person_vehicle_map=person_vehicle_map, ttl=violator_display_ttl,
+            frame_index=frame_index, vehicle_history=vehicle_history,
+        )
+    _add_stat(stats, "stgcn_registered_violators", len(stgcn_violators))
+    return set(active_violators) | stgcn_violators
+
+
+def _stage_dispatch_plates(litter_tracker, active_violators, violator_display_cache,
+                           vehicles, frame, vehicle_history, profiler):
+    # 車牌辨識只對已鎖定違規者派工;避免每幀掃描所有車輛。
     with profile_block(profiler, "detect.plate_dispatch"):
         backward_plate_roi_items = []
         if hasattr(litter_tracker, "consume_backward_plate_roi_items"):
@@ -764,7 +695,6 @@ def detect(frame, model_bbox, model_trash,
             dispatched = dispatch_license_plate_rois(backward_plate_roi_items, vehicle_history, profiler=profiler)
             if not dispatched and hasattr(litter_tracker, "restore_backward_plate_roi_items"):
                 litter_tracker.restore_backward_plate_roi_items(backward_plate_roi_items)
-
         plate_target_keys = set(active_violators)
         plate_target_keys.update(
             key for key in violator_display_cache.keys()
@@ -776,6 +706,11 @@ def detect(frame, model_bbox, model_trash,
         ]
         detect_license_plates(frame, plate_target_vehicles, vehicle_history, profiler=profiler)
 
+
+def _stage_refresh_violator_cache(tracking_objects, active_violators, litter_tracker,
+                                  person_action_map, violator_display_cache,
+                                  violator_display_ttl, vehicle_history, profiler):
+    # 違規快取刷新:把本幀違規者的位置/動作寫回快取,回傳待渲染 objects。
     with profile_block(profiler, "detect.violator_cache_refresh"):
         for obj in tracking_objects:
             actor_key = (obj['cls'], obj['track_id'])
@@ -802,45 +737,41 @@ def detect(frame, model_bbox, model_trash,
                     'until_plate_found': until_plate_found,
                     'action': action_name,
                 }
+        return list(tracking_objects)
 
-        render_objects = list(tracking_objects)
 
-    # 第六段：統一渲染 actor。違規者紅框，正常人車用各類別顏色。
+def _stage_render_actors(annotated_frame, render_objects, violator_display_cache,
+                         violator_display_max_jump, color_dict, person_action_map,
+                         vehicle_history, box_thickness, font_scale, text_thickness, profiler):
+    # 統一渲染 actor:違規者紅框,正常人車用各類別顏色。
     with profile_block(profiler, "detect.render_actors"):
         for obj in render_objects:
             x1, y1, x2, y2 = map(int, obj['box'])
             cls_name = obj['cls']
             track_id = obj['track_id']
             actor_key = (cls_name, track_id)
-
-            # 檢查是否為「被反追蹤鎖定的丟擲者」(存在於違規快取中)
+            # 檢查是否為「被反追蹤鎖定的丟擲者」(存在於違規快取中)。
             cache_entry = violator_display_cache.get(actor_key)
             is_violator = cache_entry is not None
-
             if is_violator:
                 current_center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
                 saved_center = cache_entry.get('center', current_center)
                 jump_dist = math.hypot(current_center[0] - saved_center[0], current_center[1] - saved_center[1])
-                
                 if jump_dist > violator_display_max_jump:
                     violator_display_cache.pop(actor_key, None)
-                    is_violator = False 
+                    is_violator = False
                 else:
-                    cache_entry['center'] = current_center 
-
-            # === 根據身分狀態決定 BBox 顏色 ===
+                    cache_entry['center'] = current_center
             if is_violator:
-                # 丟擲者確認：畫上紅色 BBox 
+                # 丟擲者確認:畫上紅色 BBox。
                 cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), WARN, box_thickness + 2)
                 plate_str = get_plate_number(vehicle_history, track_id) if cls_name in VEHICLE_LIKE_CLASSES else ""
                 warning_label = _warning_label_for_action(cache_entry.get('action'))
                 label_text = f"{cls_name} -{warning_label}- {plate_str}".strip()
-                
                 cv2.putText(annotated_frame, label_text, (x1, max(10, y1 - 35)),
                             cv2.FONT_HERSHEY_SIMPLEX, font_scale, WARN, text_thickness)
-                            
             else:
-                # 正常路人/車輛
+                # 正常路人/車輛。
                 color = color_dict.get(cls_name, BLACK)
                 cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, box_thickness)
                 label_text = cls_name
@@ -854,21 +785,137 @@ def detect(frame, model_bbox, model_trash,
                         label_text = f"person {action_name} STGCN {stgcn_conf:.2f}"
                     else:
                         label_text = f"person {action_info.get('action', 'normal')} STGCN {stgcn_conf:.2f}"
-
                 cv2.putText(annotated_frame, label_text, (x1, max(10, y1 - 10)),
                             cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, text_thickness)
 
-    # 第七段：只畫 confirmed litter，避免 pending 候選框造成誤解。
+
+def _stage_render_litters(annotated_frame, tracked_litters, color_dict, box_thickness, profiler):
+    # 只畫 confirmed litter,避免 pending 候選框造成誤解。
     with profile_block(profiler, "detect.render_litters"):
         for l_id, l_data in tracked_litters.items():
             lx1, ly1, lx2, ly2, conf = l_data['bbox']
             lx1, ly1, lx2, ly2 = map(int, [lx1, ly1, lx2, ly2])
-
             if l_data['state'] in ['confirmed']:
                 l_color = color_dict['litter']
                 cv2.rectangle(annotated_frame, (lx1, ly1), (lx2, ly2), l_color, box_thickness + 2)
                 cv2.putText(annotated_frame, f"Litter {l_id} ({l_data['state']})", (lx1, max(20, ly1-10)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, l_color, 2)
+
+
+def detect(frame, model_bbox, model_trash,
+           color_dict, fg_mask, litter_tracker, vehicle_history,
+           fps=30.0,
+           violator_display_cache=None, violator_display_ttl=60,
+           violator_display_max_jump=80.0,
+           action_module=None,
+           frame_index=None,
+           yolo_seg_frame_skip=2,
+           yolo_seg_cache=None,
+           bbox_conf=0.3,
+           trash_conf=0.5,
+           profiler=None,
+           moving_threshold=0.25,
+           core_moving_threshold=0.3,
+           motion_min_component_area=4,
+           motion_min_largest_component_ratio=0.25,
+           precomputed_persons=None,
+           precomputed_vehicles=None,
+           precomputed_trash_results=None,
+           fg_mask_scale=1.0,
+           stats=None,
+           actor_mode="track",
+           actor_track_iou=0.3,
+           prev_frame=None):
+    # 單幀偵測入口：負責一幀內完整 actor、litter、違規者、渲染流程。
+    if violator_display_cache is None:
+        violator_display_cache = {}
+    if yolo_seg_cache is None:
+        yolo_seg_cache = {}
+    if frame_index is None:
+        frame_index = int(yolo_seg_cache.get('next_frame_index', 0))
+        yolo_seg_cache['next_frame_index'] = frame_index + 1
+    yolo_seg_frame_skip = max(int(yolo_seg_frame_skip or 1), 1)
+
+    _stage_decay_violator_cache(violator_display_cache, vehicle_history, violator_display_ttl, profiler)
+
+    # actor 來源:vehicle/scooter 由 YOLO-Seg;action 啟用時 person 改由 YOLO-Pose(見 _stage_resolve_persons)。
+    seg_persons, vehicles = _stage_resolve_actor_sources(
+        frame, model_bbox, precomputed_persons, precomputed_vehicles,
+        yolo_seg_cache, frame_index, yolo_seg_frame_skip,
+        actor_mode, bbox_conf, actor_track_iou, profiler,
+    )
+
+    # 車輛閘門:vehicle_active=False 時,後續 pose/STGCN/litter/OCR 全部略過(沒有車牌可開罰)。
+    vehicle_active = _stage_vehicle_gate(vehicles, yolo_seg_cache, frame_index, fps, stats)
+
+    persons, frame_skeletons = _stage_resolve_persons(
+        vehicle_active, action_module, frame, seg_persons, profiler, stats
+    )
+
+    annotated_frame = frame.copy()
+    box_thickness = 4
+    font_scale = 1.0
+    text_thickness = 2
+
+    person_vehicle_map = _stage_person_vehicle_map(persons, vehicles, profiler)
+
+    all_objects = persons + vehicles
+    if stats is not None and persons:
+        stats['person_frame_hits'] = stats.get('person_frame_hits', 0) + 1
+        stats['person_detections'] = stats.get('person_detections', 0) + len(persons)
+
+    # persons 與 frame_skeletons 皆來自同一次 YOLO-Pose 推理,依 track_id 對齊。
+    person_action_map = _stage_classify_actions(
+        action_module, vehicle_active, frame, persons, frame_skeletons, fps, profiler, stats
+    )
+
+    tracking_objects = all_objects
+
+    _stage_update_vehicle_history(all_objects, vehicle_history, profiler)
+
+    shake_active, shake_mag, shake_threshold = _stage_detect_shake(
+        prev_frame, frame, litter_tracker, frame_index, fps, stats, profiler
+    )
+
+    current_frame_litters = _stage_collect_litter_candidates(
+        vehicle_active, model_trash, precomputed_trash_results,
+        prev_frame, frame, trash_conf, stats, profiler,
+    )
+
+    filtered_frame_litters = _stage_filter_litter_candidates(
+        current_frame_litters, shake_active, shake_mag, shake_threshold,
+        fg_mask, fg_mask_scale, moving_threshold, core_moving_threshold,
+        motion_min_component_area, motion_min_largest_component_ratio,
+        litter_tracker, tracking_objects, vehicle_history, frame_index, stats, profiler,
+    )
+
+    tracked_litters, active_violators = _stage_update_litter_tracker(
+        litter_tracker, filtered_frame_litters, tracking_objects,
+        person_vehicle_map, frame_index, frame, vehicle_history, stats, profiler,
+    )
+
+    active_violators = _stage_register_action_violators(
+        litter_tracker, person_action_map, tracking_objects, person_vehicle_map,
+        violator_display_ttl, frame_index, vehicle_history, active_violators, stats, profiler,
+    )
+
+    _stage_dispatch_plates(
+        litter_tracker, active_violators, violator_display_cache,
+        vehicles, frame, vehicle_history, profiler,
+    )
+
+    render_objects = _stage_refresh_violator_cache(
+        tracking_objects, active_violators, litter_tracker, person_action_map,
+        violator_display_cache, violator_display_ttl, vehicle_history, profiler,
+    )
+
+    _stage_render_actors(
+        annotated_frame, render_objects, violator_display_cache, violator_display_max_jump,
+        color_dict, person_action_map, vehicle_history, box_thickness, font_scale,
+        text_thickness, profiler,
+    )
+
+    _stage_render_litters(annotated_frame, tracked_litters, color_dict, box_thickness, profiler)
 
     return annotated_frame
 
@@ -1015,13 +1062,13 @@ def _run_batched_trash_predict(model_trash, frames, trash_conf, export_batch_siz
         return [[] for _ in frames]
     if prev_frames is None:
         prev_frames = [None] * len(frames)
-    
+
     infer_frames = []
     for frame, prev_frame in zip(frames, prev_frames):
         change_map = compute_pixel_change_map(prev_frame, frame)
         frame_4ch = np.dstack((frame, change_map))
         infer_frames.append(frame_4ch)
-    
+
     if export_batch_size > len(infer_frames):
         infer_frames.extend([infer_frames[-1]] * (export_batch_size - len(infer_frames)))
 
