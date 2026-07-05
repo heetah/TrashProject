@@ -310,6 +310,11 @@ class GlobalLitterTracker:
         self._pv_litter_events = []      # [{frame_index, center}] confirmed litter 錨定
         self._pv_litter_seen_ids = set() # litter id 去重,confirm 跨幀只記一次
 
+        # confirmed litter 事件記錄(events.jsonl 來源,與 PV_ASSOC 無關、一律開啟)。
+        # 每個 litter id 於「首次確認」記一次,含 frame、bbox、thrower、是否升級為違規。
+        self._litter_events = []
+        self._litter_event_seen_ids = set()
+
         # === Mutable state ===
         self.active_litters = {}            # {litter_id: {bbox, history, age, state, thrower_key, ...}}
         self.violators = {}                 # {(cls, track_id): {ttl, center, action, ...}}
@@ -707,6 +712,18 @@ class GlobalLitterTracker:
                         )
                         if not escalate_violation and getattr(self, '_debug', False):
                             print(f"  [VIOLATION_SKIP_NO_VEHICLE fi={frame_index} litter={best_id} thrower={thrower_key}]")
+                        if best_id not in self._litter_event_seen_ids:
+                            # 首次確認:記一筆 litter 事件(events.jsonl 來源)。
+                            self._litter_event_seen_ids.add(best_id)
+                            _lx1, _ly1, _lx2, _ly2 = (int(v) for v in litter_box[:4])
+                            self._litter_events.append({
+                                'litter_id': int(best_id),
+                                'frame_index': int(frame_index),
+                                'bbox': [_lx1, _ly1, _lx2, _ly2],
+                                'center': [float(centroid[0]), float(centroid[1])],
+                                'thrower_key': list(thrower_key) if thrower_key is not None else None,
+                                'escalated': bool(escalate_violation),
+                            })
                         if escalate_violation and not l_data.get('backward_submitted', False):
                             self._submit_backward_resolution(
                                 litter_id=best_id,
@@ -909,6 +926,10 @@ class GlobalLitterTracker:
     def get_violator_info(self, actor_key):
         # detect.py 讀取 backward resolver 附加狀態，例如車牌遮擋時的無限警示。
         return dict(self.violators.get(actor_key, {}))
+
+    def get_litter_events(self):
+        # confirmed litter 事件(每 litter id 一筆,首次確認時記錄)。events.jsonl 來源。
+        return list(self._litter_events)
 
     def finalize_associations(self):
         """收尾:對全片輕量歷史跑 offline Person↔Vehicle 關聯(event-anchored + Hungarian + dustbin)。

@@ -14,6 +14,7 @@ from pipeline.litter_tracker import GlobalLitterTracker
 from pipeline.action import STGCNActionModule
 from pipeline.plate import disable_license_plate_models, preload_license_plate_models, wait_for_plate_jobs
 from pipeline.profiling import PipelineProfiler
+from pipeline.events import build_run_events, write_events_jsonl
 
 from pipeline.infra import (
     SUPPORTED_BATCH_SIZES,
@@ -485,6 +486,19 @@ if __name__ == "__main__":
                 json.dumps(run_summary, ensure_ascii=False, indent=2, sort_keys=True),
                 encoding="utf-8",
             )
+
+            # events.jsonl:前端監測台資料來源(與 summary.json 分離,不改變其行為)。
+            events_path = Path(final_output).with_name(
+                Path(final_output).stem + "_events.jsonl"
+            )
+            run_events = build_run_events(
+                litter_tracker.get_litter_events() if litter_tracker is not None else [],
+                vehicle_history,
+                run_summary,
+                fps,
+            )
+            n_events = write_events_jsonl(run_events, str(events_path))
+            print(f"Events written: {n_events} -> {events_path}")
 
             if litter_tracker is not None:
                 litter_tracker.close()
