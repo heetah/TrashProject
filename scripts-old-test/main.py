@@ -15,6 +15,7 @@ from pipeline.action import STGCNActionModule
 from pipeline.plate import disable_license_plate_models, preload_license_plate_models, wait_for_plate_jobs
 from pipeline.profiling import PipelineProfiler
 from pipeline.events import build_run_events, write_events_jsonl
+from pipeline.config import PipelineConfig
 
 from pipeline.infra import (
     SUPPORTED_BATCH_SIZES,
@@ -94,12 +95,14 @@ if __name__ == "__main__":
 
     try:
         with profiler.time_block("pipeline.total_wall"):
-            # 固定參數：batch=8，vehicle gate 永遠開啟（VEHICLE_GATE 預設 "1"），
-            # 快速偵測路徑（actor_mode=predict, rtdetr_zero_repair=off）永遠啟用。
-            _BATCH_SIZE = 8
-            _YOLO_SEG_FRAME_SKIP = 2
-            _ACTOR_MODE = "predict"
-            _RTDETR_ZERO_REPAIR = "off"
+            # 執行參數集中於 PipelineConfig(預設 = 原固定值,可用環境變數覆寫);
+            # vehicle gate 永遠開啟(VEHICLE_GATE 預設 "1"),快速偵測路徑
+            # (actor_mode=predict, rtdetr_zero_repair=off)永遠啟用。
+            cfg = PipelineConfig.from_env()
+            _BATCH_SIZE = cfg.batch_size
+            _YOLO_SEG_FRAME_SKIP = cfg.yolo_seg_frame_skip
+            _ACTOR_MODE = cfg.actor_mode
+            _RTDETR_ZERO_REPAIR = cfg.rtdetr_zero_repair
             _RTDETR_ENABLED = os.environ.get("RTDETR_ENABLED", "1") != "0"
 
             prefer_engine = True
@@ -141,12 +144,12 @@ if __name__ == "__main__":
                     pose_model_path=pose_model_candidates,
                     stgcn_weight_path=STGCN_WEIGHT_PATH,
                     stgcn_config_path=STGCN_CONFIG_PATH,
-                    action_threshold=0.5,
+                    action_threshold=cfg.action_threshold,
                     urinate_conf_high=None,
                     urinate_conf_low=None,
-                    window_size=100,
-                    urination_window_sec=8.0,
-                    urination_min_sec=5.0,
+                    window_size=cfg.action_window,
+                    urination_window_sec=cfg.urination_window_sec,
+                    urination_min_sec=cfg.urination_min_sec,
                     device=os.environ.get("ACTION_DEVICE"),
                     profiler=profiler,
                 )
@@ -269,15 +272,15 @@ if __name__ == "__main__":
                     height,
                     fps,
                     profiler=profiler,
-                    queue_size=16,
-                    preset="fast",
-                    crf=23,
-                    encoder="auto",
+                    queue_size=cfg.writer_queue_size,
+                    preset=cfg.writer_preset,
+                    crf=cfg.writer_crf,
+                    encoder=cfg.writer_encoder,
                 )
 
             # 垃圾反追蹤物件初始化
             with profiler.time_block("setup.litter_tracker"):
-                litter_tracker = GlobalLitterTracker(distance_threshold=250, fps=fps)
+                litter_tracker = GlobalLitterTracker(distance_threshold=cfg.litter_distance_threshold, fps=fps)
 
             # 紀錄車輛歷史軌跡
             vehicle_history = defaultdict(lambda: {
@@ -342,17 +345,17 @@ if __name__ == "__main__":
                                 fg_masks, litter_tracker, vehicle_history,
                                 fps=fps,
                                 violator_display_cache=violator_display_cache,
-                                violator_display_ttl=60,
-                                violator_display_max_jump=80.0,
+                                violator_display_ttl=cfg.violator_display_ttl,
+                                violator_display_max_jump=cfg.violator_display_max_jump,
                                 action_module=action_module,
                                 frame_start_index=frame_index,
                                 yolo_seg_frame_skip=_YOLO_SEG_FRAME_SKIP,
                                 yolo_seg_cache=yolo_seg_cache,
-                                bbox_conf=0.45,
-                                trash_conf=0.4,
+                                bbox_conf=cfg.bbox_conf,
+                                trash_conf=cfg.trash_conf,
                                 profiler=profiler,
-                                moving_threshold=0.25,
-                                core_moving_threshold=0.3,
+                                moving_threshold=cfg.moving_threshold,
+                                core_moving_threshold=cfg.core_moving_threshold,
                                 motion_min_component_area=DEFAULT_MOTION_MIN_COMPONENT_AREA,
                                 motion_min_largest_component_ratio=DEFAULT_MOTION_MIN_LARGEST_COMPONENT_RATIO,
                                 batch_size=_BATCH_SIZE,
@@ -363,7 +366,7 @@ if __name__ == "__main__":
                                 rtdetr_zero_repair=_RTDETR_ZERO_REPAIR,
                                 rtdetr_batch_context=rtdetr_batch_context,
                                 actor_mode=_ACTOR_MODE,
-                                actor_track_iou=0.3,
+                                actor_track_iou=cfg.actor_track_iou,
                                 prev_frames=prev_frames,
                             )
                             # Update last_frame for next batch
