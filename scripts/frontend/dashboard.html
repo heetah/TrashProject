@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>違規事件監測台</title>
+<style>
+  :root{
+    --bg:#faf9f5; --surface:#ffffff; --surface-1:#f4f2ec; --border:#e7e4da;
+    --text:#1f1e1b; --text-2:#6b6a63; --text-3:#96948a;
+    --accent:#2a6bd4; --danger:#c0392b; --warning:#b8791a; --success:#3b7a2f;
+    --bg-danger:#fbeaea; --bg-warning:#f8f0dd; --bg-success:#eaf3e2;
+    --radius:10px; --font:-apple-system,"Segoe UI",Roboto,"Noto Sans TC",sans-serif;
+    --mono:"SF Mono",ui-monospace,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#22201c; --surface:#2c2a25; --surface-1:#33302a; --border:#403c34;
+      --text:#eceae2; --text-2:#b0ada2; --text-3:#84817a;
+      --accent:#5a97e6; --danger:#e07a70; --warning:#e0a94a; --success:#7cbf68;
+      --bg-danger:#3a2622; --bg-warning:#3a3220; --bg-success:#26331f;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font);
+    line-height:1.6;padding:24px;font-size:15px}
+  .wrap{max-width:1040px;margin:0 auto}
+  header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;
+    flex-wrap:wrap;margin-bottom:20px}
+  h1{font-size:20px;font-weight:600;margin:0}
+  .sub{color:var(--text-3);font-size:13px;margin-top:2px}
+  .loaders{display:flex;gap:8px;flex-wrap:wrap}
+  label.file{display:inline-flex;align-items:center;gap:6px;font-size:13px;
+    border:1px solid var(--border);background:var(--surface);border-radius:var(--radius);
+    padding:7px 12px;cursor:pointer;color:var(--text-2)}
+  label.file:hover{border-color:var(--text-3)}
+  label.file input{display:none}
+  label.file.ok{border-color:var(--success);color:var(--success)}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
+  .card{background:var(--surface-1);border-radius:var(--radius);padding:14px 16px}
+  .card .k{font-size:13px;color:var(--text-2)}
+  .card .v{font-size:26px;font-weight:600;margin-top:2px}
+  .panel{background:var(--surface);border:1px solid var(--border);border-radius:12px;
+    padding:18px 20px;margin-bottom:16px}
+  .panel h2{font-size:15px;font-weight:600;margin:0 0 12px}
+  video{width:100%;border-radius:8px;background:#000;display:block}
+  .ev{display:flex;align-items:flex-start;gap:12px;padding:12px 0;border-top:1px solid var(--border)}
+  .ev:first-child{border-top:0}
+  .badge{font-size:12px;font-weight:500;padding:2px 10px;border-radius:999px;white-space:nowrap;flex:none}
+  .b-litter{background:var(--bg-danger);color:var(--danger)}
+  .b-urinate{background:var(--bg-warning);color:var(--warning)}
+  .ev .body{flex:1;min-width:0}
+  .ev .title{font-size:14px}
+  .ev .meta{font-size:12px;color:var(--text-3);margin-top:2px}
+  .mono{font-family:var(--mono)}
+  .plate{font-family:var(--mono);background:var(--surface-1);padding:1px 6px;border-radius:4px}
+  .branches{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
+  .branch{display:flex;align-items:center;gap:8px;font-size:14px}
+  .dot{width:8px;height:8px;border-radius:50%;flex:none}
+  .on{background:var(--success)} .off{background:var(--text-3)}
+  .empty{color:var(--text-3);font-size:14px;padding:8px 0}
+  footer{color:var(--text-3);font-size:12px;margin-top:20px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>違規事件監測台</h1>
+      <div class="sub">scripts 管線 · 讀取 summary.json 與 events.jsonl</div>
+    </div>
+    <div class="loaders">
+      <label class="file" id="l-sum">選擇 summary.json<input type="file" accept=".json" id="f-sum"></label>
+      <label class="file" id="l-ev">選擇 events.jsonl<input type="file" accept=".jsonl,.json" id="f-ev"></label>
+      <label class="file" id="l-vid">選擇標註影片<input type="file" accept="video/*" id="f-vid"></label>
+    </div>
+  </header>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="panel" id="videoPanel" style="display:none">
+    <h2>標註影片</h2>
+    <video id="video" controls></video>
+  </div>
+
+  <div class="panel">
+    <h2>違規事件 <span style="color:var(--text-3);font-weight:400;font-size:13px">(僅已確認)</span></h2>
+    <div id="events"><div class="empty">尚未載入 events.jsonl。</div></div>
+  </div>
+
+  <div class="panel">
+    <h2>管線分支狀態</h2>
+    <div class="branches" id="branches"><div class="empty">尚未載入 summary.json。</div></div>
+  </div>
+
+  <footer>一行一事件的 events.jsonl 由 pipeline.events 於每次 run 結束時寫出;本頁純前端,不上傳任何檔案。</footer>
+</div>
+
+<script>
+const S = { summary:null, events:null };
+
+function fmtTime(sec){
+  if(sec==null) return "—";
+  const m=Math.floor(sec/60), s=Math.floor(sec%60);
+  return `${m}:${String(s).padStart(2,"0")}`;
+}
+function el(tag, cls, html){ const e=document.createElement(tag); if(cls)e.className=cls; if(html!=null)e.innerHTML=html; return e; }
+
+function renderCards(){
+  const c=document.getElementById("cards"); c.innerHTML="";
+  const s=S.summary||{};
+  const items=[
+    ["確認亂丟", s.confirmed_litter_ids ?? "—", "danger"],
+    ["確認便溺", s.stgcn_urinate_confirmed ?? "—", "warning"],
+    ["回溯丟擲者", s.backtracked_thrower_ids ?? "—", "text"],
+    ["處理幀數", (s.processed_frames!=null? s.processed_frames+"/"+(s.total_frames??"?") : "—"), "text"],
+  ];
+  for(const [k,v,role] of items){
+    const card=el("div","card");
+    card.appendChild(el("div","k",k));
+    const val=el("div","v",String(v));
+    if(role!=="text") val.style.color=`var(--${role})`;
+    card.appendChild(val); c.appendChild(card);
+  }
+}
+
+function renderEvents(){
+  const box=document.getElementById("events"); box.innerHTML="";
+  if(!S.events){ box.appendChild(el("div","empty","尚未載入 events.jsonl。")); return; }
+  if(S.events.length===0){ box.appendChild(el("div","empty","此 run 沒有已確認的違規事件。")); return; }
+  for(const ev of S.events){
+    const row=el("div","ev");
+    if(ev.type==="litter"){
+      row.appendChild(el("span","badge b-litter","亂丟垃圾"));
+      const body=el("div","body");
+      const thrower = ev.thrower ? `${ev.thrower.cls} #${ev.thrower.track_id}` : "未關聯丟擲者";
+      body.appendChild(el("div","title",`Litter #${ev.litter_id} 確認 · 回溯 ${thrower}`));
+      const plate = ev.license_plate ? `車牌 <span class="plate">${ev.license_plate}</span>`
+                    : (ev.escalated ? "車牌辨識中…" : "未升級為違規");
+      body.appendChild(el("div","meta",`${fmtTime(ev.time_sec)} · frame ${ev.frame_index} · ${plate}`));
+      row.appendChild(body);
+    }else if(ev.type==="urinate"){
+      row.appendChild(el("span","badge b-urinate","隨地便溺"));
+      const body=el("div","body");
+      if(ev.track_id!=null){
+        body.appendChild(el("div","title",`person #${ev.track_id} · STGCN 信心 ${(ev.conf??0).toFixed(2)}`));
+        body.appendChild(el("div","meta",`${fmtTime(ev.time_sec)} · frame ${ev.frame_index} · 證據累積 ${ev.evidence_sec} 秒`));
+      }else{
+        body.appendChild(el("div","title",`STGCN 確認便溺`));
+        body.appendChild(el("div","meta",`確認幀數 ${ev.confirmed_count}`));
+      }
+      row.appendChild(body);
+    }
+    box.appendChild(row);
+  }
+}
+
+function renderBranches(){
+  const box=document.getElementById("branches"); box.innerHTML="";
+  if(!S.summary){ box.appendChild(el("div","empty","尚未載入 summary.json。")); return; }
+  const s=S.summary;
+  const items=[
+    ["YOLO-Pose + STGCN", s.stgcn_pose_enabled],
+    ["RTDETR 垃圾偵測", s.rtdetr_enabled],
+    ["PaddleOCR 車牌", s.plate_enabled],
+    ["確認亂丟事件", s.has_confirm_litter],
+  ];
+  for(const [name,on] of items){
+    const b=el("div","branch");
+    b.appendChild(el("span","dot "+(on?"on":"off")));
+    b.appendChild(el("span",null,name));
+    box.appendChild(b);
+  }
+}
+
+function refresh(){ renderCards(); renderEvents(); renderBranches(); }
+
+function bindFile(inputId,labelId,onLoad){
+  document.getElementById(inputId).addEventListener("change",e=>{
+    const file=e.target.files[0]; if(!file) return;
+    const r=new FileReader();
+    r.onload=()=>{ try{ onLoad(r.result,file.name); document.getElementById(labelId).classList.add("ok"); }
+      catch(err){ alert("解析失敗:"+err.message); } refresh(); };
+    r.readAsText(file);
+  });
+}
+bindFile("f-sum","l-sum",(txt)=>{ S.summary=JSON.parse(txt); });
+bindFile("f-ev","l-ev",(txt)=>{
+  S.events=txt.split(/\r?\n/).filter(l=>l.trim()).map(l=>JSON.parse(l));
+});
+document.getElementById("f-vid").addEventListener("change",e=>{
+  const file=e.target.files[0]; if(!file) return;
+  document.getElementById("videoPanel").style.display="";
+  document.getElementById("video").src=URL.createObjectURL(file);
+  document.getElementById("l-vid").classList.add("ok");
+});
+
+refresh();
+</script>
+</body>
+</html>

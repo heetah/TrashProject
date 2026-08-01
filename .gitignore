@@ -8,9 +8,7 @@ modules_weight/
 output/
 resources/
 runs/
-scripts-fusion-heetah/
 scripts-fusion-stable/
-scripts-old-test copy/
 test_ocr/
 work_dirs/
 .codex
@@ -28,8 +26,4 @@ scripts-old-stable/tests/__init__.py
 scripts-old-stable/tests/test_detect_4c.py
 scripts-old-stable/tests/test_litter_tracker_4c.py
 scripts-old-stable/tests/test_pipeline_cases.py
-scripts-old-test/tests/__init__.py
-scripts-old-test/tests/test_detect_4c.py
-scripts-old-test/tests/test_litter_tracker_4c.py
-scripts-old-test/tests/test_pipeline_cases.py
-tests/test_litter_regression.py
+artifacts/

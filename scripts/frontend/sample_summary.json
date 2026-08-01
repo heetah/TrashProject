@@ -1,0 +1,17 @@
+{
+  "backtracked_thrower_ids": 2,
+  "confirmed_litter_ids": 2,
+  "confirmed_litter_thrower_ids": 2,
+  "has_confirm_litter": true,
+  "has_littering": false,
+  "has_urinate": true,
+  "input_video": "resize.mp4",
+  "output_video": "resize_annotated.mp4",
+  "person_detections": 3,
+  "plate_enabled": true,
+  "processed_frames": 4050,
+  "rtdetr_enabled": true,
+  "stgcn_pose_enabled": true,
+  "stgcn_urinate_confirmed": 1,
+  "total_frames": 4050
+}
