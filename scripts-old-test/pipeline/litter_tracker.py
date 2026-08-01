@@ -4,6 +4,7 @@ import math
 import os
 import queue
 import threading
+import time
 import numpy as np
 from collections import deque
 from scipy.spatial import distance
@@ -233,6 +234,7 @@ class GlobalLitterTracker:
         # 每個 litter id 於「首次確認」記一次,含 frame、bbox、thrower、是否升級為違規。
         self._litter_events = []
         self._litter_event_seen_ids = set()
+        self._litter_events_by_id = {}
 
         # === Mutable state ===
         self.active_litters = {}            # {litter_id: {bbox, history, age, state, thrower_key, ...}}
@@ -243,7 +245,23 @@ class GlobalLitterTracker:
         self._dismount_edges = {}
         self._current_frame_index = 0
         self.actor_frame_history = deque(maxlen=BACKWARD_ACTOR_HISTORY_LEN)
+        self._smart_context_frames = max(
+            BACKWARD_PRE_BIRTH_FRAMES,
+            int(round(
+                self.fps
+                * max(
+                    1.0,
+                    _backtrack_float_env("SMART_BACKTRACK_CONTEXT_SEC", 10.0),
+                )
+            )),
+        )
+        # Longer history is lightweight (no image ROI); short ring above keeps
+        # only OCR crops and bounds image memory.
+        self._smart_actor_history = deque(
+            maxlen=self._smart_context_frames + BACKWARD_POST_BIRTH_FRAMES + 2
+        )
         self.backward_plate_roi_items = []
+        self._actor_tracklet_epochs = {}
 
         # BEV 基板：跨幀累積車輛/機車底邊中心 + 高度，擬合穩定地面平面並快取。
         self._bev_bottoms = deque(maxlen=self._bev_buffer_cap)
@@ -258,6 +276,29 @@ class GlobalLitterTracker:
         self._backward_tasks = queue.Queue(maxsize=64)
         self._backward_results = queue.Queue()
         self._backward_stop = object()
+        self._backward_accepting = True
+        self._backward_stop_sent = False
+        self._closed = False
+        self._backtrack_revisions = {}
+        self._applied_backtrack_revisions = {}
+        self._applied_backtrack_signatures = {}
+        self._backtrack_marked_keys = {}
+        self._smart_candidate_tables = {}
+        self._smart_tasks = {}
+        self._smart_backtrack_enabled = (
+            os.environ.get("SMART_BACKTRACK", "1") not in ("0", "")
+        )
+        self._smart_resolver = None
+        if self._smart_backtrack_enabled:
+            try:
+                from pipeline.backtrack.resolver import SmartBacktrackResolver
+                self._smart_resolver = SmartBacktrackResolver(fps=self.fps)
+                # Do not accumulate/run the legacy one-person↔one-vehicle matrix
+                # only after smart initialization actually succeeds.
+                self._pv_assoc_enabled = False
+            except Exception as exc:  # noqa: BLE001 - legacy resolver remains safe fallback
+                self._smart_backtrack_enabled = False
+                print(f"[SMART_BACKTRACK] initialization failed; legacy fallback: {exc}")
         self._backward_thread = threading.Thread(
             target=self._backward_worker,
             name="litter-backward-resolver",
@@ -357,9 +398,16 @@ class GlobalLitterTracker:
                 l_data['history'].append(centroid)
                 if len(l_data['history']) > self.trajectory_history_len:
                     l_data['history'].pop(0)
+                history_boxes = list(l_data.get('history_boxes', []))
+                history_confidences = list(l_data.get('history_confidences', []))
+                history_boxes.append(tuple(map(float, litter_box[:4])))
+                history_confidences.append(float(litter_box[4]))
+                history_boxes = history_boxes[-self.trajectory_history_len:]
+                history_confidences = history_confidences[-self.trajectory_history_len:]
 
                 age = l_data.get('age', 1) + 1
                 state = l_data.get('state', 'pending')
+                backward_submitted = bool(l_data.get('backward_submitted', False))
                 
                 # 繼承剛出生時記錄的肇事者，並在 pending 階段依 homography 座標重新評分。
                 thrower_key = l_data.get('thrower_key')
@@ -635,16 +683,27 @@ class GlobalLitterTracker:
                             # 首次確認:記一筆 litter 事件(events.jsonl 來源)。
                             self._litter_event_seen_ids.add(best_id)
                             _lx1, _ly1, _lx2, _ly2 = (int(v) for v in litter_box[:4])
-                            self._litter_events.append({
+                            event = {
                                 'litter_id': int(best_id),
                                 'frame_index': int(frame_index),
                                 'bbox': [_lx1, _ly1, _lx2, _ly2],
                                 'center': [float(centroid[0]), float(centroid[1])],
                                 'thrower_key': list(thrower_key) if thrower_key is not None else None,
+                                'vehicle_key': None,
                                 'escalated': bool(escalate_violation),
-                            })
-                        if escalate_violation and not l_data.get('backward_submitted', False):
-                            self._submit_backward_resolution(
+                                'backtrack_status': (
+                                    'pending' if self._smart_backtrack_enabled else 'legacy'
+                                ),
+                            }
+                            self._litter_events.append(event)
+                            self._litter_events_by_id[int(best_id)] = event
+                        # Smart resolver 必須看所有 confirmed litter；舊的 require_vehicle
+                        # 只能決定最後是否升級，不能在推理前把候選事件擋掉。
+                        if (
+                            (self._smart_backtrack_enabled or escalate_violation)
+                            and not backward_submitted
+                        ):
+                            backward_submitted = self._submit_backward_resolution(
                                 litter_id=best_id,
                                 litter_data=l_data,
                                 current_bbox=litter_box,
@@ -653,7 +712,11 @@ class GlobalLitterTracker:
                                 prev_thrower_key=thrower_key,
                             )
 
-                        if escalate_violation and thrower_key is not None:
+                        if (
+                            not self._smart_backtrack_enabled
+                            and escalate_violation
+                            and thrower_key is not None
+                        ):
                             # confirmed 後標記 thrower；若該人綁定車輛，也同步標記車輛。
                             current_actor_center = thrower_center # 預設為舊位置
                             
@@ -701,7 +764,10 @@ class GlobalLitterTracker:
                     'birth_centroid': l_data.get('birth_centroid', l_data['history'][0]),
                     'birth_bbox': l_data.get('birth_bbox', l_data.get('bbox')),
                     'history_frames': (l_data.get('history_frames', []) + [frame_index])[-TRAJECTORY_HISTORY_LEN:],
-                    'backward_submitted': l_data.get('backward_submitted', False) or state == 'confirmed',
+                    'history_boxes': history_boxes,
+                    'history_confidences': history_confidences,
+                    # Queue 滿或 worker 尚未接受時保持 False，下一次 update 可重試。
+                    'backward_submitted': backward_submitted,
                     'backward_result': l_data.get('backward_result'),
                     'stationary_locked': bool(l_data.get('stationary_locked', False)),
                     'ref_shape': (
@@ -744,6 +810,8 @@ class GlobalLitterTracker:
                     'birth_centroid': centroid,
                     'birth_bbox': litter_box,
                     'history_frames': [frame_index],
+                    'history_boxes': [tuple(map(float, litter_box[:4]))],
+                    'history_confidences': [float(litter_box[4])],
                     'backward_submitted': False,
                     'backward_result': None,
                     'stationary_locked': inherit_locked,
@@ -757,7 +825,7 @@ class GlobalLitterTracker:
                 new_active_litters[l_id] = l_data
         
         self.active_litters = new_active_litters
-        self._drain_backward_results()
+        self._drain_backward_results(vehicle_history=vehicle_history)
 
         # 第五段：僅回傳本幀中位置連續的違規者；允許短暫 miss 與同類別近距離 rebind。
         active_violator_keys = set()
@@ -819,14 +887,92 @@ class GlobalLitterTracker:
         return self.active_litters, active_violator_keys
 
     def close(self, timeout=2.0):
-        # 結束 backward worker；daemon 可兜底，但正常釋放可避免測試殘留 thread。
-        try:
-            self._backward_tasks.put(self._backward_stop, timeout=timeout)
-        except queue.Full:
-            pass
+        # idempotent：正常 EOF 會先 finalize；例外路徑則由 close 負責兜底。
+        if self._closed:
+            return
+        self.finalize_backtracking(timeout=timeout)
+        self._closed = True
+
+    def finalize_backtracking(self, vehicle_history=None, timeout=8.0):
+        """Flush worker, solve final event-expanded MCF, then update events.
+
+        必須在 summary/events 寫檔之前呼叫，否則影片尾端的 attribution
+        仍停留在 provisional thrower。
+        """
+        if hasattr(self, '_final_backtrack_summary'):
+            self._drain_backward_results(vehicle_history=vehicle_history)
+            return dict(self._final_backtrack_summary)
+
+        self._backward_accepting = False
+        deadline = time.monotonic() + max(float(timeout), 0.0)
+        while (
+            getattr(self._backward_tasks, 'unfinished_tasks', 0) > 0
+            and time.monotonic() < deadline
+        ):
+            self._drain_backward_results(vehicle_history=vehicle_history)
+            time.sleep(0.01)
+
+        if not self._backward_stop_sent:
+            try:
+                remaining = max(0.01, deadline - time.monotonic())
+                self._backward_tasks.put(
+                    self._backward_stop,
+                    timeout=min(remaining, 0.5),
+                )
+                self._backward_stop_sent = True
+            except queue.Full:
+                pass
         if self._backward_thread.is_alive():
-            self._backward_thread.join(timeout=timeout)
-        self._drain_backward_results()
+            self._backward_thread.join(
+                timeout=max(0.0, deadline - time.monotonic())
+            )
+        self._drain_backward_results(vehicle_history=vehicle_history)
+
+        # Final authority: all completed per-event candidate tables are solved
+        # together. Actor capacities remain unlimited by design (one car/many people).
+        final_resolutions = {}
+        if self._smart_resolver is not None and self._smart_candidate_tables:
+            try:
+                final_resolutions = self._smart_resolver.solve_routes(
+                    self._smart_candidate_tables
+                )
+            except Exception as exc:  # noqa: BLE001
+                if self._debug:
+                    print(f"  [SMART_BACKTRACK final-flow failed: {exc}]")
+        for litter_id, resolution in final_resolutions.items():
+            task = self._smart_tasks.get(int(litter_id))
+            if task is None:
+                continue
+            task = dict(task)
+            task['revision'] = max(
+                int(task.get('revision', 0)),
+                int(self._applied_backtrack_revisions.get(int(litter_id), 0)),
+            ) + 1
+            result = self._smart_resolution_result(resolution, task)
+            self._apply_backward_result(result, vehicle_history=vehicle_history)
+
+        statuses = [
+            str(event.get('backtrack_status', 'pending'))
+            for event in self._litter_events
+        ]
+        summary = {
+            'enabled': bool(self._smart_backtrack_enabled),
+            'solver': 'kalman_rts_reverse_trajectory_min_cost_flow',
+            'events': len(self._litter_events),
+            'candidate_tables': len(self._smart_candidate_tables),
+            'resolved': sum(status == 'resolved' for status in statuses),
+            'dustbin': sum(status == 'dustbin' for status in statuses),
+            'legacy': sum(status == 'legacy' for status in statuses),
+            'pending': sum(status == 'pending' for status in statuses),
+            'worker_flushed': not self._backward_thread.is_alive(),
+            'person_capacity': 'unbounded',
+            'vehicle_capacity': 'unbounded',
+        }
+        # A timeout is observable, not a permanent final state. Do not cache it:
+        # a second finalize/close call can still join, drain and re-solve.
+        if summary['worker_flushed']:
+            self._final_backtrack_summary = summary
+        return dict(summary)
 
     def consume_backward_plate_roi_items(self):
         # detect.py 取走 backward worker 找到的歷史車輛 ROI，交給車牌 OCR 背景任務。
@@ -850,9 +996,48 @@ class GlobalLitterTracker:
         # confirmed litter 事件(每 litter id 一筆,首次確認時記錄)。events.jsonl 來源。
         return list(self._litter_events)
 
+    def get_backtrack_candidate_records(
+        self,
+        input_video,
+        output_video=None,
+    ):
+        """Return JSON-safe research records for every confirmed litter event.
+
+        Candidate diagnostics intentionally live in a separate sidecar rather
+        than the frontend events JSONL.  Include incomplete/pending events too,
+        otherwise candidate-generation failures disappear from evaluation.
+        Call after ``finalize_backtracking()`` for authoritative assignments.
+        """
+
+        from pipeline.backtrack.sidecar import build_candidate_record
+
+        records = []
+        for event in sorted(
+            self._litter_events,
+            key=lambda item: (
+                int(item.get('frame_index', 0)),
+                int(item.get('litter_id', -1)),
+            ),
+        ):
+            litter_id = int(event.get('litter_id', -1))
+            records.append(
+                build_candidate_record(
+                    task=self._smart_tasks.get(litter_id, {}),
+                    event=event,
+                    routes=self._smart_candidate_tables.get(litter_id, []),
+                    input_video=input_video,
+                    output_video=output_video,
+                )
+            )
+        return records
+
     def finalize_associations(self):
         """收尾:對全片輕量歷史跑 offline Person↔Vehicle 關聯(event-anchored + Hungarian + dustbin)。
         回傳 JSON-serializable dict;PV_ASSOC 關閉或無資料時回 None。主迴圈結束後呼叫一次。"""
+        # Smart mode 的 Hungarian 僅限 detector frame↔frame identity。
+        # 舊 P↔V 1-to-1 Hungarian 不得覆蓋 many-to-many flow assignment。
+        if self._smart_backtrack_enabled:
+            return None
         if not self._pv_assoc_enabled or not self._pv_full_history:
             return None
 
@@ -924,9 +1109,37 @@ class GlobalLitterTracker:
             snapshot = {
                 'cls': cls_name,
                 'track_id': track_id,
+                'actor_key': (cls_name, track_id),
                 'box': box,
                 'center': self._box_center(box),
+                'footpoint': ((box[0] + box[2]) / 2.0, box[3]),
+                'confidence': float(
+                    actor.get('confidence', actor.get('pose_conf', actor.get('conf', 1.0)))
+                ),
+                'observed': bool(actor.get('observed', True)),
+                'source': str(actor.get('source', 'detector')),
+                'frame_index': int(frame_index),
+                'frame_size': (int(frame_w), int(frame_h)),
             }
+
+            # Track ID 可能被外部 tracker 回收。長時間中斷後重現時增加 epoch，
+            # 成本層可用 tracklet_uid 區分物理上不同的軌跡。
+            actor_key = (cls_name, track_id)
+            uid_state = self._actor_tracklet_epochs.get(actor_key)
+            gap_limit = max(int(round(self.fps * 2.0)), 2)
+            if uid_state is None:
+                uid_state = {'epoch': 0, 'last_frame': int(frame_index)}
+            elif int(frame_index) - int(uid_state['last_frame']) > gap_limit:
+                uid_state = {
+                    'epoch': int(uid_state.get('epoch', 0)) + 1,
+                    'last_frame': int(frame_index),
+                }
+            else:
+                uid_state['last_frame'] = int(frame_index)
+            self._actor_tracklet_epochs[actor_key] = uid_state
+            snapshot['tracklet_uid'] = "{}:{}:{}".format(
+                cls_name, track_id, int(uid_state['epoch'])
+            )
 
             if frame is not None and cls_name in ('vehicle', 'scooter'):
                 roi = self._crop_actor_roi(frame, box, frame_w, frame_h)
@@ -944,6 +1157,17 @@ class GlobalLitterTracker:
                 'frame_index': int(frame_index),
                 'actors': actor_snapshots,
             })
+            self._smart_actor_history.append({
+                'frame_index': int(frame_index),
+                'actors': [
+                    {
+                        key: value
+                        for key, value in snapshot.items()
+                        if key != 'plate_roi'
+                    }
+                    for snapshot in actor_snapshots
+                ],
+            })
 
         if self._pv_assoc_enabled:
             # 全片不截斷的輕量歷史(去 plate_roi 省記憶);主執行緒 only,finalize 在 join 後讀。
@@ -951,7 +1175,9 @@ class GlobalLitterTracker:
                 'frame_index': int(frame_index),
                 'actors': [
                     {'cls': s['cls'], 'track_id': s['track_id'],
-                     'box': s['box'], 'center': s['center']}
+                     'box': s['box'], 'center': s['center'],
+                     'confidence': s['confidence'], 'observed': s['observed'],
+                     'source': s['source'], 'tracklet_uid': s['tracklet_uid']}
                     for s in actor_snapshots
                 ],
             })
@@ -965,11 +1191,20 @@ class GlobalLitterTracker:
     def _submit_backward_resolution(self, litter_id, litter_data, current_bbox,
                                     current_centroid, confirm_frame, prev_thrower_key=None):
         # task 用 immutable snapshot，worker 不碰 main thread 追蹤狀態。
+        if not self._backward_accepting:
+            return False
         birth_frame = int(litter_data.get('birth_frame', confirm_frame))
         birth_centroid = tuple(litter_data.get('birth_centroid', litter_data['history'][0]))
         birth_bbox = litter_data.get('birth_bbox', litter_data.get('bbox', current_bbox))
         history = [tuple(p) for p in litter_data.get('history', [])]
         history_frames = [int(f) for f in litter_data.get('history_frames', [])]
+        history_boxes = [
+            tuple(map(float, box[:4]))
+            for box in litter_data.get('history_boxes', [])
+        ]
+        history_confidences = [
+            float(value) for value in litter_data.get('history_confidences', [])
+        ]
         if len(history_frames) == len(history) - 1:
             # confirm 發生在 update 迴圈中段:history 已 append 本幀質心(L343),但
             # history_frames 要到幀尾 dict 重建才補 → 這裡用 confirm_frame 補齊,
@@ -978,9 +1213,37 @@ class GlobalLitterTracker:
         if not history or history[-1] != tuple(current_centroid):
             history.append(tuple(current_centroid))
             history_frames.append(int(confirm_frame))
+        if len(history_boxes) == len(history) - 1:
+            history_boxes.append(tuple(map(float, current_bbox[:4])))
+        if len(history_confidences) == len(history) - 1:
+            history_confidences.append(
+                float(current_bbox[4]) if len(current_bbox) > 4 else 1.0
+            )
 
         with self._actor_history_lock:
+            history_source = (
+                self._smart_actor_history
+                if self._smart_backtrack_enabled
+                else self.actor_frame_history
+            )
+            pre_birth_frames = (
+                self._smart_context_frames
+                if self._smart_backtrack_enabled
+                else BACKWARD_PRE_BIRTH_FRAMES
+            )
             actor_frames = [
+                {
+                    'frame_index': item['frame_index'],
+                    'actors': [dict(actor) for actor in item.get('actors', [])],
+                }
+                for item in history_source
+                if (
+                    birth_frame - pre_birth_frames
+                    <= int(item.get('frame_index', -1))
+                    <= int(confirm_frame) + BACKWARD_POST_BIRTH_FRAMES
+                )
+            ]
+            plate_actor_frames = [
                 {
                     'frame_index': item['frame_index'],
                     'actors': [dict(actor) for actor in item.get('actors', [])],
@@ -996,8 +1259,12 @@ class GlobalLitterTracker:
         if not actor_frames:
             return False
 
+        revision = int(self._backtrack_revisions.get(int(litter_id), 0)) + 1
         task = {
+            'schema_version': 1,
             'litter_id': int(litter_id),
+            'revision': revision,
+            'fps': float(self.fps),
             'birth_frame': birth_frame,
             'confirm_frame': int(confirm_frame),
             'birth_centroid': birth_centroid,
@@ -1006,15 +1273,32 @@ class GlobalLitterTracker:
             'current_centroid': tuple(current_centroid),
             'history': history,
             'history_frames': history_frames,
+            'history_boxes': history_boxes,
+            'history_confidences': history_confidences,
             'prev_thrower_key': prev_thrower_key,
             'actor_frames': actor_frames,
+            'plate_actor_frames': plate_actor_frames,
         }
 
         try:
             self._backward_tasks.put_nowait(task)
+            self._backtrack_revisions[int(litter_id)] = revision
+            if self._smart_backtrack_enabled:
+                self._smart_tasks[int(litter_id)] = task
             return True
         except queue.Full:
-            return False
+            # confirmed task 不可永久遺失。飽和是罕見情況，主執行緒同步
+            # fallback 一次，比把事件永遠標成 submitted 更安全。
+            try:
+                result = self._resolve_backward_task(task)
+                if result is not None:
+                    self._backward_results.put(result)
+                self._backtrack_revisions[int(litter_id)] = revision
+                if self._smart_backtrack_enabled:
+                    self._smart_tasks[int(litter_id)] = task
+                return True
+            except Exception:
+                return False
 
     def _backward_worker(self):
         # 第三條 worker thread：只做 CPU 幾何評分，不阻塞主推論 thread。
@@ -1038,6 +1322,122 @@ class GlobalLitterTracker:
                     pass
 
     def _resolve_backward_task(self, task):
+        """Run smart attribution first; legacy heuristic is an exception fallback."""
+        if self._smart_resolver is not None:
+            try:
+                resolution = self._smart_resolver.resolve_task(task)
+                return self._smart_resolution_result(resolution, task)
+            except Exception as exc:  # noqa: BLE001 - keep production pipeline alive
+                if self._debug:
+                    print(
+                        f"  [SMART_BACKTRACK litter={task.get('litter_id')} "
+                        f"fallback={type(exc).__name__}: {exc}]"
+                    )
+        legacy_task = dict(task)
+        legacy_task['actor_frames'] = task.get(
+            'plate_actor_frames', task.get('actor_frames', [])
+        )
+        result = self._resolve_backward_task_legacy(legacy_task)
+        if result is not None:
+            actor_key = result.get('actor_key')
+            plate_key = result.get('plate_key')
+            if actor_key is not None:
+                actor_key = tuple(actor_key)
+            if plate_key is not None:
+                plate_key = tuple(plate_key)
+            if actor_key is not None and actor_key[0] == 'person':
+                result['person_key'] = actor_key
+                result['vehicle_key'] = plate_key
+                result['direct_vehicle'] = False
+                result['route_type'] = (
+                    'person_vehicle' if plate_key is not None else 'person'
+                )
+            elif actor_key is not None and actor_key[0] in ('vehicle', 'scooter'):
+                result['person_key'] = None
+                result['vehicle_key'] = actor_key
+                result['direct_vehicle'] = True
+                result['route_type'] = 'direct_vehicle'
+            result['revision'] = int(task.get('revision', 0))
+            result['status'] = 'legacy'
+        return result
+
+    def _smart_resolution_result(self, resolution, task):
+        person_key = resolution.person_key
+        vehicle_key = resolution.vehicle_key
+        actor_key = resolution.actor_key
+        release_frame = (
+            int(resolution.release_frame)
+            if resolution.release_frame is not None
+            else int(task.get('birth_frame', 0))
+        )
+
+        def _center_near(key):
+            if key is None:
+                return None
+            frames = sorted(
+                task.get('actor_frames', []),
+                key=lambda item: abs(
+                    int(item.get('frame_index', release_frame)) - release_frame
+                ),
+            )
+            for frame_snapshot in frames:
+                center = self._snapshot_center_for_key(
+                    key, frame_snapshot.get('actors', [])
+                )
+                if center is not None:
+                    return center
+            return None
+
+        mark_items = []
+        if person_key is not None:
+            mark_items.append({
+                'actor_key': person_key,
+                'center': _center_near(person_key),
+            })
+        if vehicle_key is not None:
+            mark_items.append({
+                'actor_key': vehicle_key,
+                'center': _center_near(vehicle_key),
+            })
+        plate_roi_items = (
+            self._plate_roi_items_for_key(
+                vehicle_key,
+                task.get('plate_actor_frames', task.get('actor_frames', [])),
+                int(task.get('birth_frame', release_frame)),
+            )
+            if vehicle_key is not None
+            else []
+        )
+        return {
+            'litter_id': int(task.get('litter_id', resolution.litter_id)),
+            'revision': int(task.get('revision', 0)),
+            'status': (
+                'dustbin' if actor_key is None and vehicle_key is None else 'resolved'
+            ),
+            'actor_key': actor_key,
+            'person_key': person_key,
+            'vehicle_key': vehicle_key,
+            'direct_vehicle': bool(resolution.direct_vehicle),
+            'score': float(resolution.total_cost),
+            'margin_to_second': resolution.margin_to_second,
+            'route_type': str(resolution.route_type),
+            'route_id': str(resolution.route_id),
+            'release_frame': resolution.release_frame,
+            'release_point': resolution.release_point,
+            'release_covariance': resolution.release_covariance,
+            'components': dict(resolution.components),
+            'route_candidates': list(resolution.routes),
+            'birth_frame': int(task.get('birth_frame', 0)),
+            'confirm_frame': int(task.get('confirm_frame', task.get('birth_frame', 0))),
+            'mark_items': mark_items,
+            'plate_key': vehicle_key,
+            'plate_roi_items': plate_roi_items,
+            'plate_blocked_since_litter': (
+                vehicle_key is not None and not plate_roi_items
+            ),
+        }
+
+    def _resolve_backward_task_legacy(self, task):
         birth_ref = task.get('birth_bbox')
         if birth_ref is None:
             birth_ref = task.get('birth_centroid')
@@ -1296,58 +1696,173 @@ class GlobalLitterTracker:
                 result = self._backward_results.get_nowait()
             except queue.Empty:
                 break
+            self._apply_backward_result(result, vehicle_history=vehicle_history)
 
-            if result.get('error'):
-                continue
+    @staticmethod
+    def _json_actor_key(actor_key):
+        return list(actor_key) if actor_key is not None else None
 
-            litter_id = result.get('litter_id')
-            actor_key = result.get('actor_key')
-            if actor_key is None:
-                continue
+    def _apply_backward_result(self, result, vehicle_history=None):
+        if not isinstance(result, dict) or result.get('error'):
+            return False
+        litter_id = result.get('litter_id')
+        if litter_id is None:
+            return False
+        litter_id = int(litter_id)
+        revision = int(result.get('revision', 0))
+        if revision < int(self._applied_backtrack_revisions.get(litter_id, -1)):
+            return False
+        self._applied_backtrack_revisions[litter_id] = revision
 
-            if litter_id in self.active_litters:
-                self.active_litters[litter_id]['thrower_key'] = actor_key
-                self.active_litters[litter_id]['thrower_center'] = result.get('mark_items', [{}])[0].get('center')
-                self.active_litters[litter_id]['backward_result'] = {
-                    'actor_key': actor_key,
-                    'score': result.get('score'),
-                    'birth_frame': result.get('birth_frame'),
-                    'confirm_frame': result.get('confirm_frame'),
-                }
+        route_candidates = result.get('route_candidates')
+        if route_candidates is not None:
+            self._smart_candidate_tables[litter_id] = list(route_candidates)
 
-            plate_key = result.get('plate_key')
-            plate_blocked_since_litter = bool(result.get('plate_blocked_since_litter', False))
+        actor_key = result.get('actor_key')
+        person_key = result.get('person_key')
+        vehicle_key = result.get('vehicle_key')
+        status = str(result.get('status', 'legacy'))
+        if actor_key is not None:
+            actor_key = tuple(actor_key)
+        if person_key is not None:
+            person_key = tuple(person_key)
+        if vehicle_key is not None:
+            vehicle_key = tuple(vehicle_key)
 
+        has_vehicle = (
+            vehicle_key is not None
+            or (actor_key is not None and actor_key[0] in ('vehicle', 'scooter'))
+        )
+        escalated = (
+            actor_key is not None
+            and (not self.require_vehicle_for_violation or has_vehicle)
+        )
+        assignment_signature = (
+            actor_key,
+            person_key,
+            vehicle_key,
+            status,
+            result.get('route_id'),
+            bool(escalated),
+        )
+        same_assignment = (
+            self._applied_backtrack_signatures.get(litter_id)
+            == assignment_signature
+        )
+        self._applied_backtrack_signatures[litter_id] = assignment_signature
+
+        compact_result = {
+            'status': status,
+            'actor_key': actor_key,
+            'person_key': person_key,
+            'vehicle_key': vehicle_key,
+            'direct_vehicle': bool(result.get('direct_vehicle', False)),
+            'score': result.get('score'),
+            'margin_to_second': result.get('margin_to_second'),
+            'route_type': result.get('route_type'),
+            'route_id': result.get('route_id'),
+            'release_frame': result.get('release_frame'),
+            'release_point': result.get('release_point'),
+            'release_covariance': result.get('release_covariance'),
+            'components': result.get('components'),
+            'birth_frame': result.get('birth_frame'),
+            'confirm_frame': result.get('confirm_frame'),
+            'revision': revision,
+        }
+        if litter_id in self.active_litters:
+            first_mark = (result.get('mark_items') or [{}])[0]
+            self.active_litters[litter_id]['thrower_key'] = actor_key
+            self.active_litters[litter_id]['thrower_center'] = first_mark.get('center')
+            self.active_litters[litter_id]['backward_result'] = compact_result
+
+        event = self._litter_events_by_id.get(litter_id)
+        if event is None:
+            # Backward-compatible recovery for tests/old injected events.
+            event = next(
+                (
+                    item for item in self._litter_events
+                    if int(item.get('litter_id', -1)) == litter_id
+                ),
+                None,
+            )
+            if event is not None:
+                self._litter_events_by_id[litter_id] = event
+        if event is not None:
+            event['thrower_key'] = self._json_actor_key(actor_key)
+            event['vehicle_key'] = self._json_actor_key(vehicle_key)
+            event['escalated'] = bool(escalated)
+            event['backtrack_status'] = status
+            event['backtrack'] = compact_result
+
+        new_marked_keys = (
+            {
+                tuple(mark['actor_key'])
+                for mark in result.get('mark_items', [])
+                if mark.get('actor_key') is not None
+            }
+            if escalated
+            else set()
+        )
+        previous_marked_keys = set(
+            self._backtrack_marked_keys.get(litter_id, set())
+        )
+        self._backtrack_marked_keys[litter_id] = new_marked_keys
+        for stale_key in previous_marked_keys - new_marked_keys:
+            still_referenced = any(
+                stale_key in keys
+                for other_litter_id, keys in self._backtrack_marked_keys.items()
+                if int(other_litter_id) != litter_id
+            )
             if (
-                plate_blocked_since_litter and
-                plate_key is not None and
-                plate_key[0] in ('vehicle', 'scooter') and
-                vehicle_history is not None
+                not still_referenced
+                and self.violators.get(stale_key, {}).get('action') == 'littering'
             ):
-                plate_entry = vehicle_history[plate_key[1]]
-                if plate_entry.get('license_plate') is None:
-                    plate_entry['plate_search_until_found'] = True
-                    plate_entry['plate_blocked_since_litter'] = True
-                    plate_entry['plate_search_birth_frame'] = result.get('birth_frame')
-                    plate_entry['plate_search_litter_id'] = litter_id
+                self.violators.pop(stale_key, None)
 
-            for mark in result.get('mark_items', []):
-                mark_key = mark.get('actor_key')
-                self._mark_violator(
-                    mark_key,
-                    mark.get('center'),
-                    ttl=CONFIRMED_VIOLATOR_TTL,
-                    until_plate_found=(
-                        plate_blocked_since_litter and
-                        mark_key == plate_key
-                    ),
-                    action='littering',
-                )
+        # Smart 模式在 committed assignment 前不產生 side effect；dustbin 或
+        # require_vehicle 未滿足時也不畫違規框、不送 OCR。
+        if not escalated or same_assignment:
+            return True
 
-            plate_items = result.get('plate_roi_items') or []
-            if plate_items:
-                with self._backward_plate_lock:
-                    self.backward_plate_roi_items.extend(plate_items)
+        plate_key = vehicle_key or result.get('plate_key')
+        if plate_key is not None:
+            plate_key = tuple(plate_key)
+        plate_blocked_since_litter = bool(
+            result.get('plate_blocked_since_litter', False)
+        )
+        if (
+            plate_blocked_since_litter
+            and plate_key is not None
+            and plate_key[0] in ('vehicle', 'scooter')
+            and vehicle_history is not None
+        ):
+            plate_entry = vehicle_history[plate_key[1]]
+            if plate_entry.get('license_plate') is None:
+                plate_entry['plate_search_until_found'] = True
+                plate_entry['plate_blocked_since_litter'] = True
+                plate_entry['plate_search_birth_frame'] = result.get('birth_frame')
+                plate_entry['plate_search_litter_id'] = litter_id
+
+        for mark in result.get('mark_items', []):
+            mark_key = mark.get('actor_key')
+            if mark_key is None:
+                continue
+            mark_key = tuple(mark_key)
+            self._mark_violator(
+                mark_key,
+                mark.get('center'),
+                ttl=CONFIRMED_VIOLATOR_TTL,
+                until_plate_found=(
+                    plate_blocked_since_litter and mark_key == plate_key
+                ),
+                action='littering',
+            )
+
+        plate_items = result.get('plate_roi_items') or []
+        if plate_items:
+            with self._backward_plate_lock:
+                self.backward_plate_roi_items.extend(plate_items)
+        return True
 
     @staticmethod
     def _box_center(box):

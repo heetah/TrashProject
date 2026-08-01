@@ -37,19 +37,30 @@ def build_litter_events(litter_events, vehicle_history, fps):
     out = []
     for ev in litter_events or []:
         thrower_key = ev.get("thrower_key")
+        vehicle_key = ev.get("vehicle_key")
         thrower = None
         if thrower_key:
             thrower = {"cls": str(thrower_key[0]), "track_id": int(thrower_key[1])}
-        out.append({
+        vehicle = None
+        if vehicle_key:
+            vehicle = {"cls": str(vehicle_key[0]), "track_id": int(vehicle_key[1])}
+        item = {
             "type": "litter",
             "frame_index": int(ev.get("frame_index", 0)),
             "time_sec": _time_sec(ev.get("frame_index", 0), fps),
             "litter_id": int(ev.get("litter_id", -1)),
             "bbox": [int(v) for v in ev.get("bbox", [])],
             "thrower": thrower,
-            "license_plate": _plate_for_thrower(thrower_key, vehicle_history),
+            "vehicle": vehicle,
+            "license_plate": _plate_for_thrower(
+                vehicle_key or thrower_key, vehicle_history
+            ),
             "escalated": bool(ev.get("escalated", False)),
-        })
+            "backtrack_status": ev.get("backtrack_status"),
+        }
+        if ev.get("backtrack") is not None:
+            item["backtrack"] = ev["backtrack"]
+        out.append(item)
     return out
 
 

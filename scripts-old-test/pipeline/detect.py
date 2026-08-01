@@ -141,6 +141,16 @@ def _clone_actors(actors):
     return [dict(actor) for actor in actors]
 
 
+def _clone_cached_actors(actors):
+    # 跳幀快取不是新量測。明確標記 observed=False，避免 Kalman filter
+    # 把同一個舊 bbox 重複 update 成「零速度且極高信心」。
+    cloned = _clone_actors(actors)
+    for actor in cloned:
+        actor['observed'] = False
+        actor['source'] = 'cache'
+    return cloned
+
+
 def _as_result_list(results):
     # Ultralytics 有時回傳單物件、有時回傳 list；統一成 list 方便批次處理。
     if results is None:
@@ -216,13 +226,20 @@ def _extract_actor_tracks(results, model_bbox):
         boxes = result.boxes.xyxy.cpu().numpy()
         classes = result.boxes.cls.cpu().numpy().astype(int)
         track_ids = result.boxes.id.cpu().numpy().astype(int)
+        confidences = (
+            result.boxes.conf.cpu().numpy()
+            if result.boxes.conf is not None
+            else np.ones(len(boxes), dtype=np.float32)
+        )
 
         if result.masks is not None and getattr(result.masks, 'xy', None) is not None:
             mask_xy = result.masks.xy
         else:
             mask_xy = [None] * len(boxes)
 
-        for det_idx, (box, cls_id, track_id) in enumerate(zip(boxes, classes, track_ids)):
+        for det_idx, (box, cls_id, track_id, confidence) in enumerate(
+            zip(boxes, classes, track_ids, confidences)
+        ):
             class_name = _model_class_name(model_bbox, cls_id)
             if class_name is None:
                 continue
@@ -233,6 +250,9 @@ def _extract_actor_tracks(results, model_bbox):
                 'box': box,
                 'track_id': int(track_id),
                 'cls': class_name,
+                'confidence': float(confidence),
+                'observed': True,
+                'source': 'seg_track',
                 # 保留 polygon，讓 holding 可用 segmentation，而不是只看 bbox overlap。
                 'mask_poly': actor_mask_poly,
             }
@@ -255,13 +275,18 @@ def _extract_actor_detections(results, model_bbox):
 
         boxes = result.boxes.xyxy.cpu().numpy()
         classes = result.boxes.cls.cpu().numpy().astype(int)
+        confidences = (
+            result.boxes.conf.cpu().numpy()
+            if result.boxes.conf is not None
+            else np.ones(len(boxes), dtype=np.float32)
+        )
 
         if result.masks is not None and getattr(result.masks, 'xy', None) is not None:
             mask_xy = result.masks.xy
         else:
             mask_xy = [None] * len(boxes)
 
-        for det_idx, (box, cls_id) in enumerate(zip(boxes, classes)):
+        for det_idx, (box, cls_id, confidence) in enumerate(zip(boxes, classes, confidences)):
             class_name = _model_class_name(model_bbox, cls_id)
             if class_name is None:
                 continue
@@ -269,67 +294,50 @@ def _extract_actor_detections(results, model_bbox):
             actors.append({
                 'box': box,
                 'cls': class_name,
+                'confidence': float(confidence),
+                'observed': True,
+                'source': 'seg_predict',
                 'mask_poly': mask_xy[det_idx] if det_idx < len(mask_xy) else None,
             })
 
     return actors
 
 
-def _assign_fast_actor_track_ids(actors, yolo_seg_cache, iou_threshold=0.3, track_buffer=30):
-    # 極速模式用 predict 取代 BoT-SORT；用前一次 bbox IoU 給穩定 id，保留後續 holding/backtrack 基本需求。
-    # 【關鍵修正】保留最近遺失的 track 一段時間（track_buffer 次偵測），不再「單幀漏抓就丟棄」。
-    # 否則任何一次偵測閃爍都會讓人物換新 id，導致 STGCN 視窗與 urinate 證據累積不起來而漏報。
-    tracks = yolo_seg_cache.setdefault('fast_actor_tracks', [])
-    next_id = int(yolo_seg_cache.get('fast_next_track_id', 1))
-    used_tracks = set()
-    assigned = []
+def _assign_fast_actor_track_ids(
+    actors,
+    yolo_seg_cache,
+    iou_threshold=0.3,
+    track_buffer=30,
+    frame_index=None,
+    fps=10.0,
+):
+    """極速 actor path：Kalman 預測 + Hungarian 只負責跨幀同物件 ID。
 
-    for actor in actors:
-        best_idx = None
-        best_iou = 0.0
-        for idx, track in enumerate(tracks):
-            if idx in used_tracks or track.get('cls') != actor['cls']:
-                continue
-            iou = _actor_iou(actor['box'], track['box'])
-            if iou > best_iou:
-                best_iou = iou
-                best_idx = idx
+    人↔車、垃圾↔人/車不在這裡配對；它們交給 smart backtrack 的成本圖與
+    Min-Cost Flow，因此同一台車可以合法關聯多個 person。
+    """
+    from pipeline.backtrack.tracking import KalmanHungarianTracker
 
-        actor = dict(actor)
-        if best_idx is not None and best_iou >= iou_threshold:
-            actor['track_id'] = int(tracks[best_idx]['track_id'])
-            used_tracks.add(best_idx)
-        else:
-            actor['track_id'] = next_id
-            next_id += 1
-        assigned.append(actor)
-
-    # 本輪命中的 actor 重置 TTL；本輪未命中的舊 track 暫時保留並衰減 TTL，
-    # 讓人物在短暫漏抓後再次出現時，仍能用舊 box IoU 配回原本的 id。
-    track_buffer = max(int(track_buffer), 1)
-    new_tracks = [
-        {
-            'track_id': int(actor['track_id']),
-            'box': np.asarray(actor['box']).copy(),
-            'cls': actor['cls'],
-            'ttl': track_buffer,
-        }
-        for actor in assigned
-    ]
-    for idx, track in enumerate(tracks):
-        if idx in used_tracks:
-            continue
-        ttl = int(track.get('ttl', 0)) - 1
-        if ttl > 0:
-            new_tracks.append({
-                'track_id': int(track['track_id']),
-                'box': np.asarray(track['box']).copy(),
-                'cls': track.get('cls'),
-                'ttl': ttl,
-            })
-
-    yolo_seg_cache['fast_next_track_id'] = next_id
-    yolo_seg_cache['fast_actor_tracks'] = new_tracks
+    tracker = yolo_seg_cache.get('fast_actor_tracker')
+    effective_fps = float(fps) if fps and float(fps) > 0.0 else 10.0
+    # FPS is part of every KF transition/Q matrix. Reusing filters created with
+    # another timebase would silently corrupt velocity and uncertainty.
+    if tracker is not None and not np.isclose(tracker.fps, effective_fps):
+        tracker = None
+    if tracker is None:
+        tracker = KalmanHungarianTracker(
+            iou_threshold=float(iou_threshold),
+            max_missed_frames=max(int(track_buffer), 1),
+            next_track_id=int(yolo_seg_cache.get('fast_next_track_id', 1)),
+            fps=effective_fps,
+        )
+        yolo_seg_cache['fast_actor_tracker'] = tracker
+    tracker.iou_threshold = float(iou_threshold)
+    tracker.max_missed_frames = max(int(track_buffer), 1)
+    assigned = tracker.update(actors, frame_index=frame_index)
+    yolo_seg_cache['fast_next_track_id'] = tracker.next_track_id
+    # 舊 key 不再是 authority；清除可避免外部測試誤讀 stale greedy state。
+    yolo_seg_cache.pop('fast_actor_tracks', None)
     return _split_actors(assigned)
 
 
@@ -356,7 +364,7 @@ def _stage_decay_violator_cache(violator_display_cache, vehicle_history, violato
 
 def _stage_resolve_actor_sources(frame, model_bbox, precomputed_persons, precomputed_vehicles,
                                  yolo_seg_cache, frame_index, yolo_seg_frame_skip,
-                                 actor_mode, bbox_conf, actor_track_iou, profiler):
+                                 actor_mode, bbox_conf, actor_track_iou, fps, profiler):
     # actor 來源:vehicle/scooter 由 YOLO-Seg(可跳幀快取)。回傳 (seg_persons, vehicles)。
     if precomputed_persons is not None and precomputed_vehicles is not None:
         return _clone_actors(precomputed_persons), _clone_actors(precomputed_vehicles)
@@ -376,6 +384,7 @@ def _stage_resolve_actor_sources(frame, model_bbox, precomputed_persons, precomp
                 actor_detections = _extract_actor_detections(results, model_bbox)
                 seg_persons, vehicles = _assign_fast_actor_track_ids(
                     actor_detections, yolo_seg_cache, iou_threshold=actor_track_iou,
+                    frame_index=frame_index, fps=fps,
                 )
         else:
             with profile_block(profiler, "detect.yolo_actor_track"):
@@ -392,8 +401,8 @@ def _stage_resolve_actor_sources(frame, model_bbox, precomputed_persons, precomp
 
     # 快取重用:保留上次 actor 狀態,讓跳幀不會讓畫面完全沒有 actor。
     with profile_block(profiler, "detect.yolo_actor_cache_reuse"):
-        return (_clone_actors(yolo_seg_cache.get('persons', [])),
-                _clone_actors(yolo_seg_cache.get('vehicles', [])))
+        return (_clone_cached_actors(yolo_seg_cache.get('persons', [])),
+                _clone_cached_actors(yolo_seg_cache.get('vehicles', [])))
 
 
 def _stage_vehicle_gate(vehicles, yolo_seg_cache, frame_index, fps, stats):
@@ -842,7 +851,7 @@ def detect(frame, model_bbox, model_trash,
     seg_persons, vehicles = _stage_resolve_actor_sources(
         frame, model_bbox, precomputed_persons, precomputed_vehicles,
         yolo_seg_cache, frame_index, yolo_seg_frame_skip,
-        actor_mode, bbox_conf, actor_track_iou, profiler,
+        actor_mode, bbox_conf, actor_track_iou, fps, profiler,
     )
 
     # 車輛閘門:vehicle_active=False 時,後續 pose/STGCN/litter/OCR 全部略過(沒有車牌可開罰)。
@@ -1166,7 +1175,7 @@ def _prepare_actor_batch(frames, frame_indices, model_bbox, bbox_conf,
                          yolo_seg_frame_skip, yolo_seg_cache,
                          batch_size=1, bbox_batch_size=None,
                          actor_mode="track", actor_track_iou=0.3,
-                         profiler=None, stats=None):
+                         fps=10.0, profiler=None, stats=None):
     # 為 detect_batch 準備每幀 actor 結果：該跑 YOLO 的幀跑推理，其餘幀沿用快取。
     actor_pairs = [None] * len(frames)
     run_positions = []
@@ -1218,6 +1227,8 @@ def _prepare_actor_batch(frames, frame_indices, model_bbox, bbox_conf,
                         actor_detections,
                         yolo_seg_cache,
                         iou_threshold=actor_track_iou,
+                        frame_index=frame_index,
+                        fps=fps,
                     )
                 else:
                     persons, vehicles = _extract_actor_tracks([run_result_map[pos]], model_bbox)
@@ -1228,8 +1239,8 @@ def _prepare_actor_batch(frames, frame_indices, model_bbox, bbox_conf,
 
         if actor_pairs[pos] is None:
             actor_pairs[pos] = (
-                _clone_actors(yolo_seg_cache.get('persons', [])),
-                _clone_actors(yolo_seg_cache.get('vehicles', [])),
+                _clone_cached_actors(yolo_seg_cache.get('persons', [])),
+                _clone_cached_actors(yolo_seg_cache.get('vehicles', [])),
             )
 
     return actor_pairs
@@ -1319,6 +1330,7 @@ def detect_batch(frames, model_bbox, model_trash,
         bbox_batch_size=bbox_batch_size,
         actor_mode=actor_mode,
         actor_track_iou=actor_track_iou,
+        fps=fps,
         profiler=profiler,
         stats=stats,
     )

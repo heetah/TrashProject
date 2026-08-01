@@ -613,6 +613,9 @@ class STGCNActionModule:
                     # pose 沒有 segmentation polygon；holding/tracker 會自動退回 bbox 錨點。
                     "mask_poly": None,
                     "pose_conf": float(box_conf[idx]),
+                    "confidence": float(box_conf[idx]),
+                    "observed": True,
+                    "source": "pose_track",
                 })
         _add_stat(stats, "stgcn_pose_boxes", len(persons))
         return persons, frame_skeletons

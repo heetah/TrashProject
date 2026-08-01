@@ -12,9 +12,18 @@ from ultralytics import RTDETR
 from pipeline.detect import detect_batch
 from pipeline.litter_tracker import GlobalLitterTracker
 from pipeline.action import STGCNActionModule
-from pipeline.plate import disable_license_plate_models, preload_license_plate_models, wait_for_plate_jobs
+from pipeline.plate import (
+    disable_license_plate_models,
+    dispatch_license_plate_rois,
+    preload_license_plate_models,
+    wait_for_plate_jobs,
+)
 from pipeline.profiling import PipelineProfiler
 from pipeline.events import build_run_events, write_events_jsonl
+from pipeline.backtrack.sidecar import (
+    build_run_record as build_backtrack_run_record,
+    write_jsonl as write_backtrack_jsonl,
+)
 from pipeline.config import PipelineConfig
 
 from pipeline.infra import (
@@ -391,9 +400,60 @@ if __name__ == "__main__":
                 out.close()
                 out = None
             print(f"Video saved to {final_output}")
+            # Attribution 必須先於 summary/events 收尾：flush 尾端 worker，
+            # 再以 event-expanded Min-Cost Flow 套用 authoritative assignment。
+            smart_backtrack_summary = None
+            if litter_tracker is not None and hasattr(litter_tracker, "finalize_backtracking"):
+                smart_backtrack_summary = litter_tracker.finalize_backtracking(
+                    vehicle_history=vehicle_history,
+                    timeout=8.0,
+                )
+                if not smart_backtrack_summary.get("worker_flushed", False):
+                    print("Smart backtrack worker still draining; retrying EOF flush once.")
+                    smart_backtrack_summary = litter_tracker.finalize_backtracking(
+                        vehicle_history=vehicle_history,
+                        timeout=8.0,
+                    )
+                print(
+                    "Smart backtrack: "
+                    f"solver={smart_backtrack_summary['solver']}, "
+                    f"resolved={smart_backtrack_summary['resolved']}, "
+                    f"dustbin={smart_backtrack_summary['dustbin']}, "
+                    f"legacy={smart_backtrack_summary['legacy']}, "
+                    f"pending={smart_backtrack_summary['pending']}, "
+                    f"worker_flushed={smart_backtrack_summary['worker_flushed']}"
+                )
+                late_plate_items = litter_tracker.consume_backward_plate_roi_items()
+                if late_plate_items:
+                    dispatched = dispatch_license_plate_rois(
+                        late_plate_items, vehicle_history, profiler=profiler
+                    )
+                    if not dispatched:
+                        wait_for_plate_jobs(profiler=profiler)
+                        dispatched = dispatch_license_plate_rois(
+                            late_plate_items, vehicle_history, profiler=profiler
+                        )
+                    if not dispatched:
+                        litter_tracker.restore_backward_plate_roi_items(late_plate_items)
+                wait_for_plate_jobs(profiler=profiler)
+
+            final_litter_events = (
+                litter_tracker.get_litter_events() if litter_tracker is not None else []
+            )
             confirmed_litter_ids = detection_stats.get('confirmed_litter_ids', set())
-            confirmed_litter_thrower_ids = detection_stats.get('confirmed_litter_thrower_ids', set())
-            backtracked_thrower_ids = detection_stats.get('backtracked_thrower_ids', set())
+            confirmed_litter_thrower_ids = detection_stats.get(
+                'confirmed_litter_thrower_ids', set()
+            )
+            backtracked_thrower_ids = detection_stats.get(
+                'backtracked_thrower_ids', set()
+            )
+            # 尾端 worker 的結果可能來不及進逐幀 stats；以 finalized event 補齊。
+            for event in final_litter_events:
+                litter_id = int(event.get('litter_id', -1))
+                if event.get('thrower_key') is not None:
+                    confirmed_litter_thrower_ids.add(litter_id)
+                if event.get('backtrack_status') in ('resolved', 'legacy'):
+                    backtracked_thrower_ids.add(litter_id)
             first_confirmed = detection_stats.get('first_confirmed_litter_frame')
             first_confirmed_text = "None" if first_confirmed is None else str(first_confirmed)
             stgcn_urinate = int(detection_stats.get('stgcn_pred_urinate', 0))
@@ -459,15 +519,20 @@ if __name__ == "__main__":
                 "stgcn_registered_violators": int(detection_stats.get('stgcn_registered_violators', 0)),
                 "vehicle_gate_skipped_frames": int(detection_stats.get('vehicle_gate_skipped_frames', 0)),
                 "has_urinate": stgcn_urinate > 0 or stgcn_urinate_confirmed > 0,
-                "has_littering": False,
+                "has_littering": any(
+                    bool(event.get('escalated', False))
+                    for event in final_litter_events
+                ),
                 "has_confirm_litter": len(confirmed_litter_ids) > 0,
                 "has_confirmed_litter_thrower": len(confirmed_litter_thrower_ids) > 0,
                 "has_backtracked_thrower": len(backtracked_thrower_ids) > 0,
                 "has_keypoints": int(detection_stats.get('stgcn_pose_matches', 0)) > 0,
                 "has_person": int(detection_stats.get('person_detections', 0)) > 0,
             }
-            # Offline Person↔Vehicle 關聯(PV_ASSOC=1):全片事件錨定 1對1 配對寫入 summary。
-            # 關閉時 finalize 回 None → run_summary 不變 → JSON byte-identical。
+            if smart_backtrack_summary is not None:
+                run_summary["smart_backtrack"] = smart_backtrack_summary
+            # Legacy-only Offline P↔V Hungarian。Smart mode 會回 None，避免
+            # 1-to-1 結果覆蓋 many-to-many Min-Cost Flow attribution。
             if litter_tracker is not None and hasattr(litter_tracker, "finalize_associations"):
                 pv_assoc = litter_tracker.finalize_associations()
                 if pv_assoc is not None:
@@ -480,6 +545,55 @@ if __name__ == "__main__":
                         f"unbound={pv_assoc['unbound_persons']}, "
                         f"litter_events={pv_assoc['litter_events']}"
                     )
+
+            # Research/calibration sidecar: immutable model candidates and every
+            # weighted/raw component. Ground truth is stored separately by the
+            # annotation tool so rerunning inference never overwrites labels.
+            if (
+                litter_tracker is not None
+                and hasattr(litter_tracker, "get_backtrack_candidate_records")
+                and os.environ.get("SMART_BACKTRACK_SIDECAR", "1")
+                not in ("0", "")
+            ):
+                sidecar_path = Path(final_output).with_name(
+                    Path(final_output).stem
+                    + "_backtrack_candidates.jsonl"
+                )
+                weak_clip_label = (
+                    {
+                        "value": "litter",
+                        "strength": "weak_gt",
+                        "source": "parent_directory",
+                    }
+                    if Path(video_path).parent.name.lower() == "litter"
+                    else None
+                )
+                candidate_records = (
+                    litter_tracker.get_backtrack_candidate_records(
+                        input_video=str(video_path),
+                        output_video=str(final_output),
+                    )
+                )
+                run_record = build_backtrack_run_record(
+                    input_video=str(video_path),
+                    output_video=str(final_output),
+                    fps=float(fps),
+                    frame_count=int(processed_frames),
+                    smart_summary=smart_backtrack_summary,
+                    extra={"clip_label": weak_clip_label},
+                )
+                write_backtrack_jsonl(
+                    [run_record, *candidate_records],
+                    str(sidecar_path),
+                )
+                run_summary["backtrack_candidate_sidecar"] = str(sidecar_path)
+                run_summary["backtrack_candidate_records"] = len(
+                    candidate_records
+                )
+                print(
+                    "Backtrack candidate sidecar: "
+                    f"events={len(candidate_records)} -> {sidecar_path}"
+                )
 
             # Summary JSON 固定寫在輸出影片同目錄：{stem}_summary.json
             summary_path = Path(final_output).with_name(
@@ -495,7 +609,7 @@ if __name__ == "__main__":
                 Path(final_output).stem + "_events.jsonl"
             )
             run_events = build_run_events(
-                litter_tracker.get_litter_events() if litter_tracker is not None else [],
+                final_litter_events,
                 action_module.get_urinate_events() if action_module is not None else [],
                 vehicle_history,
                 run_summary,

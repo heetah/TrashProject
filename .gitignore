@@ -33,3 +33,5 @@ scripts-old-test/tests/test_detect_4c.py
 scripts-old-test/tests/test_litter_tracker_4c.py
 scripts-old-test/tests/test_pipeline_cases.py
 tests/test_litter_regression.py
+artifacts/
+mmpose-rtmw
