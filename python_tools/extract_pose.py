@@ -18,7 +18,7 @@ The output ``garbage_final.pkl`` follows MMACTION2 ``PoseDataset`` format:
         "split": {"train": [...], "val": [...]}
     }
 
-Labels are intentionally aligned with scripts-old-test/action.py:
+Labels are intentionally aligned with scripts/action.py:
 0 = normal, 1 = urinate.
 The class-1 folder on disk may be named ``urinate`` while the exported label
 name stays ``urinate`` to match the current runtime contract. Littering is

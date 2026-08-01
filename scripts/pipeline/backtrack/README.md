@@ -1,5 +1,11 @@
 # Smart Backtrack
 
+> Optional tooling notice: this checkout currently does not include the root
+> `validate_old_test_videos.py` or `tools/` annotation/preview CLIs referenced
+> by some research commands below. Core backtrack modules and tests remain
+> available; CLI-only tests explicitly skip when their optional tool is absent.
+> Do not report those workflows as runnable until the files are restored.
+
 Production attribution flow:
 
 ```text
@@ -106,7 +112,7 @@ To create sidecars without writing annotated videos:
 ```bash
 conda run -n rtdetr python validate_old_test_videos.py \
   /path/to/video1.mp4 /path/to/video2.mp4 \
-  --pipeline-dir scripts-old-test \
+  --pipeline-dir scripts \
   --sidecar-dir artifacts/backtrack_candidates
 ```
 

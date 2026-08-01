@@ -13,7 +13,7 @@ from pathlib import Path
 
 DEFAULT_ROOT_DIR = Path("/mnt/8tb_hdd/under115a/resources/urinate_long_test")
 DEFAULT_OUTPUT_DIR = Path("/mnt/8tb_hdd/under115a/output/urinate_long_test_iterate0625")
-DEFAULT_MAIN_PY = Path("/home/se_copilot/trashProject/scripts-old-test/main.py")
+DEFAULT_MAIN_PY = Path("/home/se_copilot/trashProject/scripts/main.py")
 DEFAULT_CLASSES = ("litter",)
 DEFAULT_EXTENSIONS = (".mp4", ".avi")
 
@@ -97,7 +97,7 @@ def parse_args():
         "--main-arg",
         action="append",
         default=[],
-        help="extra argument passed to scripts-old-test/main.py; repeat for multiple args",
+        help="extra argument passed to scripts/main.py; repeat for multiple args",
     )
     parser.add_argument(
         "--per-clip-timeout",
@@ -226,7 +226,7 @@ def build_command(args, root_dir, main_py, cls, file_path):
 
 
 def build_subprocess_env(args):
-    # 撠� --rtdetr off 頧���� RTDETR_ENABLED=0 env var嚗�scripts-old-test/main.py 霈����甇文�潦��
+    # 撠� --rtdetr off 頧���� RTDETR_ENABLED=0 env var嚗�scripts/main.py 霈����甇文�潦��
     if args.rtdetr == "off":
         return {**os.environ, "RTDETR_ENABLED": "0"}
     return None  # None ��� subprocess 蝜潭�輻�園�脩�� env嚗����閮剖����剁��

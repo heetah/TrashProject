@@ -1,162 +1,284 @@
-# trashProject / scripts-old-test
+# 環保科技執法系統
 
-`scripts-old-test/` 是目前主要影片推理流程，負責整合 YOLO actor tracking、RTDETR litter detection、litter 軌跡確認、丟擲者反追蹤、STGCN 動作辨識、車牌 OCR、影片輸出與耗時摘要。
+本專案以 Python 與電腦視覺模型分析固定監視器影片，辨識新拋出的垃圾或持續性隨地便溺行為，反追蹤可能違規者及其車輛，並在證據充分時辨識車牌，供後續人工複核與執法流程使用。
 
-## 執行入口
+系統設計以降低誤罰為優先。垃圾 detector bbox、事件確認、違規者歸因、車輛關聯與車牌辨識是不同證據層級；任一步驟證據不足都必須保留 `NULL`／人工複核，不強制產生罰單。
 
-```bash
-conda run -n rtdetr python scripts-old-test/main.py TThrow.mp4 --batch 1
-conda run -n rtdetr python scripts-old-test/main.py TThrow.mp4 --batch 2
+## Repository 架構
+
+```text
+trashProject/
+├── scripts/                     # 唯一 production pipeline
+│   ├── main.py                  # 影片推論入口
+│   ├── pipeline/                # 主要模組化實作
+│   │   ├── action.py            # YOLO-Pose + STGCN
+│   │   ├── detect.py            # actor/litter detection orchestration
+│   │   ├── litter_tracker.py    # litter confirmation、violator state
+│   │   ├── plate.py             # 車牌 detection + PaddleOCR
+│   │   ├── events.py            # summary/events schema
+│   │   ├── config.py            # 集中執行參數
+│   │   ├── infra/               # model、motion、video I/O、worker
+│   │   ├── litter/              # litter trajectory helpers
+│   │   └── backtrack/           # Kalman/RTS/cost/flow/sidecar
+│   ├── frontend/                # summary/events 靜態 dashboard
+│   └── *.py                     # compatibility shims 與工具入口
+├── tests/
+│   ├── pipeline/                # production unit/integration tests
+│   └── test_litter_regression.py
+├── modules_weight/              # 本機權重，Git ignored
+├── resources/                   # 本機測試影片，Git ignored，可不存在
+├── dataset-pose/                # STGCN pose annotations/training artifacts
+├── mmaction2/                   # STGCN/STGCN++ dependency
+├── artifacts/                   # sidecar、annotation、metrics，Git ignored
+├── output/                      # annotated videos，Git ignored
+├── versions/                    # 每次整合版本說明
+├── scripts-old-stable/          # rollback/reference baseline
+├── AGENTS.md                    # 唯一 AI Agent Instruction
+└── README.md                    # 本文件
 ```
 
-影片檔預設從 `resources/` 讀取，輸出到 `output/{影片名}_annotated.mp4`。
+### Production 與 reference
 
-## Batch 模式與模型路徑
+- `scripts/` 是唯一 production source of truth。
+- `scripts/pipeline/` 放真正實作；`scripts/action.py`、`detect.py`、`litterTracker.py` 等頂層檔案是舊 import compatibility shim。
+- `scripts-old-stable/` 只用來比較與 rollback，不進行日常開發。
+- 不建立 `heetah/`、`pgdr/` 或其他個人程式碼副本，開發隔離完全使用 Git branch/worktree。
+- `mmpose-rtmw/` 已移除，production keypoints 只來自 YOLO-Pose。
 
-`--batch 1` 使用一般單幀模式：
+## 高階系統流程
 
-- YOLO actor model: `modules_weight/best-yolo-seg_v3.pt`
-- RTDETR litter model: `modules_weight/best-rtdetr-seg.pt`
+```text
+輸入監視器影片
+  -> 模型 preload / warmup
+  -> 背景讀取 frame + temporal motion mask
+  -> YOLO-Seg vehicle/scooter detection
+  -> vehicle gate
+      ├── YOLO-Pose person detection/tracking/keypoints
+      │     -> STGCN normal/urinate
+      │     -> sustained temporal confirmation
+      ├── RT-DETR 4-channel litter candidate
+      │     -> geometry/motion/core-motion/holding filter
+      │     -> GlobalLitterTracker pending/confirmed
+      └── confirmed event
+            -> Smart Backtrack person/vehicle/NULL
+            -> vehicle/scooter ROI
+            -> plate detector + PaddleOCR
+  -> annotated video
+  -> summary.json / events.jsonl / backtrack sidecar
+```
 
-`--batch 2` 使用 batch-2 模式：
+## 模組責任
 
-- YOLO actor model: `modules_weight/batch/best-yolo-seg_v3.pt`
-- RTDETR litter model: `modules_weight/batch/best-rtdetr-seg.pt`
+### Vehicle / scooter
 
-若同位置存在 TensorRT engine，`main.py` 會優先載入：
+YOLO-Seg 負責 vehicle/scooter detection 與 tracking，並提供 vehicle gate、person association、反追蹤及 OCR 的車輛候選。它不負責 STGCN action 或直接確認垃圾事件。
 
-- batch 1: `*.engine`
-- batch 2: `*_b2.engine`
+`VEHICLE_GATE` 預設開啟；最近出現車輛的 TTL 預設為 3 秒。沒有近期車輛時，系統可略過昂貴的 pose、STGCN、RT-DETR 與 OCR 路徑。
 
-可用 `--no-engine` 強制使用 `.pt`。也可用 `--bbox-model` / `--trash-model` 手動覆蓋預設路徑。
+### Person action
 
-## 常用參數
+YOLO-Pose 直接負責 person detection、tracking 與 17 點 keypoints，骨架依 `track_id` 累積後交給 STGCN。
 
-- `--batch {1,2}`: 選擇單幀或 batch-2 推理。
-- `--bbox-conf`: YOLO actor 信心門檻，預設 `0.45`。
-- `--trash-conf`: RTDETR litter 信心門檻，預設 `0.4`。
-- `--yolo-seg-frame-skip`: 每 N 幀跑一次 YOLO actor tracking，其餘幀沿用快取。
-- `--disable-action`: 關閉 STGCN 動作辨識。
-- `--action-threshold`: STGCN 判定 `littering` 的分數門檻，預設 `0.5`。
-- `--disable-plate`: 關閉車牌偵測與 OCR。
-- `--skip-plate-preload`: 不在影片開始前預載車牌模型。
-- `--disable-speed-filter`: 關閉車輛速度相關過濾。
+STGCN classes 固定為：
 
-## 檔案責任
+```python
+ACTION_CLASSES = {0: "normal", 1: "urinate"}
+```
 
-`main.py`
+STGCN 不判斷 littering。預設 sequence window 為 100 frames；urinate 使用 8 秒視窗與 5 秒 evidence 基準，並受現有 top-p/hysteresis 環境變數控制。只有通過持續性證據才會產生 urinate warning。
 
-- 解析 CLI 參數。
-- 依 `--batch` 自動選擇 batch 1 或 batch 2 model path。
-- 優先嘗試 TensorRT engine，失敗或不存在時回退 `.pt`。
-- 預載並 warmup YOLO、RTDETR、STGCN、車牌模型。
-- 讀取影片、建立前景遮罩、呼叫 `detect()` 或 `detect_batch()`。
-- 寫入暫存 AVI，最後用 ffmpeg 壓成 MP4。
-- 在暫存檔清理後輸出分段耗時摘要。
+### Litter object-event
 
-`detect.py`
+RT-DETR 使用 BGR 加 temporal change map 的 4-channel 輸入。模型輸出的 `litter` bbox 只是 candidate，必須依序通過：
 
-- 管理單幀與批次偵測流程。
-- 從 YOLO tracking 解析 `person / scooter / vehicle`。
-- 建立 person-to-vehicle 關聯。
-- 執行 RTDETR litter detection。
-- 對 litter 做 motion filter 與 holding filter。
-- 呼叫 `GlobalLitterTracker` 更新 pending/confirmed 狀態。
-- 渲染 actor、violator、confirmed litter、STGCN 分數與車牌。
+1. Bbox size/aspect-ratio filter。
+2. 全框 motion evidence。
+3. 中心區 core-motion evidence。
+4. Camera-shake cooldown。
+5. Actor polygon/relative-motion holding gate。
+6. `GlobalLitterTracker` trajectory、displacement、temporal confirmation。
 
-`litterTracker.py`
+只有 `state == "confirmed"` 才是垃圾事件。Pending candidate 不會畫成最終違規。
 
-- 維護 active litter 軌跡、missed frame、shape reference 與 `pending / confirmed` 狀態。
-- 使用物理軌跡與向下位移確認 litter。
-- 以 pseudo-ground homography 估計最可能 thrower。
-- confirmed 後標記 person / vehicle / scooter 違規者，並用 TTL 維持畫面紅框。
+### Smart Backtrack
 
-`smallFunction.py`
+Smart Backtrack 位於 `scripts/pipeline/backtrack/`：
 
-- 提供 motion check、IoU、polygon overlap、holding 判斷與 `validate_trajectory()`。
-- `litter_holding()` 是 polygon-aware gate，負責判斷 litter 是否仍貼在人車上。
+```text
+actor detections
+  -> Kalman + Hungarian same-object tracking
+  -> confidence-aware filtering
+  -> RTS smoothing
 
-`action.py`
+litter trajectory
+  -> x-linear / y-quadratic reverse hypotheses
 
-- 封裝 YOLO pose + STGCN++。
-- 累積每個 person track 的骨架序列。
-- 當動作為 `littering` 且分數達 `action_threshold` 時，回傳 alert。
+release hypotheses + actor tracklets
+  -> C_BA(litter, person)
+  -> C_AC(person, vehicle)
+  -> C_BC(litter, vehicle)
+  -> route candidates
+  -> Min-Cost Flow
+  -> person / vehicle / NULL
+```
 
-`licensePlate.py`
+Hungarian 只維護同一物件跨幀 identity，不做 person↔vehicle 或 litter attribution。Person/vehicle capacity 允許同車多人與同人多事件；每個事件都有 `NULL` route，避免證據不足時強制歸因。
 
-- 只對已鎖定違規車輛派工。
-- 背景 thread 執行車牌 YOLO 與 PaddleOCR。
-- OCR 結果寫回 `vehicle_history`，供畫面顯示。
+Backtrack sidecar 用於標註、成本校正與 gate 分析。沒有人工 reviewed ground truth 時，只能報告 candidate coverage/resolved/dustbin，不能宣稱歸因準確率。
 
-`timeUtils.py`
+### Plate OCR
 
-- 提供 `PipelineProfiler` 與 `profile_block()`。
-- 支援中文欄位寬度對齊。
-- 最後輸出模型載入、影片處理、影像寫入與瓶頸 Top 3。
+OCR 只處理已可靠歸因的 vehicle/scooter ROI。無法辨識、低信心或遮擋時，保留影像與失敗狀態，不猜測車牌、不自動開罰。
 
-`export_tensorrt.py`
+## 執行方式
 
-- 匯出 YOLO actor 與 RTDETR litter 的 TensorRT engine。
-- 預設支援 batch 2，輸出檔名會是 `*_b2.engine`。
+預設環境：
 
-## 逐幀主流程
+```bash
+conda run -n rtdetr ...
+```
 
-1. `main.py` 讀取 frame，並用 MOG2 背景減除器產生前景遮罩。
-2. `detect.py` 執行 YOLO actor tracking，或依 `--yolo-seg-frame-skip` 沿用 actor 快取。
-3. 解析 actor bbox、track id、class name 與 segmentation polygon。
-4. 建立 person 與 vehicle/scooter 的 IoU 對應。
-5. 選擇性執行 STGCN 動作辨識。
-6. RTDETR 對全圖偵測 litter。
-7. litter 候選先通過 motion filter 與 holding filter。
-8. `GlobalLitterTracker` 更新 litter 軌跡與 confirmed 狀態。
-9. confirmed 後反推 thrower，標記 person / vehicle / scooter 違規者。
-10. 車牌流程只對違規車輛派工。
-11. 渲染紅框、confirmed litter、STGCN 分數與車牌。
+目前 `scripts/main.py` 只接受一個 positional video path；batch、threshold 與輸出位置主要使用環境變數。
 
-## Litter 確認流程
+```bash
+OUTPUT_ROOT=output PIPELINE_BATCH=8 \
+conda run -n rtdetr python scripts/main.py resources/resize.mp4
+```
 
-### 前處理
+也可直接提供絕對路徑：
 
-RTDETR 只負責提出 litter bbox 候選，不能直接當 confirmed。候選進 tracker 前會先被 `detect.py` 過濾：
+```bash
+OUTPUT_ROOT=output \
+conda run -n rtdetr python scripts/main.py /path/to/video.mp4
+```
 
-1. 只接受 class name 為 `litter` 的結果。
-2. 過濾極端長寬比與過小 bbox，避免明顯雜訊進入 tracker。
-3. 使用前景遮罩檢查 litter bbox 內的 moving pixel ratio。
-4. 對較大的 litter bbox 再檢查核心區域 motion，避免旁邊人車移動誤觸發舊垃圾。
-5. 從既有 tracker 找最近上一幀 litter center。
-6. 若是新出現 litter，先放入 tracker 建立 pending history anchor。
-7. 若已有上一幀中心，呼叫 `litter_holding()` 判斷是否仍被人、車或機車持有。
+請勿沿用舊版本的 `--batch`、`--disable-action`、`--disable-plate`、`--no-engine`、`--trash-conf` 參數；目前 CLI 不接受這些選項。
 
-### Holding Gate
+### 常用環境變數
 
-`litter_holding()` 會用 actor bbox、segmentation polygon、litter 位移、車輛位移與相對速度判斷是否仍是 holding：
+| 變數 | 預設 | 說明 |
+|---|---:|---|
+| `PIPELINE_BATCH` | `8` | Pipeline batch size |
+| `YOLO_SEG_FRAME_SKIP` | `2` | Vehicle/scooter detector cadence |
+| `BBOX_CONF` | `0.45` | Actor confidence |
+| `TRASH_CONF` | `0.4` | Litter candidate confidence |
+| `ACTION_WINDOW` | `100` | STGCN sequence frames |
+| `URINATION_WINDOW_SEC` | `8.0` | Urinate evidence window |
+| `URINATION_MIN_SEC` | `5.0` | Binary evidence minimum |
+| `VEHICLE_GATE` | `1` | Vehicle gate enable |
+| `VEHICLE_GATE_TTL_SEC` | `3.0` | Recent vehicle TTL |
+| `RTDETR_ENABLED` | `1` | Litter detector/OCR enable |
+| `SMART_BACKTRACK` | `1` | Smart attribution enable |
+| `SMART_BACKTRACK_SIDECAR` | `1` | Candidate sidecar enable |
+| `OUTPUT_ROOT` | `.` | Output directory；建議明確設為 `output` |
 
-1. litter anchor 在 actor polygon 內，通常視為仍被持有。
-2. litter 貼近 vehicle/scooter mask 底部或側邊時，若沒有明確 release motion，視為 holding。
-3. vehicle release 需要向下位移、水平位移、相對車體分離或明確絕對位移。
-4. 靜止 litter 加上車輛仍在移動時，不視為 holding，避免地上垃圾被移動車輛黏住。
-5. 通過 holding gate 後，litter 才會交給 tracker。
+完整預設值以 `scripts/pipeline/config.py` 與各環境變數使用點為準。
 
-### Tracker 確認
+## 輸出
 
-`GlobalLitterTracker.update()` 會把通過前處理的 litter 串成軌跡：
+假設輸入為 `resize.mp4`，且 `OUTPUT_ROOT=output`：
 
-1. 以中心距離與尺寸一致性配對既有 active litter。
-2. 新 litter 建立 `pending` 狀態，記錄 bbox、history、shape 與出生幀 thrower。
-3. pending 更新時累積中心點 history，並重新評估最可能 thrower。
-4. confirmed 需要足夠觀測幀數與向下位移。
-5. confirmed 可由兩條路成立：
-   - `validate_trajectory()` 通過：軌跡平滑、總位移足夠、Y 軸往下。
-   - motion route 通過：位移明顯、Y 軸往下、且能關聯到 thrower。
-6. confirmed 後才會在畫面畫出紫色 `Litter {id} (confirmed)`。
+```text
+output/resize_annotated.mp4
+output/resize_annotated_summary.json
+output/resize_annotated_events.jsonl
+output/resize_annotated_backtrack_candidates.jsonl
+```
 
-### 後處理
+實際 sidecar 是否產生取決於功能開關與事件狀態。
 
-confirmed 後會進入違規者後處理：
+## 測試
 
-1. tracker 用 pseudo-ground homography 估計 litter 與 actor 的地面距離。
-2. 選出最可能 thrower，寫入 violator TTL cache。
-3. 若 thrower 是 person，且曾與 vehicle/scooter 有 IoU 關聯，會同步標記該車輛。
-4. 違規者用紅框顯示，TTL 期間可容忍短暫 miss。
-5. 若 tracking ID 短暫切換，會以同類別近距離 rebind 延續違規標記。
-6. 車牌辨識只對已鎖定違規車輛執行，避免每幀掃描所有車輛。
+### Compile smoke
+
+```bash
+conda run -n rtdetr python -m py_compile \
+  scripts/main.py \
+  scripts/pipeline/action.py \
+  scripts/pipeline/detect.py \
+  scripts/pipeline/litter_tracker.py
+```
+
+### Pipeline tests
+
+```bash
+conda run -n rtdetr python -m pytest -q tests/pipeline
+```
+
+### Targeted GPU-free tests
+
+```bash
+conda run -n rtdetr python -m pytest -q \
+  tests/pipeline/test_config.py \
+  tests/pipeline/test_import_smoke.py \
+  tests/pipeline/test_backtrack_kalman.py \
+  tests/pipeline/test_backtrack_costs.py \
+  tests/pipeline/test_backtrack_flow.py
+```
+
+大型模型與影片測試必須明確列出使用的 weights、clip、環境變數與輸出結果。MP4 可解碼只代表輸出容器正常，不代表事件或歸因正確。
+
+## Git 開發流程
+
+### Branch ownership
+
+```text
+main          正式穩定版本
+dev/heetah    張宇誠個人整合 branch
+dev/pgdr      張哲誠個人整合 branch
+```
+
+禁止建立個人 production 資料夾。需要平行開發時使用 branch 或 Git worktree。
+
+### 每次功能開發
+
+1. 從最新穩定基準建立或同步自己的 branch。
+2. 先確認目標行為與測試案例。
+3. 完成一個可獨立驗收的功能或修正。
+4. 執行 unit test；依風險執行 integration/regression。
+5. 更新本 `README.md` 中受影響的架構、命令或參數。
+6. 新增 `versions/YYYY-MM-DD_<author>_<topic>.md`。
+7. 建立 atomic Conventional Commit。
+8. Push、建立 PR、review、通過測試後合併。
+
+Commit 範例：
+
+```text
+feat(backtrack): add NULL route for uncertain attribution
+fix(litter): reject stationary vehicle components
+refactor(pipeline): extract video I/O workers
+test(action): add sustained urination regression
+docs(architecture): document vehicle gate behavior
+chore(repo): rename production pipeline directory
+```
+
+## Version note 格式
+
+檔名：
+
+```text
+versions/2026-08-02_heetah_backtrack.md
+```
+
+內容至少包含：
+
+```markdown
+# 變更標題
+
+- 日期：
+- 作者：
+- Branch：
+- Commit：
+- 類型：feat / fix / refactor / test / docs / chore
+
+## 問題背景
+## 實作內容
+## API／Config／Schema 變更
+## 測試證據
+## 已知限制
+## 回滾方式
+```
+
+## AI Agent 規則
+
+所有 AI Coding Agent 必須完整閱讀 `AGENTS.md`，再讀 live code。`AGENTS.md` 是唯一 AI 規則內容來源；本專案不維護第二份重複的 `CLAUDE.md`。

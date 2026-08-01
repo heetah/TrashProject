@@ -8,9 +8,9 @@
 import os
 import sys
 
-# 本檔位於 <repo>/scripts-old-test/pipeline/paths.py。
-PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))          # scripts-old-test/pipeline
-SCRIPTS_DIR = os.path.dirname(PACKAGE_DIR)                         # scripts-old-test
+# 本檔位於 <repo>/scripts/pipeline/paths.py。
+PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))          # scripts/pipeline
+SCRIPTS_DIR = os.path.dirname(PACKAGE_DIR)                         # scripts
 REPO_ROOT = os.path.dirname(SCRIPTS_DIR)                          # <repo>
 MMACTION_REPO = os.path.join(REPO_ROOT, "mmaction2")
 

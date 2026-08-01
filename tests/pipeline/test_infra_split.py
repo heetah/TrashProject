@@ -10,7 +10,7 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
 
 import pipeline.infra as infra
 from pipeline.infra import constants, video_io, motion, models

@@ -12,7 +12,7 @@
   - dummy/dustbin 欄容許「行人無車」不被強配(SuperGlue, Sarlin et al. CVPR 2020 的規則型版)。
   - 確認車輛類別(過濾欄) 必須在建分數矩陣「之前」,否則 dustbin 會被假車欄搶走。
 
-整合契約(之後接入 scripts-old-test/ 用):
+整合契約(之後接入 scripts/ 用):
   唯一輸入 `frame_history` 的格式 == litterTracker.actor_frame_history 的元素:
       [{'frame_index': int,
         'actors': [{'cls': 'person'|'vehicle'|'scooter',

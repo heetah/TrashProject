@@ -14,6 +14,11 @@ _SCRIPT_PATH = (
     / "tools"
     / "render_backtrack_annotation_previews.py"
 )
+if not _SCRIPT_PATH.exists():
+    pytest.skip(
+        "optional backtrack annotation preview tool is not present in this checkout",
+        allow_module_level=True,
+    )
 _SPEC = importlib.util.spec_from_file_location(
     "render_backtrack_annotation_previews", _SCRIPT_PATH
 )

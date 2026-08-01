@@ -6,7 +6,7 @@ import sys
 import numpy as np
 
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
 
 from pipeline.backtrack.tracking import KalmanHungarianTracker
 from pipeline.backtrack.costs import CostCell

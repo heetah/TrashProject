@@ -27,7 +27,7 @@ OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
 
 
 def compute_pixel_change_map(prev_frame, curr_frame):
-    # 與 scripts-old-test/detect.py 完全一致的 change channel 構造方式。
+    # 與 scripts/detect.py 完全一致的 change channel 構造方式。
     if prev_frame is None:
         return np.zeros(curr_frame.shape[:2], dtype=np.uint8)
     diff = cv2.absdiff(prev_frame, curr_frame)

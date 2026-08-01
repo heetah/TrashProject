@@ -5,7 +5,7 @@ detect() 在給定 precomputed actors + stub 偵測輸出、model 傳 None/stub 
 執行(不碰 YOLO/RTDETR/STGCN)。本測試對固定場景把「標註影格 sha + 可觀察狀態」釘成
 golden,作為 detect() 拆解成 stage 函式時的行為不變閘門——輸出必須逐位元相同。
 
-    conda run -n rtdetr python -m pytest scripts-old-test/tests/test_detect_characterization.py -q
+    conda run -n rtdetr python -m pytest tests/pipeline/test_detect_characterization.py -q
 """
 import hashlib
 import os
@@ -14,7 +14,7 @@ from collections import defaultdict, deque
 
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
 
 from pipeline.detect import detect
 from pipeline.litter_tracker import GlobalLitterTracker

@@ -7,8 +7,10 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
 
 from pipeline.backtrack.annotations import (
     ANNOTATION_SCHEMA,
@@ -332,6 +334,8 @@ def test_cli_init_validate_and_evaluate(tmp_path):
     )
     annotation_path = tmp_path / "annotations.jsonl"
     cli = Path(__file__).resolve().parents[2] / "tools" / "backtrack_annotations.py"
+    if not cli.exists():
+        pytest.skip("optional backtrack annotations CLI is not present in this checkout")
 
     initialized = subprocess.run(
         [

@@ -5,12 +5,12 @@
 確保 re-export 搬移沒有破壞既有 import。不需要 GPU/模型載入即可執行,作為每次搬移的
 回歸安全網:
 
-    conda run -n rtdetr python -m pytest scripts-old-test/tests/test_import_smoke.py -q
+    conda run -n rtdetr python -m pytest tests/pipeline/test_import_smoke.py -q
 """
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
 
 
 def test_profiling_shim_identity():
@@ -48,7 +48,7 @@ def test_paths_repo_root_resolves():
     # pipeline.paths 取代 action.py/litterTracker.py 的 __file__ 相對推算,
     # 必須指到真正的 repo root(含 mmaction2),搬移後路徑深度才不會漂掉。
     assert os.path.isdir(paths.REPO_ROOT), paths.REPO_ROOT
-    assert os.path.basename(paths.SCRIPTS_DIR) == "scripts-old-test"
+    assert os.path.basename(paths.SCRIPTS_DIR) == "scripts"
     assert paths.MMACTION_REPO == os.path.join(paths.REPO_ROOT, "mmaction2")
     assert os.path.isdir(paths.MMACTION_REPO), paths.MMACTION_REPO
 
@@ -97,7 +97,8 @@ def test_infra_no_longer_imports_detector():
 def test_main_uses_canonical_pipeline_imports():
     # 生產進入點應直接 import pipeline.*,不再依賴舊扁平 shim。
     main_src = open(
-        os.path.join(os.path.dirname(__file__), "..", "main.py"), encoding="utf-8"
+        os.path.join(os.path.dirname(__file__), "..", "..", "scripts", "main.py"),
+        encoding="utf-8",
     ).read()
     for legacy in (
         "from detect import",

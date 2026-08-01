@@ -1,506 +1,336 @@
-# AGENTS.md
+# 環保科技執法系統 AI Agent Instruction
 
-## Project Reality
+- Version: `v0.2`
+- Last verified: `2026-08-01`
+- Repository: `/home/se_copilot/trashProject`
+- Production pipeline: `scripts/`
+- Default runtime: `conda run -n rtdetr ...`
 
-- Repo root: `/home/se_copilot/trashProject`.
-- Default runtime env: `conda run -n rtdetr ...`.
-- Primary active video pipeline: `scripts-old-test/`.
-- Important reference trees:
-  - `scripts-old-stable/`: rollback/reference baseline. Do not edit unless asked.
-  - `scripts-old-stgcn/`: STGCN / YOLO-Pose comparison and batch-eval path.
-  - `scripts-heetah/`: integrated HEE TAH path when present in a task. Verify folder exists before using older notes.
-  - `dataset-pose/`, `dataset-pose-wholebody/`, `dataset-pose-wholebody-under115a/`: legacy or existing STGCN/STGCN++ pose artifacts. Verify actual keypoint source before reusing.
-  - `mmaction2/`: vendored STGCN/STGCN++ training/inference dependency. Keep edits narrow.
-  - `mmpose-rtmw/`: legacy RTMW dependency. Do not use RTMW for the current production keypoint path unless the user explicitly asks to restore RTMW.
+本文件是本 repository 唯一的 AI Coding Agent 規則來源，適用於 Codex、Claude 或其他會讀取專案指令的 Coding Agent。AI 的任務是協助開發固定監視器影片中的亂丟垃圾、隨地便溺、違規者反追蹤、車輛關聯與車牌辨識系統。
 
-## Working Rules
-
-- Inspect live code before answering. This repo drifts often; memory can be stale.
-- Use `rg` / `rg --files` first for search.
-- Preserve user changes. Never reset or checkout files unless explicitly asked.
-- Use `apply_patch` for manual edits.
-- Default language for explanations: Traditional Chinese when user asks codeflow/training/debug details.
-- For runtime work, prefer actual evidence: command output, validation clip result, `py_compile`, video decode check, or artifact metric.
-- If GPU is busy or user asks to lower compile/init churn, avoid repeated heavyweight model loads. Use static checks, small smoke tests, or existing logs first.
-- Do not silently change the pipeline responsibility split. In the current workflow:
-  - YOLO-Pose + STGCN handles only `normal` / `urinate`.
-  - Littering is handled only by the litter object-event branch.
-  - RTMW is not used for keypoint extraction.
+本文件不是監視器運行時的事件判斷 prompt，也不能取代人類對罰單與證據的最終審核。
 
 ---
 
-# Current Workflow Contract
+## 1. Instruction Authority
 
-## High-Level Flow
+發生衝突時依以下順序處理：
+
+1. `AGENTS.md`：產品安全、證據層級、模組責任與開發規則。
+2. Live code：當前函式、CLI、環境變數、schema 與實際預設值。
+3. `README.md`、subsystem README、`versions/`：人類說明與歷史紀錄。
+
+若 live code 違反本文件的安全或責任合約，不可自行把錯誤行為寫回文件。先指出衝突，再做最小修正。若只是介面或參數已更新，則以 live code 為準並同步更新文件。
+
+回答架構、執行流程或效能問題前，必須先讀 live code；本 repository 漂移頻繁，禁止只憑記憶回答。
+
+---
+
+## 2. Repository Directory Contract
 
 ```text
-Input Video
-  -> Load Models
-  -> Background Frame Reader Thread
-  -> Frame Queue
-  -> Main Inference Thread
-  -> YOLO-Seg Actor Detection
-      -> Person Branch
-          -> YOLO-Pose Keypoint Extraction
-          -> Accumulate Keypoints by Person Track ID
-          -> STGCN Action Recognition
-          -> Output: normal / urinate only
-      -> Vehicle / Scooter Branch
-          -> Vehicle-Person Association
-      -> Litter Branch
-          -> RT-DETR / YOLO Litter Detection
-          -> Motion Check
-          -> Temporal Difference
-          -> Holding Algorithm
-          -> Confirm Littering Event
-          -> Backtrack Thrower and Vehicle
-          -> OCR License Plate
-          -> Output Annotated Video
+trashProject/
+├── scripts/                  # 唯一 production pipeline
+│   ├── main.py               # 影片推論入口
+│   ├── pipeline/             # 主要 Python 實作
+│   │   ├── action.py
+│   │   ├── detect.py
+│   │   ├── litter_tracker.py
+│   │   ├── plate.py
+│   │   ├── events.py
+│   │   ├── config.py
+│   │   ├── infra/
+│   │   ├── litter/
+│   │   └── backtrack/
+│   ├── frontend/             # summary/events 靜態檢視介面
+│   └── *.py                  # 舊 import compatibility shims 或工具入口
+├── tests/
+│   ├── pipeline/             # production pipeline unit/integration tests
+│   └── test_litter_regression.py
+├── modules_weight/           # 本機模型權重；不進一般 Git
+├── resources/                # 本機影片；不進一般 Git，可不存在
+├── dataset-pose/             # STGCN pose annotation/training artifacts
+├── mmaction2/                # vendored STGCN/STGCN++ dependency
+├── artifacts/                # backtrack sidecar、annotation、metrics；預設不進 Git
+├── output/                   # annotated video、summary、events；不進 Git
+├── versions/                 # 每次整合版本的 Markdown 紀錄
+├── scripts-old-stable/       # rollback/reference baseline，非 production
+├── README.md                 # 給人類開發者的架構與流程
+└── AGENTS.md                 # 唯一 AI Agent Instruction
 ```
 
-## Responsibility Split
+### Folder rules
 
-### Person Action Branch
+| Path | Agent 可以做 | Agent 不可以做 |
+|---|---|---|
+| `scripts/` | 實作 production 功能、修 bug、更新相容 shim | 建立個人版本副本、混入測試影片或權重 |
+| `scripts/pipeline/` | 新增可重用模組、維持清楚 data flow | 把核心功能寫回頂層 shim、跨分支偷改責任 |
+| `tests/` | 新增 unit/integration/regression test | 把測試重新塞回 `scripts/` |
+| `modules_weight/` | 讀取與驗證本機模型 metadata | 把大型 `.pt/.pth/.onnx/.engine` 加進一般 Git |
+| `resources/` | 執行明確指定的測試影片 | 把大量影片加入一般 Git |
+| `dataset-pose/` | 維護 YOLO-Pose 產生的 STGCN annotation | 重新引入 RTMW keypoints |
+| `mmaction2/` | 必要時做最小相容修正 | 大範圍格式化或無關 vendor 改寫 |
+| `artifacts/` | 儲存研究 sidecar、metrics、預覽 | 把 coverage 當作 accuracy |
+| `output/` | 儲存執行輸出並驗證可解碼性 | 把可解碼影片宣稱為模型正確性證據 |
+| `versions/` | 新增版本說明 | 改寫既有版本歷史以掩蓋變更 |
+| `scripts-old-stable/` | 唯讀比較與 rollback 參考 | 未經明確要求直接修改 |
 
-Responsible for:
+不得建立 `heetah/`、`pgdr/` 或其他個人 production 副本。開發隔離完全使用 Git branch/worktree。
 
-- detecting / tracking person actors from YOLO-Seg output,
-- extracting person keypoints using YOLO-Pose,
-- accumulating keypoint sequences by `track_id`,
-- running STGCN only after enough keypoint frames are available,
-- classifying person action as only:
-  - `normal`
-  - `urinate`
-- confirming `urinate` only with sustained temporal evidence.
-
-Not responsible for:
-
-- detecting littering,
-- detecting thrown objects,
-- confirming litter objects,
-- vehicle/scooter OCR,
-- license plate recognition,
-- RTMW inference.
-
-### Litter Object-Event Branch
-
-Responsible for:
-
-- detecting litter candidates with RT-DETR / YOLO litter detector,
-- assigning litter IDs,
-- recording first appearance frame `F2`,
-- validating object motion and temporal difference,
-- applying `litter_holding()` behavior evidence,
-- confirming littering events,
-- backtracking the likely thrower,
-- associating thrower with vehicle/scooter when possible,
-- triggering OCR and warning visualization for confirmed littering.
-
-Not responsible for:
-
-- human pose estimation,
-- STGCN action classification,
-- urinate classification.
-
-### Vehicle / Scooter Branch
-
-Responsible for:
-
-- tracking vehicle/scooter actors,
-- filtering tiny or invalid vehicle candidates,
-- associating nearby person and vehicle/scooter actors,
-- supporting later violation attribution and OCR crop selection.
-
-Not responsible for:
-
-- STGCN action recognition,
-- keypoint extraction,
-- direct litter confirmation.
-
-### OCR Branch
-
-Responsible for:
-
-- cropping confirmed violator vehicle/scooter ROI,
-- running PaddleOCR,
-- outputting license plate text when confident enough.
-
-Not responsible for:
-
-- detecting actions,
-- confirming litter objects,
-- pose extraction.
+`mmpose-rtmw/` 已從 repository 移除。不得重新建立、載入或作為 production fallback。
 
 ---
 
-# Main Pipeline: `scripts-old-test/`
+## 3. Product Goal and Evidence Levels
 
-- Entry: `scripts-old-test/main.py`.
-- Typical command:
+系統目標是從固定監視器畫面建立可稽核的違規證據鏈：
 
-```bash
-conda run -n rtdetr python scripts-old-test/main.py resources/resize.mp4 --batch 8
+```text
+detection candidate
+  -> confirmed event
+  -> attributed person/vehicle
+  -> readable plate
+  -> finable case
 ```
 
-- Output goes under `output/*_annotated.mp4`.
-- Actor model: YOLO segment, class-name based `person`, `scooter`, `vehicle`.
-- Pose model: YOLO-Pose only for current STGCN keypoint extraction.
-- Litter model: RT-DETR or YOLO litter detector, `litter` only.
-- STGCN action module: `scripts-old-test/action.py`; enabled by default unless `--disable-action`.
-- OCR path: `scripts-old-test/licensePlate.py`; expensive, should be gated with `--disable-plate` for litter-only speed work.
-- Timing owner: `scripts-old-test/timeUtils.py`; preserve final grouped timing summary and `tqdm` behavior where present.
-- RTMW must not be loaded, initialized, called, or used as fallback in the current production workflow.
+以上每一層都必須分開。下游失敗不能回頭偽造上游證據。
 
-## Expected Runtime Sequence
+- Detector bbox 只是 candidate，不是 confirmed event。
+- Confirmed litter 代表垃圾事件成立，不代表已找到正確違規者。
+- 找到附近人車不代表歸因成立。
+- 車牌 OCR 失敗不得猜測或補造文字。
+- 人、車或車牌證據不足時保留事件並輸出 `NULL`／人工複核，不得強制配對。
+- 自動開罰必須同時具有可靠事件、歸因與車牌證據；AI 輸出仍需人類依法規與證據程序複核。
 
-1. Read video frames in a background thread.
-2. Push frames into queue.
-3. Main thread pops a batch, usually `--batch 8`.
-4. Run YOLO-Seg actor detection for `person`, `vehicle`, `scooter`.
-5. For each tracked person:
-   - use YOLO-Pose to extract keypoints,
-   - append keypoints to `person_kps_buffer[track_id]`,
-   - run STGCN only when enough frames exist,
-   - output only `normal` or `urinate`.
-6. For each vehicle/scooter:
-   - keep valid tracks,
-   - associate person and vehicle/scooter by proximity / IoU / policy logic.
-7. Run litter detector to find litter candidates.
-8. Send litter candidates into `GlobalLitterTracker`.
-9. Confirm littering only after behavior / motion / temporal evidence.
-10. For confirmed littering:
-    - backtrack likely thrower,
-    - associate vehicle/scooter,
-    - crop plate ROI,
-    - run PaddleOCR,
-    - draw final violation annotation.
-11. Write annotated output video.
+降低誤罰優先於強制產生結果。
 
 ---
 
-# Detection Semantics
+## 4. Current Production Flow
 
-## Litter Detection Semantics
+```text
+Input video
+  -> model preload/warmup
+  -> background frame reader + motion mask
+  -> batched main inference
+  -> YOLO-Seg vehicle/scooter detection
+  -> vehicle gate
+      -> YOLO-Pose person detection/tracking/keypoints
+      -> STGCN normal/urinate classification
+      -> RT-DETR 4-channel litter candidates
+      -> motion/shape/core-motion/holding filters
+      -> GlobalLitterTracker pending/confirmed
+      -> Smart Backtrack person/vehicle/NULL route
+      -> plate detection + PaddleOCR
+  -> confirmed-event rendering
+  -> annotated video + summary/events/sidecar
+```
 
-- RT-DETR / YOLO litter bbox is only a candidate. It is not a confirmed violation by itself.
-- Confirmed litter must pass tracker/behavior evidence in `GlobalLitterTracker`.
-- Preserve these intent signals:
-  - physical trajectory validation,
-  - horizontal movement,
-  - downward Y movement,
-  - ROI/background motion evidence for 1-2 frame detections,
-  - polygon-aware holding rules in `litter_holding()`,
-  - same-id litter history when requested.
-- Keep `litter_holding()` behavior-based. Inside actor polygon, only clear downward + horizontal release motion should pass as released.
-- Noise fixes should strengthen motion/shape/component evidence, not only lower thresholds.
-- Draw only confirmed litter as confirmed. Avoid showing pending candidates as if final.
-- Never trigger littering violation from STGCN output.
+同幀主要偵測流程有明確順序。背景 reader、writer 或 worker overlap 不等於 GPU kernels 已並行；除非有 profiler/CUDA trace，不得宣稱模型同時執行。
 
-## STGCN Semantics
+---
 
-- STGCN classifier score is not person bbox confidence. UI text should say `STGCN`.
-- STGCN is only for `normal` / `urinate` action judgment going forward.
-- STGCN classes must be exactly:
+## 5. Model and Module Responsibility
+
+### Vehicle / scooter branch
+
+- YOLO-Seg 負責 `vehicle`、`scooter` detection/tracking。
+- Vehicle/scooter 是 person association、litter attribution 與 OCR 的基礎。
+- `VEHICLE_GATE` 預設開啟；`VEHICLE_GATE_TTL_SEC` 預設 `3.0` 秒。
+- Gate 關閉時可略過 pose、STGCN、litter 與 OCR 等昂貴路徑。
+- 不負責 STGCN action classification 或直接確認 litter。
+
+### Person / action branch
+
+- YOLO-Pose 是 production person detection、tracking、keypoints 的唯一來源。
+- Keypoints 依 YOLO-Pose `track_id` 直接對齊，不再做 pose-vs-seg IoU 配對。
+- STGCN 只接受 YOLO-Pose keypoint sequence。
+- `ACTION_CLASSES` 必須保持：
 
 ```python
 ACTION_CLASSES = {0: "normal", 1: "urinate"}
 ```
 
-- Do not classify, alert, or visualize `littering` action through STGCN.
-- Littering violations come from confirmed litter tracker/behavior evidence, not STGCN action output.
-- `urinate` requires sustained evidence. Current preferred rule:
-  - default 8 second temporal window,
-  - at least 6 seconds positive `urinate` evidence.
-- If current code still uses older policy values, such as 10 second window and 8 seconds positive, do not change silently. Confirm the intended threshold in the task or preserve existing code behavior.
-- Suppress `urinate` for person tracks linked to vehicle/scooter when that policy is active.
-- `ACTION_PREDICT_INTERVAL` reduces classifier cadence after sequence window is full; pose extraction can still dominate cost.
-- STGCN inference should run only after enough keypoint frames are collected, usually:
+- 禁止新增 `littering`、`throwing` 或 `litter` STGCN class。
+- Sequence 預設為 `100` frames。
+- `PipelineConfig` 目前預設 urinate window `8.0` 秒、minimum evidence `5.0` 秒。
+- Top-p evidence、high/low confidence 可由現有環境變數調整，但不可靜默修改預設。
+- 單次 urinate score 不可直接產生 violation，必須通過 temporal confirmation。
 
-```python
-MIN_STGCN_FRAMES = 30
-```
+### Litter object-event branch
 
-## YOLO-Pose Keypoint Semantics
+- RT-DETR 4-channel 只產生 class `litter` candidate。
+- 第四通道來自 temporal pixel-change map；修改時必須驗證最終模型輸入，不只檢查來源影像。
+- Candidate 必須經過 geometry、motion、core-motion、camera-shake、holding 與 tracker evidence。
+- `pending` 不得畫成 confirmed violation。
+- 只有 `GlobalLitterTracker` 確認後才能建立 littering event。
+- 噪聲修正應強化 motion、shape、component 或 physical evidence，不可只降低 threshold。
 
-- YOLO-Pose is the only current source of person keypoints for STGCN.
-- Expected keypoint buffer concept:
+### Smart Backtrack
 
-```python
-person_kps_buffer[track_id].append({
-    "frame_index": frame_index,
-    "keypoints": keypoints,
-    "bbox": bbox,
-    "confidence": pose_confidence,
-})
-```
+- Smart Backtrack 位於 `scripts/pipeline/backtrack/`，預設由 `SMART_BACKTRACK=1` 啟用。
+- Hungarian 只處理同類、同一物件的跨幀 identity，不可拿來做 person↔vehicle 或 litter attribution。
+- 流程為 confidence-aware Kalman、RTS smoothing、反向 litter trajectory、`C_BA/C_AC/C_BC`、route scoring、Min-Cost Flow。
+- Person/vehicle capacity 必須允許同車多人與同人多事件。
+- 每個事件必須保留完整 `NULL` route，禁止 forced match。
+- Smart attribution 只能處理已 confirmed litter；不能救回未通過 litter confirmation 的 candidate。
+- Sidecar 是研究與標註資料，不是 ground truth。未經人工 reviewed annotation，不得宣稱 attribution accuracy。
 
-- Convert YOLO-Pose keypoints into the STGCN input layout before inference.
-- If keypoints are missing, low-confidence, or unstable:
-  - do not invent a violation,
-  - skip the frame or apply existing interpolation / smoothing only if already supported,
-  - keep logs clear about skipped pose frames.
+### OCR branch
 
-## RTMW Legacy Semantics
-
-- RTMW is legacy in the current workflow.
-- Do not use RTMW for:
-  - keypoint extraction,
-  - fallback pose inference,
-  - STGCN preprocessing,
-  - production visualization,
-  - new training data generation.
-- Search and remove or disable current-production usages of:
-
-```text
-rtmw
-RTMW
-rtmw_model
-rtmw_pose
-rtmw_keypoints
-extract_keypoints_with_rtmw
-mmpose-rtmw
-```
-
-- Keep vendored RTMW files untouched unless the task explicitly asks for legacy RTMW cleanup.
+- 只處理已可靠歸因的 vehicle/scooter ROI。
+- 使用原始未畫框 frame crop，避免 annotation 污染 OCR。
+- OCR 低信心、遮擋或無結果時保存證據與失敗狀態，不得生成虛構車牌。
+- OCR 不負責 event confirmation、pose 或 action classification。
 
 ---
 
-# Code-Level Requirements
+## 6. Runtime Contract
 
-## Action Classes
-
-Old or invalid form:
-
-```python
-ACTION_CLASSES = ["normal", "urinate", "littering"]
-```
-
-Required form:
-
-```python
-ACTION_CLASSES = {0: "normal", 1: "urinate"}
-```
-
-Do not add:
-
-```python
-"littering"
-"throwing"
-"litter"
-```
-
-to STGCN action labels.
-
-## STGCN Output Contract
-
-Expected output shape for person branch:
-
-```python
-{
-    "track_id": person_id,
-    "action": "normal" | "urinate",
-    "confidence": float,
-    "frame_index": current_frame_index,
-}
-```
-
-## STGCN Postprocessing
-
-Allowed postprocessing pattern:
-
-```python
-if action == "urinate":
-    update_urinate_state(track_id)
-elif action == "normal":
-    update_normal_state(track_id)
-else:
-    ignore_unknown_action(track_id, action)
-```
-
-Invalid postprocessing pattern:
-
-```python
-if action == "littering":
-    ...
-```
-
-## Warning Visualization
-
-For confirmed `urinate` violation:
-
-```text
-Draw warning around the person.
-Display text similar to:
-"WARNING: URINATE"
-```
-
-For confirmed littering violation:
-
-```text
-Draw warning only from the litter object-event branch.
-Do not use STGCN result for littering warning.
-```
-
-For pending candidates:
-
-```text
-Do not draw them as final confirmed violations.
-Use debug-only overlay if needed and if a debug flag exists.
-```
-
----
-
-# Validation Clips
-
-Use exact clips when relevant instead of substitutes:
-
-- Litter confirmation regression: `resize.mp4`, `manyFast.mp4`, `resize5.mp4`, `1fast.mp4`, `success.mp4`.
-- STGCN/action regression: `urinate.mp4`, `normal_case1.mp4`, `normal_case2.mp4`, `best_urinate.mp4`.
-- Use litter clips only for tracker-based litter confirmation, not STGCN littering action.
-- For `scripts-heetah/` detector-vs-pipeline mismatch, compare root `test.py` raw detector result with integrated pipeline before blaming weights.
-
-Useful lightweight validator:
+目前 `scripts/main.py` 只接受一個 positional video path。執行參數主要由 `PipelineConfig` 與環境變數控制。
 
 ```bash
-conda run -n rtdetr python validate_old_test_videos.py --expect-positive resize.mp4 manyFast.mp4
+OUTPUT_ROOT=output PIPELINE_BATCH=8 \
+conda run -n rtdetr python scripts/main.py resources/resize.mp4
 ```
 
-For code-only edits, at minimum run targeted compile:
+不得沿用已失效的舊 CLI，例如：
+
+```text
+--batch
+--disable-action
+--disable-plate
+--no-engine
+--trash-conf
+```
+
+在提供命令前，先讀 `scripts/main.py`、`scripts/pipeline/config.py` 與使用點的環境變數。
+
+---
+
+## 7. Coding Agent Workflow
+
+任何修改前必須：
+
+1. 完整讀取根目錄 `AGENTS.md`。
+2. 讀取 `README.md` 與目標 subsystem README。
+3. 執行 `git status --short`，保留使用者與其他開發者的未提交變更。
+4. 以 `rg` 搜尋 live entrypoint、callers、tests、config 與 schema。
+5. 確認任務屬於哪個 module responsibility，禁止跨分支偷接捷徑。
+6. 先建立或選定可驗收行為，再進行最小修改。
+
+修改時：
+
+- 使用清楚、模組化、可測試的 Python。
+- 新 production 實作放在 `scripts/pipeline/`；頂層同名檔只保留 compatibility shim。
+- 不做無關格式化、批次改名或 opportunistic cleanup。
+- 不覆蓋不相關的 working-tree changes。
+- 不使用 `git reset --hard`、`git checkout --` 或其他破壞性復原。
+- 不在未獲批准時下載 dependency、模型或影片。
+- 模型 device/CUDA 問題先檢查 torch、device count、`/dev/nvidia*` 與 `nvidia-smi`，不要直接改成 CPU 後宣稱已修復 GPU。
+
+完成時：
+
+- 執行與風險相稱的測試。
+- 更新 `README.md` 中受影響的架構或操作內容。
+- 新增 `versions/YYYY-MM-DD_<author>_<topic>.md`。
+- 回報修改檔案、測試證據、未驗證項目與已知限制。
+
+---
+
+## 8. Git and Team Development Rules
+
+### Branches
+
+- `main`：正式穩定版本，只接受通過 review/test 的整合。
+- `dev/heetah`：張宇誠個人整合 branch。
+- `dev/pgdr`：張哲誠個人整合 branch。
+- 較大功能可由個人 branch 再建立 `feat/...`、`fix/...` 短期 branch。
+- 禁止以本機資料夾複製個人版本。
+
+### Commit boundary
+
+Commit 以可獨立驗收的行為為單位，不以單一函式行數為單位。程式、必要測試與相依文件應形成 atomic change。
+
+採 Conventional Commits：
+
+```text
+feat(backtrack): add NULL route for uncertain attribution
+fix(litter): reject stationary vehicle components
+refactor(pipeline): extract video I/O workers
+test(action): add sustained urination regression
+docs(architecture): document vehicle gate behavior
+perf(detection): reduce repeated model inference
+chore(repo): reorganize project layout
+```
+
+完成流程：
+
+```text
+sync branch
+  -> implement one behavior
+  -> unit test
+  -> integration/regression where relevant
+  -> update README.md
+  -> add versions note
+  -> commit
+  -> push
+  -> PR/review
+  -> merge to main
+  -> release tag when appropriate
+```
+
+---
+
+## 9. Validation Rules
+
+### Fast code validation
 
 ```bash
-conda run -n rtdetr python -m py_compile scripts-old-test/main.py scripts-old-test/detect.py scripts-old-test/litterTracker.py scripts-old-test/action.py
+conda run -n rtdetr python -m py_compile \
+  scripts/main.py \
+  scripts/pipeline/action.py \
+  scripts/pipeline/detect.py \
+  scripts/pipeline/litter_tracker.py
 ```
 
-If output video integrity is part of task, verify final MP4 is decodable with `ffprobe` or OpenCV read.
+```bash
+conda run -n rtdetr python -m pytest -q tests/pipeline
+```
 
-## Required Regression Expectations
+若完整 suite 因缺少外部影片、模型或工具而無法執行，必須跑可執行的 targeted tests，並清楚列出未執行項目，不得寫成全部通過。
 
-### Case 1: Normal person
+### Runtime validation
 
-Expected:
+- Litter regression 使用明確指定的 litter clips。
+- STGCN regression 使用 normal/urinate clips，不得用 litter clip 評估 STGCN littering。
+- 修改輸出影片時，用 `ffprobe` 或 OpenCV 驗證 MP4 可解碼。
+- 可解碼只代表容器 smoke pass，不代表事件或歸因正確。
+- GPU concurrency、效能改善、模型 accuracy 必須提供 profiler、trace、reviewed labels 或正式 metrics。
+
+### Required behavior scenarios
+
+1. 新 litter candidate 證據不足：保持 pending 或丟棄，不 confirmed、不開罰。
+2. Confirmed litter 找不到可靠人車：保存事件，選擇 `NULL`／人工複核。
+3. Person sustained urinate：只由 YOLO-Pose + STGCN temporal evidence 確認。
+4. Person throws litter：STGCN 可以是 normal；littering 只由 object-event branch 確認。
+5. 找到違規車但 OCR 失敗：保存 ROI 與失敗狀態，不產生車牌、不自動開罰。
+
+---
+
+## 10. Documentation Rules
+
+`README.md` 給人類開發者，必須保持：
+
+- 目錄與 module responsibility 正確。
+- 執行命令與 live CLI/env 一致。
+- 輸入、輸出、模型與測試方式可重現。
+- 不保留已失效的架構或參數範例。
+
+每次完成整合功能新增：
 
 ```text
-YOLO-Pose extracts keypoints.
-STGCN predicts normal.
-No violation warning is drawn.
+versions/YYYY-MM-DD_<author>_<topic>.md
 ```
 
-### Case 2: Urinating person
-
-Expected:
-
-```text
-YOLO-Pose extracts keypoints.
-STGCN predicts urinate.
-Temporal confirmation verifies sustained evidence.
-If confirmed, draw urinate warning.
-```
-
-### Case 3: Person throws trash
-
-Expected:
-
-```text
-YOLO-Pose + STGCN must not classify this as littering.
-STGCN may output normal.
-Littering must be confirmed by litter object-event branch only.
-```
-
-### Case 4: Litter object appears near vehicle
-
-Expected:
-
-```text
-Litter detector finds candidate.
-Motion / temporal / holding checks confirm event.
-System backtracks possible thrower.
-System associates thrower with vehicle/scooter.
-OCR reads license plate.
-Annotated output video shows littering violation.
-```
-
----
-
-# Performance Policy
-
-- Rank bottlenecks before changing knobs.
-- For `scripts-old-test/`, first suspects:
-  - actor `YOLO.track()` / actor batch path,
-  - `RTDETR.predict()` or YOLO litter branch,
-  - YOLO-Pose extraction inside STGCN branch,
-  - STGCN sequence inference,
-  - OCR preload/background work,
-  - video encode/decode.
-- Use existing profiler labels when possible. Do not replace grouped timing output with noisy ad hoc prints.
-- Keep expensive branches optional or gated: STGCN/action, OCR, debug overlays, full per-frame repair.
-- TensorRT engines should be preferred only when sibling `.engine` exists and runtime smoke passes. `--no-engine` must remain a valid fallback.
-- Do not reintroduce RTMW to solve performance or stability issues unless explicitly requested.
-
----
-
-# Training / Artifacts
-
-- Do not guess best checkpoints. Rank from `results.csv`, `args.yaml`, checkpoint paths, or evaluation scripts.
-- `train-fusion.py` changes must anchor on observed best run artifacts, not generic hyperparameters.
-- If user asks YOLO vs RTDETR training control, preserve explicit target selection (`yolo`, `rtdetr`, `both`) if present.
-- STGCN/STGCN++ training consumes generated `.pkl` pose annotations. MP4 files are preprocessing input, not direct training input.
-- `all_videos.txt` / split text files are traceability and split lists; config `ann_file` points to actual `.pkl` used by MMACTION2.
-- For STGCN/STGCN++ pose work, default to YOLO-Pose keypoints.
-- Treat RTMW / wholebody notes as legacy unless the user explicitly asks for RTMW again.
-- STGCN training should target only `normal` and `urinate` classes.
-- Do not include `littering` as an STGCN class.
-- Littering training and evaluation should belong to the object-detection / tracker branch, not the STGCN action branch.
-
----
-
-# `rtmw_test_image.py`
-
-- Treat `rtmw_test_image.py` as legacy / visual test utility unless the task explicitly asks about RTMW.
-- Do not connect `rtmw_test_image.py` back into the current production STGCN keypoint path.
-- Keep image/video/GIF behavior symmetric where possible.
-- `--keypoints-only` means only keypoints/skeleton: remove boxes, labels, scores, and extra text unless explicit opt-in.
-- `--show-label` is opt-in for top-left mode/action/score label.
-- Do not add labels back by default after user requests minimal visuals.
-
----
-
-# Root `test.py`
-
-- Treat as module-by-module smoke/eval harness, not production pipeline.
-- Preserve independent toggles for YOLO, RTDETR, STGCN, Pose, PaddleOCR.
-- Use it to separate raw model capability from tracker/postprocess bugs.
-- If a task touches STGCN action, verify whether `test.py` uses YOLO-Pose or legacy RTMW before trusting its result.
-
----
-
-# Git / Dependencies
-
-- This workspace may contain many generated outputs. Avoid unrelated formatting or metadata churn.
-- Do not run dependency installs or network downloads without approval.
-- If a required command fails due sandbox/network/package access, request escalation with the exact command reason.
-- Do not modify vendored `mmaction2/` or `mmpose-rtmw/` broadly; patch minimal import/config drift only when needed.
-- Do not remove legacy dependency folders just because RTMW is no longer used in the current workflow.
-
----
-
-# Acceptance Criteria
-
-The implementation is considered correct if:
-
-1. RTMW is not loaded or used anywhere in the current keypoint extraction pipeline.
-2. YOLO-Pose is the only source of person keypoints for STGCN.
-3. STGCN only outputs `normal` or `urinate`.
-4. STGCN no longer outputs or handles `littering`.
-5. Littering detection is handled only by the litter object-event branch.
-6. Urinate warnings are triggered only after temporal confirmation.
-7. Littering warnings are triggered only after object-event confirmation.
-8. The output video still correctly draws warning boxes for confirmed violations.
-9. Terminal logs clearly separate:
-   - actor detection,
-   - YOLO-Pose keypoint extraction,
-   - STGCN normal / urinate classification,
-   - litter object detection,
-   - litter behavior confirmation,
-   - OCR result.
-10. Code-only edits pass targeted `py_compile`.
-11. Video-output edits produce a decodable annotated MP4.
+版本文件至少記錄日期、作者、branch、commit、問題、變更、介面/config、測試證據、限制與回滾方式。

@@ -1047,7 +1047,7 @@ class GlobalLitterTracker:
         if REPO_ROOT not in sys.path:
             sys.path.insert(0, REPO_ROOT)
         try:
-            from person_vehicle_assoc import associate, AssocConfig, LitterEvent
+            from python_tools.person_vehicle_assoc import associate, AssocConfig, LitterEvent
         except Exception as exc:  # noqa: BLE001 — 缺模組不該讓整段 run 失敗
             print(f"[PV_ASSOC] import failed, skip association: {exc}")
             return None
