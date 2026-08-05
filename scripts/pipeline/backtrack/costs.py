@@ -12,6 +12,93 @@ ActorKey = Tuple[str, int]
 
 
 @dataclass(frozen=True)
+class BacktrackCostConfig:
+    """Immutable, explicit cost weights used by a resolver trial.
+
+    Defaults exactly reproduce the production component weights.  Research
+    callers select a named ablation instead of altering process-wide env vars.
+    Physical hard gates intentionally stay outside these weights.
+    """
+
+    ba_weights: Mapping[str, float] = field(default_factory=lambda: {
+        "release_distance": 1.25, "uncertainty": .5, "time": .4,
+        "quality": .45, "direction": .35, "release_prior": 1.0,
+    })
+    bc_weights: Mapping[str, float] = field(default_factory=lambda: {
+        "direct_distance": 1.0, "spatial_mahalanobis": .2,
+        "uncertainty": .2, "time": .35, "quality": .4,
+        "release_prior": 1.0,
+    })
+    ac_weights: Mapping[str, float] = field(default_factory=lambda: {
+        "endpoint_proximity": 1.0, "overlap": .8, "time": .2,
+        "quality": .3, "uncertainty": .15, "continuity": .25,
+    })
+    # Production/full keeps the historical feature values. Research D+T
+    # stages express distance and time as fractions of their hard gates so
+    # weights compare dimensionless quantities with the same 0..1 meaning.
+    normalize_distance_time_by_gate: bool = False
+
+    @classmethod
+    def for_stage(
+        cls,
+        stage: str,
+        *,
+        distance_weight: float = 1.0,
+        time_weight: float = 1.0,
+    ) -> "BacktrackCostConfig":
+        stage = str(stage)
+        distance_weight = float(distance_weight)
+        time_weight = float(time_weight)
+        if distance_weight < 0.0 or time_weight < 0.0:
+            raise ValueError("distance/time weights must be non-negative")
+        if distance_weight + time_weight <= 0.0:
+            raise ValueError("at least one distance/time weight must be positive")
+        if stage in {"distance_time", "kalman_rts"}:
+            return cls(
+                ba_weights={
+                    "release_distance": distance_weight,
+                    "time": time_weight,
+                },
+                bc_weights={
+                    "direct_distance": distance_weight,
+                    "time": time_weight,
+                },
+                ac_weights={
+                    "endpoint_proximity": distance_weight,
+                    "time": time_weight,
+                },
+                normalize_distance_time_by_gate=True,
+            )
+        if stage == "confidence":
+            base = cls.for_stage(
+                "distance_time",
+                distance_weight=distance_weight,
+                time_weight=time_weight,
+            )
+            return cls(
+                ba_weights={**base.ba_weights, "quality": .45},
+                bc_weights={**base.bc_weights, "quality": .4},
+                ac_weights={**base.ac_weights, "quality": .3},
+                normalize_distance_time_by_gate=True,
+            )
+        if stage == "uncertainty":
+            base = cls.for_stage(
+                "confidence",
+                distance_weight=distance_weight,
+                time_weight=time_weight,
+            )
+            return cls(
+                ba_weights={**base.ba_weights, "uncertainty": .5},
+                bc_weights={**base.bc_weights, "uncertainty": .2, "spatial_mahalanobis": .2},
+                ac_weights={**base.ac_weights, "uncertainty": .15},
+                normalize_distance_time_by_gate=True,
+            )
+        if stage in {"reverse", "full"}:
+            return cls()
+        raise ValueError("unknown backtrack cost stage: {}".format(stage))
+
+
+@dataclass(frozen=True)
 class ActorObservation:
     """One observed or Kalman-predicted actor state."""
 
@@ -25,11 +112,24 @@ class ActorObservation:
         default_factory=lambda: np.eye(2, dtype=float) * 4.0
     )
     source: str = "detector"
+    # Frame of nearest real detector measurement supporting this state.
+    # A Kalman state may live exactly at release time, but its D+T time cost
+    # must still expose how stale the real evidence is.
+    evidence_frame_index: Optional[int] = None
 
     def __post_init__(self):
         object.__setattr__(self, "cls_name", str(self.cls_name).lower())
         object.__setattr__(self, "track_id", int(self.track_id))
         object.__setattr__(self, "frame_index", int(self.frame_index))
+        object.__setattr__(
+            self,
+            "evidence_frame_index",
+            (
+                int(self.frame_index)
+                if self.evidence_frame_index is None
+                else int(self.evidence_frame_index)
+            ),
+        )
         object.__setattr__(
             self, "bbox", tuple(float(v) for v in self.bbox[:4])
         )
@@ -85,6 +185,7 @@ class ActorObservation:
                 "covariance_uv", np.eye(2, dtype=float) * 4.0
             ),
             source=str(snapshot.get("source", "detector")),
+            evidence_frame_index=snapshot.get("evidence_frame_index"),
         )
 
     @classmethod
@@ -98,6 +199,11 @@ class ActorObservation:
         """Adapt ``kalman.SmoothedTracklet`` without coupling module imports."""
 
         state = tracklet.state_at(int(frame_index))
+        observed_frames = [
+            int(frame)
+            for frame, observed in zip(tracklet.frames, tracklet.observed)
+            if bool(observed)
+        ]
         return cls(
             cls_name=tracklet.class_name,
             track_id=tracklet.track_id,
@@ -107,6 +213,16 @@ class ActorObservation:
             observed=bool(state.observed),
             covariance_uv=state.covariance[:2, :2],
             source=source,
+            evidence_frame_index=(
+                min(
+                    observed_frames,
+                    key=lambda observed_frame: (
+                        abs(observed_frame - int(frame_index)),
+                        observed_frame,
+                    ),
+                )
+                if observed_frames else int(frame_index)
+            ),
         )
 
 
@@ -137,9 +253,16 @@ class CostCell:
 
 def _weighted_components(raw_features, weights):
     return {
-        str(name): float(raw_features[name]) * float(weights.get(name, 1.0))
-        for name in raw_features
+        str(name): float(raw_features[name]) * float(weights[name])
+        for name in raw_features if name in weights
     }
+
+
+def _gate_fraction(value, gate, enabled):
+    value = max(float(value), 0.0)
+    if not enabled:
+        return value
+    return min(value / max(float(gate), 1e-9), 1.0)
 
 
 def _nearest_observation(
@@ -230,6 +353,7 @@ def compute_c_ba(
     max_observation_gap_seconds: float = 0.25,
     max_uncertainty_height_ratio: float = 1.5,
     normalized_distance_gate: float = 0.85,
+    cost_config: Optional[BacktrackCostConfig] = None,
 ) -> CostCell:
     """Litter-person cost using a person's upper-body release zone.
 
@@ -292,7 +416,12 @@ def compute_c_ba(
             )
             direction_cost = 0.35 * max(0.0, -cosine)
 
-        time_gap = abs(person.frame_index - release.frame_index) / max(
+        evidence_gap_frames = abs(
+            person.evidence_frame_index - release.frame_index
+        )
+        if evidence_gap_frames > max_gap:
+            continue
+        time_gap = evidence_gap_frames / max(
             float(fps), 1e-6
         )
         quality = _quality_cost(person)
@@ -301,17 +430,25 @@ def compute_c_ba(
         )
         _, logdet = np.linalg.slogdet(np.eye(2) + normalized_covariance)
         uncertainty_cost = 0.5 * max(float(logdet), 0.0)
+        resolved_cost_config = cost_config or BacktrackCostConfig()
+        normalize_dt = bool(
+            resolved_cost_config.normalize_distance_time_by_gate
+        )
         raw_features = {
-            "release_distance": normalized_distance,
+            "release_distance": _gate_fraction(
+                normalized_distance, normalized_distance_gate, normalize_dt
+            ),
             "uncertainty": max(float(logdet), 0.0),
-            "time": time_gap,
+            "time": _gate_fraction(
+                time_gap, max_observation_gap_seconds, normalize_dt
+            ),
             "quality": quality,
             "direction": (
                 direction_cost / 0.35 if direction_cost > 0.0 else 0.0
             ),
             "release_prior": float(release.prior_cost),
         }
-        weights = {
+        weights = dict(resolved_cost_config.ba_weights) or {
             # Physical distance is deliberately independent of covariance.
             # Combined with monotone uncertainty_cost, increasing covariance
             # cannot improve the same geometric B-A hypothesis.
@@ -375,6 +512,7 @@ def compute_c_bc(
     max_observation_gap_seconds: float = 0.25,
     max_uncertainty_height_ratio: float = 1.5,
     normalized_distance_gate: float = 0.8,
+    cost_config: Optional[BacktrackCostConfig] = None,
 ) -> CostCell:
     """Direct litter-vehicle route with a hard physical release gate."""
 
@@ -433,11 +571,22 @@ def compute_c_bc(
             max(float(residual @ _safe_inverse(combined_cov) @ residual), 0.0)
         )
         quality = _quality_cost(vehicle)
-        time_gap = abs(vehicle.frame_index - release.frame_index) / max(
+        evidence_gap_frames = abs(
+            vehicle.evidence_frame_index - release.frame_index
+        )
+        if evidence_gap_frames > max_gap:
+            continue
+        time_gap = evidence_gap_frames / max(
             float(fps), 1e-6
         )
+        resolved_cost_config = cost_config or BacktrackCostConfig()
+        normalize_dt = bool(
+            resolved_cost_config.normalize_distance_time_by_gate
+        )
         raw_features = {
-            "direct_distance": normalized_distance,
+            "direct_distance": _gate_fraction(
+                normalized_distance, normalized_distance_gate, normalize_dt
+            ),
             "spatial_mahalanobis": mahalanobis,
             "uncertainty": np.log1p(
                 (
@@ -446,11 +595,13 @@ def compute_c_bc(
                 )
                 / max(vehicle.height * vehicle.height, 1.0)
             ),
-            "time": time_gap,
+            "time": _gate_fraction(
+                time_gap, max_observation_gap_seconds, normalize_dt
+            ),
             "quality": quality,
             "release_prior": float(release.prior_cost),
         }
-        weights = {
+        weights = dict(resolved_cost_config.bc_weights) or {
             "direct_distance": 1.0,
             "spatial_mahalanobis": 0.2,
             "uncertainty": 0.2,
@@ -524,6 +675,7 @@ def compute_c_ac(
     max_uncertainty_height_ratio: float = 1.5,
     min_dwell_seconds: float = 0.15,
     max_support_gap_seconds: float = 0.50,
+    cost_config: Optional[BacktrackCostConfig] = None,
 ) -> CostCell:
     """Person-vehicle cost from their own endpoints and overlap only.
 
@@ -586,7 +738,12 @@ def compute_c_ac(
             continue
         proximity = foot_distance / vehicle_scale
         iom = _intersection_over_minimum(person.bbox, vehicle.bbox)
-        pair_gap = abs(person.frame_index - vehicle.frame_index) / max(
+        evidence_gap_frames = abs(
+            person.evidence_frame_index - vehicle.evidence_frame_index
+        )
+        if evidence_gap_frames > max_gap:
+            continue
+        pair_gap = evidence_gap_frames / max(
             float(fps), 1e-6
         )
         quality = 0.5 * (
@@ -695,14 +852,48 @@ def compute_c_ac(
     support_frames = selected_run[1] if sustained else [
         int(item[0].frame_index) for item in strong_endpoint
     ]
+    resolved_cost_config = cost_config or BacktrackCostConfig()
+    normalize_dt = bool(
+        resolved_cost_config.normalize_distance_time_by_gate
+    )
+    weights = dict(resolved_cost_config.ac_weights) or {
+        "endpoint_proximity": 1.0,
+        "overlap": 0.8,
+        "time": 0.2,
+        "quality": 0.3,
+        "uncertainty": 0.15,
+        "continuity": 0.25,
+    }
+
+    def _pair_raw_features(item):
+        _, _, pair_proximity, pair_iom, pair_gap, pair_quality, pair_uncertainty = item
+        return {
+            "endpoint_proximity": _gate_fraction(
+                min(pair_proximity, float(proximity_gate)),
+                proximity_gate,
+                normalize_dt,
+            ),
+            "overlap": 1.0 - pair_iom,
+            "time": _gate_fraction(
+                pair_gap, max_pair_gap_seconds, normalize_dt
+            ),
+            "quality": pair_quality,
+            "uncertainty": (
+                float(pair_uncertainty) / 0.15
+                if float(pair_uncertainty) > 0.0 else 0.0
+            ),
+            "continuity": (
+                1.0 - min(len(support_frames) / max(len(pairs), 1), 1.0)
+            ),
+        }
+
+    # Candidate-frame selection must use the same enabled features and trial
+    # weights as the returned cell. Otherwise a D+T ablation would still pick
+    # its observation using hidden overlap/quality/uncertainty components.
     best = min(
         evidence,
-        key=lambda item: (
-            min(item[2], float(proximity_gate))
-            + 0.8 * (1.0 - item[3])
-            + 0.2 * item[4]
-            + 0.3 * item[5]
-            + item[6]
+        key=lambda item: sum(
+            _weighted_components(_pair_raw_features(item), weights).values()
         ),
     )
     person, vehicle, proximity, iom, pair_gap, quality, uncertainty = best
@@ -711,26 +902,7 @@ def compute_c_ac(
             "person_vehicle_gate_failed", proximity=proximity, overlap=iom
         )
 
-    raw_features = {
-        "endpoint_proximity": min(proximity, float(proximity_gate)),
-        "overlap": 1.0 - iom,
-        "time": pair_gap,
-        "quality": quality,
-        "uncertainty": (
-            float(uncertainty) / 0.15 if float(uncertainty) > 0.0 else 0.0
-        ),
-        "continuity": (
-            1.0 - min(len(support_frames) / max(len(pairs), 1), 1.0)
-        ),
-    }
-    weights = {
-        "endpoint_proximity": 1.0,
-        "overlap": 0.8,
-        "time": 0.2,
-        "quality": 0.3,
-        "uncertainty": 0.15,
-        "continuity": 0.25,
-    }
+    raw_features = _pair_raw_features(best)
     components = _weighted_components(raw_features, weights)
     return CostCell(
         valid=True,

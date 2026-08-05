@@ -63,7 +63,10 @@ SMART_BACKTRACK_DIRECT_VEHICLE_COST=0.9
 SMART_BACKTRACK_AC_WEIGHT=0.75
 SMART_BACKTRACK_BC_SUPPORT_BONUS=0.25
 SMART_BACKTRACK_SIGMA_FLOOR=2.0
-SMART_BACKTRACK_SIDECAR=1
+SMART_BACKTRACK_SIDECAR=0
+SMART_BACKTRACK_STUDY_STAGE=full  # full | distance_time | kalman_rts | confidence | uncertainty | reverse
+SMART_BACKTRACK_DT_DISTANCE_WEIGHT=1.0
+SMART_BACKTRACK_DT_TIME_WEIGHT=1.0
 ```
 
 `SMART_BACKTRACK=0` keeps the legacy resolver available as a rollback path.
@@ -76,17 +79,54 @@ currently decompose mathematically into independent shortest routes. The graph
 form is retained for explicit NULL handling and later cross-event consistency
 constraints; it should not be described as adding cross-event coupling today.
 
+## Reproducible cost study
+
+`scripts/backtrack_study.py` replays `resolver_input` stored in a candidate
+sidecar.  It never invokes detector inference or promotes a candidate into a
+confirmed litter event.  A trial uses an immutable JSON config and a grouped
+60/20/20 manifest. `kalman_rts` is a clean branch from D+T; the later
+`uncertainty` stage combines confidence and Kalman/covariance evidence:
+
+```text
+distance_time -> confidence ---------> uncertainty -> reverse -> full
+            \-> kalman_rts (pure) ----/
+```
+
+`distance_time` uses only distance/time cost components, original observed
+actor boxes, and the litter birth anchor. Distance and time are divided by
+their corresponding hard gates before weighting, so both features are
+dimensionless fractions in the range 0--1. The DT environment weights affect
+all three matrices; hard gates remain independent and cannot be relaxed by a
+weight. `kalman_rts` enables actor position smoothing/interpolation while
+keeping uniform Kalman measurement confidence and disabling covariance gates,
+covariance/Mahalanobis costs, and reverse release fitting. `uncertainty` adds
+confidence and covariance evidence; `reverse` enables ballistic release hypotheses with uniform litter
+weights; `full` additionally restores confidence-weighted trajectory fitting.
+All route types and the full NULL route remain present in every stage.
+
+`kalman_rts` trial configs may additionally set
+`kalman_process_noise_scale`, `kalman_measurement_noise_scale`, and
+`kalman_max_extrapolation_seconds`. These affect actor smoothing/interpolation
+only; they do not add confidence, covariance, or Mahalanobis cost components.
+Kalman states supply geometry only. Their D+T time feature remains the gap to
+the nearest real detector frame, so interpolation cannot silently rewrite
+missing actor evidence as a zero synchronization gap.
+
+New candidate rows contain `resolver_input`, the JSON-safe immutable worker
+task required for replay. Rows without it are diagnostic-only and are rejected
+by the replay CLI rather than silently re-running a different pipeline.
+
 ## Candidate/component sidecar
 
-Normal pipeline output now includes:
+Research runs with `SMART_BACKTRACK_SIDECAR=1` additionally include:
 
 ```text
 <annotated-video-stem>_backtrack_candidates.jsonl
 ```
 
-Set `SMART_BACKTRACK_SIDECAR=0` to disable it. The sidecar is separate from
-frontend `events.jsonl`: events stay compact, while the research sidecar keeps
-the data needed for labeling, gate analysis and cost calibration.
+Production keeps it disabled so the frontend receives only `analysis.json`.
+The research sidecar stores labeling, gate-analysis and cost-calibration data;
+it is not part of the frontend schema.
 
 Schema `smart-backtrack-candidates/v1` contains:
 

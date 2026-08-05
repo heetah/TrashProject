@@ -7,9 +7,11 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
 
 from pipeline.events import (
+    build_analysis_report,
     build_litter_events,
     build_run_events,
     build_urinate_events,
+    write_analysis_json,
     write_events_jsonl,
 )
 
@@ -44,6 +46,38 @@ def test_litter_event_pedestrian_thrower_has_no_plate():
     events = build_litter_events(litter_events, {2: {"license_plate": "X"}}, fps=30)
     assert events[0]["thrower"] == {"cls": "person", "track_id": 2}
     assert events[0]["license_plate"] is None  # person 不查車牌
+
+
+def test_litter_event_has_time_segment_and_normalized_plate_confidence():
+    events = build_litter_events(
+        [{
+            "litter_id": 8,
+            "frame_index": 60,
+            "birth_frame": 45,
+            "confirm_frame": 60,
+            "bbox": [1, 2, 3, 4],
+            "thrower_key": ["person", 2],
+            "vehicle_key": ["vehicle", 9],
+            "detector_confidence": 0.87654,
+            "escalated": True,
+            "backtrack": {"release_frame": 42, "confirm_frame": 60},
+        }],
+        {9: {"license_plate": {"number": "ABC1234", "conf": 0.91234}}},
+        fps=30,
+    )
+    event = events[0]
+    assert event["license_plate"] == "ABC1234"
+    assert event["license_plate_confidence"] == 0.9123
+    assert event["license_plate_status"] == "recognized"
+    assert event["detector_confidence"] == 0.8765
+    assert event["time_segment"] == {
+        "start_frame": 42,
+        "end_frame": 60,
+        "start_sec": 1.4,
+        "end_sec": 2.0,
+        "basis": "estimated_release_to_confirmation",
+        "human_reviewed": False,
+    }
 
 
 def test_urinate_aggregate_fallback_when_no_per_track():
@@ -94,6 +128,164 @@ def test_write_events_jsonl_roundtrip(tmp_path):
     parsed = json.loads(lines[0])
     assert parsed["license_plate"] == "AB-99"
     assert parsed["time_sec"] == round(5 / 15, 2)
+
+
+def test_analysis_report_is_compact_and_keeps_accuracy_boundary(tmp_path):
+    vehicle_history = {
+        9: {
+            "cls": "vehicle",
+            "first_seen_frame": 10,
+            "last_seen_frame": 90,
+            "detected_observations": 3,
+            "detector_confidence_sum": 2.4,
+            "detector_confidence_max": 0.9,
+            "detector_confidence_last": 0.8,
+            "last_bbox": [10, 20, 100, 120],
+            "license_plate": {"number": "ABC1234", "conf": 0.91},
+        },
+        12: {
+            "cls": "scooter",
+            "first_seen_frame": 30,
+            "last_seen_frame": 60,
+            "detected_observations": 2,
+            "detector_confidence_sum": 1.4,
+            "detector_confidence_max": 0.75,
+            "detector_confidence_last": 0.7,
+            "license_plate": None,
+            "plate_ocr_misses": 2,
+        },
+    }
+    events = build_run_events(
+        [{
+            "litter_id": 1,
+            "frame_index": 60,
+            "birth_frame": 45,
+            "confirm_frame": 60,
+            "bbox": [1, 2, 3, 4],
+            "thrower_key": ["person", 4],
+            "vehicle_key": ["vehicle", 9],
+            "detector_confidence": 0.88,
+            "escalated": True,
+        }],
+        [],
+        vehicle_history,
+        {"stgcn_urinate_confirmed": 0},
+        fps=30,
+    )
+    output_video = tmp_path / "scene_annotated.mp4"
+    output_video.write_bytes(b"video")
+    report = build_analysis_report(
+        {
+            "input_video": "scene.mp4",
+            "output_video": str(output_video),
+            "processed_frames": 300,
+            "total_frames": 300,
+            "raw_litter_candidates": 7,
+            "filtered_litter_candidates": 2,
+            "raw_litter_candidate_confidence_mean": 0.61,
+            "raw_litter_candidate_confidence_max": 0.93,
+            "filtered_litter_candidate_confidence_mean": 0.81,
+            "filtered_litter_candidate_confidence_max": 0.9,
+            "person_detections": 15,
+            "person_unique_tracks": 2,
+        },
+        events,
+        vehicle_history,
+        fps=30,
+    )
+    assert set(report) == {"schema_version", "video", "summary", "events"}
+    assert report["video"] == {
+        "file": "scene_annotated.mp4",
+        "duration_sec": 10.0,
+    }
+    assert report["schema_version"] == "2.0.0"
+    assert report["summary"]["litter_event_count"] == 1
+    assert report["summary"]["urinate_event_count"] == 0
+    assert report["summary"]["passed_vehicle_count"] == 2
+    assert report["summary"]["average_litter_confidence"] == 0.88
+    assert report["summary"]["detection_accuracy"] is None
+    assert report["summary"]["accuracy_status"] == "not_evaluated"
+    assert report["summary"]["littering_plates"] == ["ABC1234"]
+    assert report["summary"]["review_required"] is True
+    assert report["events"] == [{
+        "type": "litter",
+        "id": 1,
+        "start_sec": 1.5,
+        "end_sec": 2.0,
+        "confidence": 0.88,
+        "vehicle": "vehicle:9",
+        "plate": "ABC1234",
+        "plate_confidence": 0.91,
+        "plate_status": "recognized",
+        "attribution_status": None,
+        "review_required": True,
+    }]
+
+    path = tmp_path / "scene_annotated_analysis.json"
+    assert write_analysis_json(report, path) == str(path)
+    parsed = json.loads(path.read_text(encoding="utf-8"))
+    assert parsed == report
+    assert not (tmp_path / "scene_annotated_analysis.json.tmp").exists()
+
+
+def test_analysis_compacts_urinate_event():
+    report = build_analysis_report(
+        {"output_video": "scene_annotated.mp4", "duration_sec": 20.0},
+        [{
+            "type": "urinate",
+            "track_id": 3,
+            "time_sec": 12.5,
+            "conf": 0.81,
+            "evidence_sec": 5.2,
+        }],
+        {},
+        fps=30,
+    )
+    assert report["summary"]["urinate_event_count"] == 1
+    assert report["events"] == [{
+        "type": "urinate",
+        "track_id": 3,
+        "time_sec": 12.5,
+        "confidence": 0.81,
+        "review_required": True,
+    }]
+
+
+def test_analysis_counts_direct_vehicle_thrower_and_missing_plate():
+    events = build_run_events(
+        [{
+            "litter_id": 2,
+            "frame_index": 20,
+            "bbox": [1, 2, 3, 4],
+            "thrower_key": ["scooter", 5],
+            "vehicle_key": None,
+            "escalated": True,
+        }],
+        [],
+        {5: {"cls": "scooter", "license_plate": None}},
+        {},
+        fps=10,
+    )
+    report = build_analysis_report(
+        {"processed_frames": 100, "total_frames": 100},
+        events,
+        {5: {"cls": "scooter", "license_plate": None}},
+        fps=10,
+    )
+    assert report["summary"]["passed_vehicle_count"] == 1
+    assert report["events"][0] == {
+        "type": "litter",
+        "id": 2,
+        "start_sec": 2.0,
+        "end_sec": 2.0,
+        "confidence": None,
+        "vehicle": "scooter:5",
+        "plate": None,
+        "plate_confidence": None,
+        "plate_status": "not_requested",
+        "attribution_status": None,
+        "review_required": True,
+    }
 
 
 def test_tracker_captures_confirmed_litter_event():

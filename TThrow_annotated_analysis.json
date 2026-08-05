@@ -1,0 +1,18 @@
+{
+  "events": [],
+  "schema_version": "2.0.0",
+  "summary": {
+    "accuracy_status": "not_evaluated",
+    "average_litter_confidence": null,
+    "detection_accuracy": null,
+    "litter_event_count": 0,
+    "littering_plates": [],
+    "passed_vehicle_count": 2,
+    "review_required": false,
+    "urinate_event_count": 0
+  },
+  "video": {
+    "duration_sec": 11.133,
+    "file": "TThrow_annotated.mp4"
+  }
+}

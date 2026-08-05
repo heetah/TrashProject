@@ -431,6 +431,11 @@ def build_candidate_record(
         "candidate_actors": _candidate_actor_tracklets(task),
         "routes": serialized_routes,
         "candidate_diagnostics": _json_safe(route_diagnostics),
+        # A research trial must be able to rebuild the *same* resolver input
+        # without loading a model or relying on a mutable tracker cache.  This
+        # is deliberately separate from the human-facing annotation schema;
+        # annotation tools never expose it as a model decision.
+        "resolver_input": _json_safe(task),
     }
 
 

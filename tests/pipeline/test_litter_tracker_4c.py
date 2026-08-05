@@ -687,6 +687,16 @@ class TestLitterCandidateFilter:
         drop, reason = litter_candidate_is_vehicle_fp(litter, [], prev_litter_history=hist)
         assert drop and reason == 'horizontal_streak'
 
+    def test_keeps_recent_horizontal_release_from_vehicle_edge(self):
+        """A bottle that starts inside a vehicle box may initially fly almost horizontally."""
+        from smallFunction import litter_candidate_is_vehicle_fp
+        veh = {'cls': 'vehicle', 'track_id': 2, 'box': [1050, 0, 1678, 554]}
+        litter = _lbox(1774, 60, half=5)          # 96px outside the right vehicle edge
+        hist = [(1674, 61)]                        # prior observation was inside vehicle 2
+        drop, reason = litter_candidate_is_vehicle_fp(
+            litter, [veh], prev_litter_history=hist)
+        assert not drop, f"recent vehicle-edge release must reach tracker (got {reason})"
+
     def test_keeps_vertical_throw(self):
         """Downward-dominant trajectory clear of vehicles → keep."""
         from smallFunction import litter_candidate_is_vehicle_fp
@@ -713,6 +723,16 @@ class TestLitterCandidateFilter:
         litter = _lbox(900, 700, half=5)
         drop, reason = litter_candidate_is_vehicle_fp(litter, [self._veh()], prev_litter_history=None)
         assert not drop, f"new clear candidate must birth (got reason={reason})"
+
+    def test_vehicle_edge_release_fallback_beats_perspective_score(self):
+        """Exact box-origin plus a clear release must retain the source vehicle."""
+        from litterTracker import GlobalLitterTracker
+        tracker = GlobalLitterTracker(distance_threshold=250, fps=10)
+        vehicle = {'cls': 'vehicle', 'track_id': 2, 'box': [1050, 0, 1678, 554]}
+        history = [(1674.5, 61.0), (1774.5, 60.5), (1945.5, 156.0)]
+        thrower_key, _ = tracker._find_thrower_for_litter(
+            _lbox(1945.5, 156.0, half=5), [vehicle], history=history)
+        assert thrower_key == ('vehicle', 2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -747,4 +767,3 @@ class TestCameraShakeDetection:
     def test_none_inputs_safe(self):
         from smallFunction import estimate_global_shift
         assert estimate_global_shift(None, None) == (0.0, 0.0)
-

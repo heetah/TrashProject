@@ -15,12 +15,12 @@ trashProject/
 │   │   ├── detect.py            # actor/litter detection orchestration
 │   │   ├── litter_tracker.py    # litter confirmation、violator state
 │   │   ├── plate.py             # 車牌 detection + PaddleOCR
-│   │   ├── events.py            # summary/events schema
+│   │   ├── events.py            # 精簡 analysis JSON schema
 │   │   ├── config.py            # 集中執行參數
 │   │   ├── infra/               # model、motion、video I/O、worker
 │   │   ├── litter/              # litter trajectory helpers
 │   │   └── backtrack/           # Kalman/RTS/cost/flow/sidecar
-│   ├── frontend/                # summary/events 靜態 dashboard
+│   ├── frontend/                # analysis JSON 靜態 dashboard
 │   └── *.py                     # compatibility shims 與工具入口
 ├── tests/
 │   ├── pipeline/                # production unit/integration tests
@@ -64,7 +64,8 @@ trashProject/
             -> vehicle/scooter ROI
             -> plate detector + PaddleOCR
   -> annotated video
-  -> summary.json / events.jsonl / backtrack sidecar
+  -> annotated video + analysis.json
+  -> optional research backtrack sidecar
 ```
 
 ## 模組責任
@@ -97,6 +98,8 @@ RT-DETR 使用 BGR 加 temporal change map 的 4-channel 輸入。模型輸出�
 4. Camera-shake cooldown。
 5. Actor polygon/relative-motion holding gate。
 6. `GlobalLitterTracker` trajectory、displacement、temporal confirmation。
+
+近車候選仍會先排除 vehicle-contained、共動與純水平條紋；唯一例外是剛由車框內明顯脫離的前三個 observation。當該軌跡起點確實在同一車框內、終點已脫離，會保留該車作為 thrower fallback；這不是最近車輛配對，仍須通過 vehicle-relative、物理與 temporal confirmation gate。
 
 只有 `state == "confirmed"` 才是垃圾事件。Pending candidate 不會畫成最終違規。
 
@@ -169,10 +172,51 @@ conda run -n rtdetr python scripts/main.py /path/to/video.mp4
 | `VEHICLE_GATE_TTL_SEC` | `3.0` | Recent vehicle TTL |
 | `RTDETR_ENABLED` | `1` | Litter detector/OCR enable |
 | `SMART_BACKTRACK` | `1` | Smart attribution enable |
-| `SMART_BACKTRACK_SIDECAR` | `1` | Candidate sidecar enable |
+| `SMART_BACKTRACK_SIDECAR` | `0` | Research candidate sidecar；需明確設 `1` 啟用 |
+| `SMART_BACKTRACK_STUDY_STAGE` | `full` | Research ablation stage；production 預設不變 |
+| `SMART_BACKTRACK_DT_DISTANCE_WEIGHT` | `1.0` | D+T stage 的 gate-normalized distance weight |
+| `SMART_BACKTRACK_DT_TIME_WEIGHT` | `1.0` | D+T stage 的 gate-normalized time weight |
 | `OUTPUT_ROOT` | `.` | Output directory；建議明確設為 `output` |
 
 完整預設值以 `scripts/pipeline/config.py` 與各環境變數使用點為準。
+
+### 反追蹤研究 replay
+
+`scripts/backtrack_study.py` 只重播 confirmed event sidecar 內的 frozen
+resolver input；不重跑 detector，也不改變 litter confirmation。先由新 sidecar
+建立不可變 group split，再只在 development/validation 調參，最後才讀 test：
+
+```bash
+conda run -n rtdetr python scripts/backtrack_study.py manifest \
+  --candidates artifacts/backtrack_candidates --output artifacts/study_manifest.json
+
+conda run -n rtdetr python scripts/backtrack_study.py replay \
+  --candidates artifacts/backtrack_candidates --manifest artifacts/study_manifest.json \
+  --config artifacts/distance_time.json --split validation \
+  --output artifacts/distance_time_validation.jsonl
+```
+
+`stage` 可為 `distance_time`、`kalman_rts`、`confidence`、`uncertainty`、
+`reverse` 或 `full`。其中 distance/time 以 birth anchor 與原始 actor
+observation 為基準；
+distance 與 time 先各自除以 hard gate 成為 0--1 無因次比例，再套用 trial
+的 `distance_weight`、`time_weight`；runtime 可用上述兩個 DT 環境變數設定。
+`kalman_rts` 只把均一 measurement confidence 的 Kalman/RTS 平滑 actor
+位置交給 D+T，不使用 covariance gate/cost、Mahalanobis 或反向 trajectory；
+`uncertainty` 才加入 confidence 與 covariance evidence，`reverse` 才引入反向
+trajectory。此工具沒有
+reviewed annotation 時只產生 candidate diagnostics，不能輸出 accuracy 結論。
+`evaluate` 另報 selected non-NULL 的錯誤率與 deterministic bootstrap 95% CI；
+它是安全風險指標，不能由 resolved/dustbin 比例取代。
+
+純 Kalman/RTS trial 可在 JSON 另外掃描
+`kalman_process_noise_scale`、`kalman_measurement_noise_scale` 與
+`kalman_max_extrapolation_seconds`。三者只調整 actor 平滑／補點，不啟用額外
+cost component。Kalman 補點只提供位置；D+T 的時間差仍取最近真實 detection
+frame，不會因預測點剛好落在 release frame 就被改寫為零。
+
+建立人工盲標 queue 時使用 `scripts/backtrack_annotations.py init`；輸出的
+annotation schema 不複製 selected route、cost、rank 或 release prediction。
 
 ## 輸出
 
@@ -180,12 +224,19 @@ conda run -n rtdetr python scripts/main.py /path/to/video.mp4
 
 ```text
 output/resize_annotated.mp4
-output/resize_annotated_summary.json
-output/resize_annotated_events.jsonl
-output/resize_annotated_backtrack_candidates.jsonl
+output/resize_annotated_analysis.json
 ```
 
-實際 sidecar 是否產生取決於功能開關與事件狀態。
+`resize_annotated_analysis.json` 是每支影片各自產生、寫在標註影片同資料夾的
+前端單檔資料源；不跨影片累積狀態。寫檔使用 `.tmp` 後 atomic replace，避免網頁讀到
+半份 JSON。Production 不再另外輸出 `summary.json` 或 `events.jsonl`。
+
+Schema version `2.0.0` 只保留 `video`、`summary`、`events` 三區，供
+`scripts/frontend/dashboard.html` 直接載入。完整欄位、範例與證據限制見
+[`scripts/pipeline/ANALYSIS_JSON.md`](scripts/pipeline/ANALYSIS_JSON.md)。
+
+`SMART_BACKTRACK_SIDECAR=0` 為預設。研究時明確設為 `1` 才會額外輸出
+`*_backtrack_candidates.jsonl`；該 sidecar 不供網頁使用，也不是 ground truth。
 
 ## 測試
 

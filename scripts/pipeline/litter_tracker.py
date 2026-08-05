@@ -92,6 +92,7 @@ THROWER_PREVIOUS_BONUS = 0.85
 THROWER_FALLBACK_SCORE_LIMIT = 1.25
 THROWER_BIRTH_BOX_DIST_LIMIT = 270.0
 THROWER_RELEASE_ORIGIN_SCORE_LIMIT = 4.0
+THROWER_EDGE_RELEASE_MIN_SEPARATION = 40.0
 
 # === Backward resolver ===
 BACKWARD_ACTOR_HISTORY_LEN = 120
@@ -686,8 +687,13 @@ class GlobalLitterTracker:
                             event = {
                                 'litter_id': int(best_id),
                                 'frame_index': int(frame_index),
+                                'birth_frame': int(l_data.get('birth_frame', frame_index)),
+                                'confirm_frame': int(frame_index),
                                 'bbox': [_lx1, _ly1, _lx2, _ly2],
                                 'center': [float(centroid[0]), float(centroid[1])],
+                                'detector_confidence': (
+                                    float(litter_box[4]) if len(litter_box) > 4 else None
+                                ),
                                 'thrower_key': list(thrower_key) if thrower_key is not None else None,
                                 'vehicle_key': None,
                                 'escalated': bool(escalate_violation),
@@ -2499,6 +2505,32 @@ class GlobalLitterTracker:
         elif best_actor_key is None and release_actor_key is not None:
             best_actor_key = release_actor_key
             best_center = release_center
+
+        if best_actor_key is None and history and len(history) >= 2:
+            # pseudo-ground score 在近景、極大車框時可能把真正從車框邊緣拋出的
+            # 輕物排到所有 fallback 之外。只接受比一般 release_like 更強的證據：
+            # 軌跡起點實際在同一車框內，且最後一點已明確脫離。這不是放寬
+            # 最近車輛歸因；沒有 exact box-origin 的候選仍維持 NULL。
+            edge_release_candidates = []
+            for actor in actors:
+                cls_name = str(actor.get('cls', '')).lower()
+                if cls_name not in ('vehicle', 'scooter'):
+                    continue
+                try:
+                    track_id = int(actor['track_id'])
+                    box = actor['box']
+                except (KeyError, TypeError, ValueError):
+                    continue
+                start_distance = self._point_to_box_distance(history[0], box)
+                end_distance = self._point_to_box_distance(history[-1], box)
+                if (
+                    start_distance == 0.0 and
+                    end_distance >= THROWER_EDGE_RELEASE_MIN_SEPARATION and
+                    self._release_origin_near_actor(history, actor)
+                ):
+                    edge_release_candidates.append((end_distance, (cls_name, track_id), self._actor_center(actor)))
+            if edge_release_candidates:
+                _, best_actor_key, best_center = min(edge_release_candidates, key=lambda item: item[0])
 
         return best_actor_key, best_center
 

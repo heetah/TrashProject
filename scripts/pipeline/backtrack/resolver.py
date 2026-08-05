@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Kalman/RTS + reverse trajectory + explicit costs + min-cost-flow resolver."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import os
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -9,6 +9,7 @@ import numpy as np
 
 from .costs import (
     ActorObservation,
+    BacktrackCostConfig,
     CostCell,
     build_ac_costs,
     build_ba_costs,
@@ -54,12 +55,39 @@ class SmartBacktrackConfig:
     ac_weight: float = 0.75
     bc_support_bonus: float = 0.25
     sigma_floor_px: float = 2.0
+    cost_config: BacktrackCostConfig = field(default_factory=BacktrackCostConfig)
+    # Research switches default to the current production behavior.  They are
+    # intentionally constructor-only; production never reads them from env.
+    use_kalman_rts: bool = True
+    confidence_aware_kalman: bool = True
+    use_uncertainty_gates: bool = True
+    kalman_process_noise_scale: float = 1.0
+    kalman_measurement_noise_scale: float = 1.0
+    kalman_max_extrapolation_seconds: Optional[float] = None
+    use_reverse_trajectory: bool = True
+    confidence_weighted_trajectory: bool = True
 
     @classmethod
     def from_env(cls, fps=10.0):
         # 24 frames was the original 10 FPS research window (=2.4 s).
         # Scale the default with FPS so the physical look-back duration stays fixed.
         default_max_back = max(1, int(round(float(fps or 10.0) * 2.4)))
+        study_stage = str(
+            os.environ.get("SMART_BACKTRACK_STUDY_STAGE", "full")
+        ).strip().lower()
+        if study_stage not in {
+            "distance_time", "kalman_rts", "confidence", "uncertainty",
+            "reverse", "full"
+        }:
+            study_stage = "full"
+        distance_weight = max(
+            0.0, _float_env("SMART_BACKTRACK_DT_DISTANCE_WEIGHT", 1.0)
+        )
+        time_weight = max(
+            0.0, _float_env("SMART_BACKTRACK_DT_TIME_WEIGHT", 1.0)
+        )
+        if distance_weight + time_weight <= 0.0:
+            distance_weight = time_weight = 1.0
         return cls(
             max_back_frames=max(
                 1,
@@ -81,6 +109,20 @@ class SmartBacktrackConfig:
             sigma_floor_px=max(
                 0.25, _float_env("SMART_BACKTRACK_SIGMA_FLOOR", 2.0)
             ),
+            cost_config=BacktrackCostConfig.for_stage(
+                study_stage,
+                distance_weight=distance_weight,
+                time_weight=time_weight,
+            ),
+            use_kalman_rts=study_stage in {
+                "kalman_rts", "uncertainty", "reverse", "full"
+            },
+            confidence_aware_kalman=study_stage != "kalman_rts",
+            use_uncertainty_gates=study_stage in {
+                "uncertainty", "reverse", "full"
+            },
+            use_reverse_trajectory=study_stage in {"reverse", "full"},
+            confidence_weighted_trajectory=study_stage == "full",
         )
 
 
@@ -218,6 +260,16 @@ class SmartBacktrackResolver:
         self.fps = float(fps) if fps and float(fps) > 0.0 else 30.0
         self.config = config or SmartBacktrackConfig.from_env(fps=self.fps)
 
+    def _kalman_max_extrapolation_frames(self, fps: float) -> int:
+        if self.config.kalman_max_extrapolation_seconds is None:
+            return int(self.config.max_back_frames + 4)
+        return max(
+            0,
+            int(round(
+                float(fps) * self.config.kalman_max_extrapolation_seconds
+            )),
+        )
+
     def _release_hypotheses(self, task) -> List[ReleaseHypothesis]:
         points = list(task.get("history") or [])
         frames = list(task.get("history_frames") or [])
@@ -235,6 +287,20 @@ class SmartBacktrackResolver:
             else:
                 confidence_values = [1.0] * count
         birth_frame = int(task.get("birth_frame", task.get("confirm_frame", 0)))
+        if not self.config.use_reverse_trajectory:
+            point = task.get("birth_centroid")
+            if point is None and points:
+                point = points[0]
+            if point is None:
+                point = (0.0, 0.0)
+            return [ReleaseHypothesis(
+                frame_index=birth_frame,
+                mean_uv=np.asarray(point, dtype=float),
+                covariance_uv=np.eye(2, dtype=float) * self.config.sigma_floor_px ** 2,
+                velocity_uv=np.zeros(2, dtype=float),
+                model="birth_anchor",
+                prior_cost=0.0,
+            )]
         points, frames = airborne_prefix(
             points,
             frames,
@@ -248,7 +314,10 @@ class SmartBacktrackResolver:
             max_back_frames=self.config.max_back_frames,
             fps=float(task.get("fps", self.fps) or self.fps),
             sigma_floor_px=self.config.sigma_floor_px,
-            confidences=confidence_values,
+            confidences=(
+                confidence_values if self.config.confidence_weighted_trajectory
+                else [1.0] * len(points)
+            ),
             fallback_prior_cost=self.config.dustbin_cost,
         )
 
@@ -286,6 +355,30 @@ class SmartBacktrackResolver:
         actor_tracks = {}
         actor_track_scores = {}
         birth_frame = int(task.get("birth_frame", task.get("confirm_frame", 0)))
+        if not self.config.use_kalman_rts:
+            # Baseline study mode: retain detector observations and IDs, but do
+            # not inject RTS positions/covariance into a distance/time result.
+            for (key, _tracklet_uid), items in snapshots_by_uid.items():
+                observations = []
+                for frame_index, snapshot in items:
+                    if not bool(snapshot.get("observed", True)):
+                        continue
+                    try:
+                        observations.append(ActorObservation.from_snapshot(
+                            snapshot, frame_index=frame_index
+                        ))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                if not observations:
+                    continue
+                score = (
+                    min(abs(item.frame_index - birth_frame) for item in observations),
+                    -len(observations), int(observations[0].frame_index),
+                )
+                if key not in actor_tracks or score < actor_track_scores[key]:
+                    actor_tracks[key] = observations
+                    actor_track_scores[key] = score
+            return actor_tracks
         for (key, _tracklet_uid), items in snapshots_by_uid.items():
             # Cached reuse is a prediction target, never a detector update.
             real_items = [
@@ -302,13 +395,16 @@ class SmartBacktrackResolver:
                     measurement = TrackMeasurement(
                         frame_index=frame_index,
                         bbox_xyxy=tuple(snapshot["box"]),
-                        confidence=float(
-                            snapshot.get(
-                                "confidence",
+                        confidence=(
+                            float(
                                 snapshot.get(
-                                    "pose_conf", snapshot.get("conf", 1.0)
-                                ),
+                                    "confidence",
+                                    snapshot.get(
+                                        "pose_conf", snapshot.get("conf", 1.0)
+                                    ),
+                                )
                             )
+                            if self.config.confidence_aware_kalman else 1.0
                         ),
                     )
                 except (TypeError, ValueError):
@@ -318,9 +414,31 @@ class SmartBacktrackResolver:
             real_items = valid_real_items
             if not measurements:
                 continue
+            max_extrapolation_frames = (
+                self._kalman_max_extrapolation_frames(fps)
+            )
             kalman_config = KalmanConfig(
                 frames_per_second=fps,
-                max_extrapolation_frames=self.config.max_back_frames + 4
+                max_extrapolation_frames=max_extrapolation_frames,
+            )
+            kalman_config.process_position_accel_fractions = {
+                name: float(value) * self.config.kalman_process_noise_scale
+                for name, value in
+                kalman_config.process_position_accel_fractions.items()
+            }
+            kalman_config.process_log_size_accel_stds = {
+                name: float(value) * self.config.kalman_process_noise_scale
+                for name, value in
+                kalman_config.process_log_size_accel_stds.items()
+            }
+            kalman_config.measurement_position_std_fraction *= (
+                self.config.kalman_measurement_noise_scale
+            )
+            kalman_config.measurement_position_std_floor *= (
+                self.config.kalman_measurement_noise_scale
+            )
+            kalman_config.measurement_log_size_std *= (
+                self.config.kalman_measurement_noise_scale
             )
             try:
                 smoothed = smooth_tracklet(
@@ -336,16 +454,17 @@ class SmartBacktrackResolver:
             last_observed = int(smoothed.frames[-1])
             first_frame = max(
                 birth_frame - self.config.max_back_frames,
-                first_observed - self.config.max_back_frames,
+                first_observed - max_extrapolation_frames,
             )
             last_frame = min(
                 int(task.get("confirm_frame", last_observed))
                 + self.config.max_back_frames,
-                last_observed + self.config.max_back_frames,
+                last_observed + max_extrapolation_frames,
             )
             observed_by_frame = {
                 frame_index: snapshot for frame_index, snapshot in real_items
             }
+            real_frames = sorted(observed_by_frame)
             observations = []
             for frame_index in range(first_frame, last_frame + 1):
                 try:
@@ -380,6 +499,13 @@ class SmartBacktrackResolver:
                             if source_snapshot is not None
                             else "kalman_rts"
                         ),
+                        evidence_frame_index=min(
+                            real_frames,
+                            key=lambda observed_frame: (
+                                abs(observed_frame - frame_index),
+                                observed_frame,
+                            ),
+                        ),
                     )
                 )
             if observations:
@@ -398,6 +524,9 @@ class SmartBacktrackResolver:
 
     def build_routes(self, task) -> List[RouteCandidate]:
         fps = float(task.get("fps", self.fps) or self.fps)
+        max_extrapolation_frames = (
+            self._kalman_max_extrapolation_frames(fps)
+        )
         releases = self._release_hypotheses(task)
         actor_tracks = self._build_actor_tracks(task)
         person_tracks = {
@@ -408,15 +537,32 @@ class SmartBacktrackResolver:
             key: values for key, values in actor_tracks.items()
             if key[0] in ("vehicle", "scooter")
         }
-        ba_costs = build_ba_costs(releases, person_tracks, fps)
-        bc_costs = build_bc_costs(releases, vehicle_tracks, fps)
-        ac_costs = build_ac_costs(person_tracks, vehicle_tracks, fps)
+        max_uncertainty_ratio = (
+            1.5 if self.config.use_uncertainty_gates else float("inf")
+        )
+        ba_costs = build_ba_costs(
+            releases, person_tracks, fps,
+            cost_config=self.config.cost_config,
+            max_uncertainty_height_ratio=max_uncertainty_ratio,
+        )
+        bc_costs = build_bc_costs(
+            releases, vehicle_tracks, fps,
+            cost_config=self.config.cost_config,
+            max_uncertainty_height_ratio=max_uncertainty_ratio,
+        )
+        ac_costs = build_ac_costs(
+            person_tracks, vehicle_tracks, fps,
+            cost_config=self.config.cost_config,
+            max_uncertainty_height_ratio=max_uncertainty_ratio,
+        )
         # Keep pre-collapse per-release cells for the research sidecar.  A
         # collapsed pair cost alone cannot tell whether the GT release was
         # missing, rejected by a gate, or merely lost during route ranking.
         ba_by_person_release = {
             (person_key, int(release.frame_index)): compute_c_ba(
-                [release], observations, fps
+                [release], observations, fps,
+                cost_config=self.config.cost_config,
+                max_uncertainty_height_ratio=max_uncertainty_ratio,
             )
             for person_key, observations in person_tracks.items()
             for release in releases
@@ -425,7 +571,9 @@ class SmartBacktrackResolver:
         # event table once instead of repeating it for every B-A candidate.
         bc_by_vehicle_release = {
             (vehicle_key, int(release.frame_index)): compute_c_bc(
-                [release], observations, fps
+                [release], observations, fps,
+                cost_config=self.config.cost_config,
+                max_uncertainty_height_ratio=max_uncertainty_ratio,
             )
             for vehicle_key, observations in vehicle_tracks.items()
             for release in releases
@@ -629,6 +777,35 @@ class SmartBacktrackResolver:
                 "ac_weight": float(self.config.ac_weight),
                 "bc_support_bonus": float(self.config.bc_support_bonus),
                 "sigma_floor_px": float(self.config.sigma_floor_px),
+                "use_kalman_rts": bool(self.config.use_kalman_rts),
+                "confidence_aware_kalman": bool(
+                    self.config.confidence_aware_kalman
+                ),
+                "use_uncertainty_gates": bool(
+                    self.config.use_uncertainty_gates
+                ),
+                "kalman_process_noise_scale": float(
+                    self.config.kalman_process_noise_scale
+                ),
+                "kalman_measurement_noise_scale": float(
+                    self.config.kalman_measurement_noise_scale
+                ),
+                "kalman_max_extrapolation_seconds": (
+                    float(self.config.kalman_max_extrapolation_seconds)
+                    if self.config.kalman_max_extrapolation_seconds is not None
+                    else None
+                ),
+                "kalman_effective_max_extrapolation_frames": int(
+                    max_extrapolation_frames
+                ),
+                "kalman_time_semantics": (
+                    "nearest_real_detection_frame"
+                    if self.config.use_kalman_rts
+                    else "detector_frame"
+                ),
+                "use_reverse_trajectory": bool(
+                    self.config.use_reverse_trajectory
+                ),
             },
             "release_hypotheses": [
                 _release_hypothesis_payload(release) for release in releases

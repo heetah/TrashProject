@@ -54,6 +54,8 @@ LITTER_FP_NEAREST_VEHICLE_DIST = 40.0  # 候選距車輛 bbox 此值內才做共
 LITTER_FP_COMOTION_MIN_VEH_STEP = 4.0  # 該步車輛位移 ≥ 此值才足以判斷共動（px/frame）
 LITTER_FP_COMOTION_MAX_REL = 4.0       # 該步 litter 相對車輛位移 ≤ 此值視為隨車（px/frame）
 LITTER_FP_COMOTION_MIN_COS = 0.85      # litter 與車輛速度向量夾角餘弦門檻
+LITTER_FP_RELEASE_MIN_SEPARATION = 40.0  # 車框邊緣出生後至少離車此距離，才可略過水平條紋 gate
+LITTER_FP_RELEASE_MAX_HISTORY = 3        # 僅保留剛釋放的前幾個 observation，避免放寬長軌跡雜訊
 
 # === litter_holding 參數常數（皆為固定調校值，不從呼叫端覆寫）===
 
@@ -860,7 +862,32 @@ def litter_candidate_is_vehicle_fp(litter_box, actors, vehicle_history=None,
         down = lcy - y0
         horiz = abs(lcx - x0)
         if horiz > LITTER_FP_STREAK_RATIO * max(down, 1e-6):
-            return True, 'horizontal_streak'
+            # 真正從車窗/車斗邊緣拋出的輕物，一開始可能幾乎水平飛行。
+            # 只有軌跡剛出生、起點在車框內且本幀已明顯離開同一車框時，
+            # 才不在此前處理 gate 丟棄；後續仍需通過 holding、vehicle-relative
+            # separation 與 tracker 的車輛拋擲 confirmation，不能直接確認事件。
+            released_from_vehicle_edge = False
+            if len(hist) <= LITTER_FP_RELEASE_MAX_HISTORY:
+                for actor in actors or []:
+                    if str(actor.get('cls', '')).lower() not in VEHICLE_LIKE_CLASSES:
+                        continue
+                    box = actor.get('box')
+                    if box is None:
+                        continue
+                    ax1, ay1, ax2, ay2 = map(float, box[:4])
+                    start_dist = math.hypot(
+                        max(ax1 - x0, 0.0, x0 - ax2),
+                        max(ay1 - y0, 0.0, y0 - ay2),
+                    )
+                    current_dist = math.hypot(
+                        max(ax1 - lcx, 0.0, lcx - ax2),
+                        max(ay1 - lcy, 0.0, lcy - ay2),
+                    )
+                    if start_dist == 0.0 and current_dist >= LITTER_FP_RELEASE_MIN_SEPARATION:
+                        released_from_vehicle_edge = True
+                        break
+            if not released_from_vehicle_edge:
+                return True, 'horizontal_streak'
 
     # 3) co-motion（需軌跡 + 鄰近移動車輛的逐幀 centroid）
     if (nearest_veh_id is not None and nearest_dist <= LITTER_FP_NEAREST_VEHICLE_DIST

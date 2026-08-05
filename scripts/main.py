@@ -1,5 +1,4 @@
 import cv2
-import json
 import os
 import argparse
 from pathlib import Path
@@ -19,7 +18,11 @@ from pipeline.plate import (
     wait_for_plate_jobs,
 )
 from pipeline.profiling import PipelineProfiler
-from pipeline.events import build_run_events, write_events_jsonl
+from pipeline.events import (
+    build_analysis_report,
+    build_run_events,
+    write_analysis_json,
+)
 from pipeline.backtrack.sidecar import (
     build_run_record as build_backtrack_run_record,
     write_jsonl as write_backtrack_jsonl,
@@ -77,7 +80,7 @@ MODEL_BBOX_PATH = '/home/se_copilot/trashProject/modules_weight/best-yolo-seg_v3
 MODEL_TRASH_PATH = '/home/se_copilot/trashProject/modules_weight/best-rtdetr-4c.pt'
 MODEL_BBOX_PATH_BATCH = '/home/se_copilot/trashProject/modules_weight/batch/best-yolo-seg_v3.pt'
 # best-rtdetr-4c.pt 無 batch/ 版本；batch engine 由 export_tensorrt.py 在同目錄產出 best-rtdetr-4c_b8.engine。
-MODEL_TRASH_PATH_BATCH = '/home/se_copilot/trashProject/modules_weight/best-rtdetr-4c.pt'
+MODEL_TRASH_PATH_BATCH = '/home/se_copilot/trashProject/modules_weight/best-rtdetr-4c-background.pt'
 
 
 def _default_model_paths_for_batch(batch_size):
@@ -492,6 +495,7 @@ if __name__ == "__main__":
                 "rtdetr_enabled": _RTDETR_ENABLED,
                 "stgcn_pose_enabled": True,
                 "plate_enabled": _RTDETR_ENABLED,
+                "duration_sec": round(int(processed_frames) / float(fps), 3),
                 "raw_litter_candidates": int(detection_stats.get('raw_litter_candidates', 0)),
                 "filtered_litter_candidates": int(detection_stats.get('filtered_litter_candidates', 0)),
                 "confirmed_litter_ids": len(confirmed_litter_ids),
@@ -552,7 +556,7 @@ if __name__ == "__main__":
             if (
                 litter_tracker is not None
                 and hasattr(litter_tracker, "get_backtrack_candidate_records")
-                and os.environ.get("SMART_BACKTRACK_SIDECAR", "1")
+                and os.environ.get("SMART_BACKTRACK_SIDECAR", "0")
                 not in ("0", "")
             ):
                 sidecar_path = Path(final_output).with_name(
@@ -595,19 +599,12 @@ if __name__ == "__main__":
                     f"events={len(candidate_records)} -> {sidecar_path}"
                 )
 
-            # Summary JSON 固定寫在輸出影片同目錄：{stem}_summary.json
-            summary_path = Path(final_output).with_name(
-                Path(final_output).stem + "_summary.json"
+            # 每支影片只輸出一份前端 JSON；研究 sidecar 預設關閉，需明確啟用。
+            analysis_path = Path(final_output).with_name(
+                Path(final_output).stem + "_analysis.json"
             )
-            summary_path.write_text(
-                json.dumps(run_summary, ensure_ascii=False, indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
+            run_summary["analysis_json"] = str(analysis_path)
 
-            # events.jsonl:前端監測台資料來源(與 summary.json 分離,不改變其行為)。
-            events_path = Path(final_output).with_name(
-                Path(final_output).stem + "_events.jsonl"
-            )
             run_events = build_run_events(
                 final_litter_events,
                 action_module.get_urinate_events() if action_module is not None else [],
@@ -615,8 +612,14 @@ if __name__ == "__main__":
                 run_summary,
                 fps,
             )
-            n_events = write_events_jsonl(run_events, str(events_path))
-            print(f"Events written: {n_events} -> {events_path}")
+            analysis_report = build_analysis_report(
+                run_summary,
+                run_events,
+                vehicle_history,
+                fps=fps,
+            )
+            write_analysis_json(analysis_report, analysis_path)
+            print(f"Analysis written: {analysis_path}")
 
             if litter_tracker is not None:
                 litter_tracker.close()
