@@ -42,7 +42,7 @@ def _get_plate_models(profiler=None):
     if _plate_model is None:
         from ultralytics import YOLO
         with profile_block(profiler, "model_load.plate_yolo"):
-            _plate_model = YOLO("test_ocr/license_plate_model/runs/detect/license_plate/yolo26n_v1/weights/best.pt")
+            _plate_model = YOLO("/home/se_copilot/trashProject/modules_weight/best-licnese-plate.pt")
 
     if _ocr_model is None:
         os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")

@@ -22,8 +22,12 @@ trashProject/
 │   │   └── backtrack/           # Kalman/RTS/cost/flow/sidecar
 │   ├── frontend/                # analysis JSON 靜態 dashboard
 │   └── *.py                     # compatibility shims 與工具入口
+├── UI/                          # 獨立 Flask API + React 人工複核介面
+│   ├── backend/                 # SQLite job/review、單一 pipeline worker、JSON/media API
+│   └── frontend/                # 未審核/已審核、可捲動影片列與事件證據
 ├── tests/
 │   ├── pipeline/                # production unit/integration tests
+│   ├── ui/                      # UI persistence/API tests
 │   └── test_litter_regression.py
 ├── modules_weight/              # 本機權重，Git ignored
 ├── resources/                   # 本機測試影片，Git ignored，可不存在
@@ -157,6 +161,19 @@ conda run -n rtdetr python scripts/main.py /path/to/video.mp4
 
 請勿沿用舊版本的 `--batch`、`--disable-action`、`--disable-plate`、`--no-engine`、`--trash-conf` 參數；目前 CLI 不接受這些選項。
 
+### Flask + React 人工複核介面
+
+`UI/` 是獨立 web application，不把 Flask/React 混入 `scripts/`。Flask 把上傳影片或
+`.env` allowlist 內的資料夾影片排入 SQLite queue，再由單一 background worker 逐支
+呼叫上述 `scripts/main.py`。React 讀取 Flask 提供的 analysis JSON，顯示 annotated
+影片與摘要，並在桌面版右欄列出全部 confirmed litter/STGCN 事件、模型 confidence、
+Smart Backtrack 狀態、可能車輛與 OCR 證據；每個事件的證據與人工判定共用一卡片。
+車牌可保存獨立人工修正版，不覆寫 AI OCR 值。介面分為未審核／已審核兩頁。
+
+人工 accepted/rejected/uncertain 與備註只寫入 `UI/data/ui.sqlite3`，不修改 production
+analysis JSON。重新啟動後工作與審核仍保留，也可重新掃描 `output/` 下既有的
+`*_annotated_analysis.json`。完整設定、安裝、啟動與 API 見 [`UI/README.md`](UI/README.md)。
+
 ### 常用環境變數
 
 | 變數 | 預設 | 說明 |
@@ -254,6 +271,13 @@ conda run -n rtdetr python -m py_compile \
 
 ```bash
 conda run -n rtdetr python -m pytest -q tests/pipeline
+```
+
+### UI tests 與 frontend build
+
+```bash
+conda run -n rtdetr python -m pytest -q tests/ui
+cd UI/frontend && npm run build
 ```
 
 ### Targeted GPU-free tests

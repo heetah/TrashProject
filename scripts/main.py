@@ -77,7 +77,7 @@ STGCN_WEIGHT_PATH = '/home/se_copilot/trashProject/modules_weight/best_stgcn_062
 STGCN_CONFIG_PATH = '/home/se_copilot/trashProject/mmaction2/configs/skeleton/stgcnpp/custom_trash_stgcnpp.py'
 
 MODEL_BBOX_PATH = '/home/se_copilot/trashProject/modules_weight/best-yolo-seg_v3.pt'
-MODEL_TRASH_PATH = '/home/se_copilot/trashProject/modules_weight/best-rtdetr-4c.pt'
+MODEL_TRASH_PATH = '/home/se_copilot/trashProject/modules_weight/best-rtdetr-4c-background.pt'
 MODEL_BBOX_PATH_BATCH = '/home/se_copilot/trashProject/modules_weight/batch/best-yolo-seg_v3.pt'
 # best-rtdetr-4c.pt 無 batch/ 版本；batch engine 由 export_tensorrt.py 在同目錄產出 best-rtdetr-4c_b8.engine。
 MODEL_TRASH_PATH_BATCH = '/home/se_copilot/trashProject/modules_weight/best-rtdetr-4c-background.pt'
