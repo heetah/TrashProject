@@ -611,6 +611,12 @@ if __name__ == "__main__":
                 vehicle_history,
                 run_summary,
                 fps,
+                action_vehicle_associations=(
+                    litter_tracker.get_action_vehicle_associations()
+                    if litter_tracker is not None
+                    and hasattr(litter_tracker, "get_action_vehicle_associations")
+                    else {}
+                ),
             )
             analysis_report = build_analysis_report(
                 run_summary,

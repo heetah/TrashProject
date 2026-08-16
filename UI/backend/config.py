@@ -48,6 +48,17 @@ def _int(environ: Mapping[str, str], name: str, default: int, minimum: int = 0) 
     return max(minimum, parsed)
 
 
+def _float(
+    environ: Mapping[str, str], name: str, default: float, minimum: float = 0.0
+) -> float:
+    value = environ.get(name)
+    try:
+        parsed = float(value) if value not in (None, "") else default
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, parsed)
+
+
 def _path(value: str | None, default: Path) -> Path:
     candidate = Path(value).expanduser() if value else default
     if not candidate.is_absolute():
@@ -76,6 +87,10 @@ class UIConfig:
     allowed_input_roots: tuple[Path, ...]
     frontend_dist: Path
     log_root: Path
+    export_root: Path
+    ffmpeg_executable: str
+    export_pre_roll_sec: float
+    export_post_roll_sec: float
     host: str
     port: int
     conda_executable: str
@@ -126,6 +141,16 @@ def build_config(
             values.get("UI_FRONTEND_DIST"), UI_ROOT / "frontend/dist"
         ),
         log_root=_path(values.get("UI_LOG_ROOT"), data_root / "logs"),
+        export_root=_path(
+            values.get("UI_EXPORT_ROOT"), REPOSITORY_ROOT / "output/ui_exports"
+        ),
+        ffmpeg_executable=values.get("UI_FFMPEG_EXECUTABLE", "ffmpeg"),
+        export_pre_roll_sec=_float(
+            values, "UI_EXPORT_PRE_ROLL_SEC", 3.0, minimum=0.0
+        ),
+        export_post_roll_sec=_float(
+            values, "UI_EXPORT_POST_ROLL_SEC", 3.0, minimum=0.0
+        ),
         host=values.get("UI_HOST", "127.0.0.1"),
         port=_int(values, "UI_PORT", 5000, minimum=1),
         conda_executable=values.get("UI_CONDA_EXECUTABLE", "conda"),
@@ -137,4 +162,3 @@ def build_config(
         import_existing=_bool(values, "UI_IMPORT_EXISTING", True),
         folder_recursive=_bool(values, "UI_FOLDER_RECURSIVE", True),
     )
-

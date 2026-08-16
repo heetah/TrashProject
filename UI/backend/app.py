@@ -83,6 +83,17 @@ def create_app(config: UIConfig | None = None, *, start_worker: bool = False) ->
     def retry_job(job_id: str):
         return jsonify({"job": service.retry(job_id)})
 
+    @app.post("/api/exports/reviewed")
+    def export_reviewed_violations():
+        archive = service.export_reviewed_violations()
+        return send_file(
+            archive,
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=archive.name,
+            conditional=True,
+        )
+
     @app.put("/api/jobs/<job_id>/reviews/<path:event_key>")
     def save_review(job_id: str, event_key: str):
         payload = request.get_json(silent=True) or {}

@@ -714,6 +714,7 @@ class STGCNActionModule:
                     urination_confirmed, urination_positive_sec, urination_observed_sec = (
                         self._record_urination_evidence(track_id, action, conf, fps, stats=stats)
                     )
+                    new_urinate_event_frame = None
                     if self._is_urination_action(action) and urination_confirmed:
                         already_alerting_urination = (
                             self.alert_counter[track_id] > 0 and
@@ -722,13 +723,14 @@ class STGCNActionModule:
                         self.alert_counter[track_id] = self.alert_frames
                         self.alert_action[track_id] = "urinate"
                         if not already_alerting_urination:
+                            new_urinate_event_frame = int(self.frame_index)
                             _add_stat(stats, "stgcn_alerts")
                             _add_stat(stats, "stgcn_urinate_confirmed")
                             # 新確認的 urinate episode:記一筆事件(frame_index 為 action 模組
                             # 內部幀計數,作為相對時間戳)。
                             self._urinate_events.append({
                                 "track_id": int(track_id),
-                                "frame_index": int(self.frame_index),
+                                "frame_index": new_urinate_event_frame,
                                 "conf": float(conf),
                                 "evidence_sec": float(urination_positive_sec),
                             })
@@ -749,6 +751,8 @@ class STGCNActionModule:
                             self.urinate_topp_mass if self.urinate_topp_enabled
                             else self.urination_min_sec
                         ),
+                        # 只在新 episode 的確認幀提供，讓下游把該事件綁到當時回追的車輛。
+                        "new_urinate_event_frame": new_urinate_event_frame,
                     }
                     if self.alert_counter[track_id] > 0:
                         # alert_frames 讓違規標記維持數幀，避免單幀分類閃爍。

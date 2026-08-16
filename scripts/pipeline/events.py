@@ -10,7 +10,8 @@ accuracy 固定為 ``null``，不可把 confidence 當成 accuracy。
 事件 schema(每行一個 JSON 物件):
   litter:  {type:"litter", frame_index, time_sec, litter_id, bbox:[x1,y1,x2,y2],
             thrower:{cls,track_id}|null, license_plate:str|null, escalated:bool}
-  urinate: {type:"urinate", frame_index:null, time_sec:null, confirmed_count:int}
+  urinate: {type:"urinate", frame_index, time_sec, track_id,
+            vehicle:{cls,track_id}|null, license_plate:str|null}
 """
 import json
 import math
@@ -98,6 +99,55 @@ def _litter_time_segment(event, fps):
     }
 
 
+def _urinate_time_segment(event, fps):
+    """以確認時間與已累積 evidence 建立可剪輯區間。"""
+    frame_index = event.get("frame_index")
+    if frame_index is None:
+        return {
+            "start_sec": None,
+            "end_sec": None,
+            "basis": "aggregate_without_timestamp",
+            "human_reviewed": False,
+        }
+    end_sec = _time_sec(frame_index, fps)
+    evidence_sec = max(_finite_float(event.get("evidence_sec")) or 0.0, 0.0)
+    return {
+        "start_sec": round(max(0.0, end_sec - evidence_sec), 2),
+        "end_sec": end_sec,
+        "basis": "stgcn_evidence_to_confirmation",
+        "human_reviewed": False,
+    }
+
+
+def _vehicle_for_person(track_id, person_vehicle_map, event_frame_index=None):
+    if track_id is None or not person_vehicle_map:
+        return None
+    try:
+        person_id = int(track_id)
+    except (TypeError, ValueError):
+        return None
+    vehicle_key = None
+    if event_frame_index is not None:
+        try:
+            vehicle_key = person_vehicle_map.get((person_id, int(event_frame_index)))
+        except (TypeError, ValueError):
+            vehicle_key = None
+    if vehicle_key is None:
+        vehicle_key = person_vehicle_map.get(person_id)
+    if vehicle_key is None:
+        vehicle_key = person_vehicle_map.get(str(person_id))
+    if not isinstance(vehicle_key, (tuple, list)) or len(vehicle_key) != 2:
+        return None
+    cls_name = str(vehicle_key[0]).lower()
+    if cls_name not in VEHICLE_LIKE:
+        return None
+    try:
+        vehicle_id = int(vehicle_key[1])
+    except (TypeError, ValueError):
+        return None
+    return (cls_name, vehicle_id)
+
+
 def build_litter_events(litter_events, vehicle_history, fps):
     """把 tracker 的 confirmed litter 事件(get_litter_events())轉成扁平 event 記錄。"""
     out = []
@@ -135,20 +185,43 @@ def build_litter_events(litter_events, vehicle_history, fps):
     return out
 
 
-def build_urinate_events(urinate_events, run_summary, fps):
+def build_urinate_events(
+    urinate_events,
+    run_summary,
+    fps,
+    person_vehicle_map=None,
+    vehicle_history=None,
+):
     """優先用 per-track 確認明細(action_module.get_urinate_events());沒有時退回 summary
     聚合(相容舊行為:一筆 run-level urinate 事件)。"""
     if urinate_events:
         out = []
         for ev in urinate_events:
             fi = ev.get("frame_index")
+            vehicle_key = _vehicle_for_person(
+                ev.get("track_id"), person_vehicle_map, ev.get("frame_index")
+            )
+            vehicle = (
+                {"cls": vehicle_key[0], "track_id": vehicle_key[1]}
+                if vehicle_key is not None
+                else None
+            )
+            plate_number, plate_confidence, plate_status = _plate_for_thrower(
+                vehicle_key, vehicle_history
+            )
             out.append({
                 "type": "urinate",
                 "track_id": int(ev.get("track_id", -1)),
                 "frame_index": int(fi) if fi is not None else None,
                 "time_sec": _time_sec(fi, fps) if fi is not None else None,
+                "time_segment": _urinate_time_segment(ev, fps),
                 "conf": round(float(ev.get("conf", 0.0)), 3),
                 "evidence_sec": round(float(ev.get("evidence_sec", 0.0)), 2),
+                "vehicle": vehicle,
+                "license_plate": plate_number,
+                "license_plate_confidence": plate_confidence,
+                "license_plate_status": plate_status,
+                "attribution_status": "resolved" if vehicle else "dustbin",
             })
         out.sort(key=lambda e: e["frame_index"] if e["frame_index"] is not None else float("inf"))
         return out
@@ -165,11 +238,24 @@ def build_urinate_events(urinate_events, run_summary, fps):
     }]
 
 
-def build_run_events(litter_events, urinate_events, vehicle_history, run_summary, fps):
+def build_run_events(
+    litter_events,
+    urinate_events,
+    vehicle_history,
+    run_summary,
+    fps,
+    action_vehicle_associations=None,
+):
     """組合一次 run 的所有事件:litter 依 frame 排序,urinate(per-track 或聚合)接在後面。"""
     events = build_litter_events(litter_events, vehicle_history, fps)
     events.sort(key=lambda e: e.get("frame_index") or 0)
-    events.extend(build_urinate_events(urinate_events, run_summary, fps))
+    events.extend(build_urinate_events(
+        urinate_events,
+        run_summary,
+        fps,
+        person_vehicle_map=action_vehicle_associations,
+        vehicle_history=vehicle_history,
+    ))
     return events
 
 
@@ -211,11 +297,23 @@ def _compact_analysis_event(event):
             "review_required": True,
         }
 
+    segment = event.get("time_segment") or {}
+    vehicle = event.get("vehicle")
+    vehicle_id = (
+        f"{vehicle['cls']}:{int(vehicle['track_id'])}" if vehicle else None
+    )
     return {
         "type": "urinate",
         "track_id": event.get("track_id"),
         "time_sec": event.get("time_sec"),
+        "start_sec": segment.get("start_sec", event.get("time_sec")),
+        "end_sec": segment.get("end_sec", event.get("time_sec")),
         "confidence": event.get("conf"),
+        "vehicle": vehicle_id,
+        "plate": event.get("license_plate"),
+        "plate_confidence": event.get("license_plate_confidence"),
+        "plate_status": event.get("license_plate_status"),
+        "attribution_status": event.get("attribution_status"),
         "review_required": True,
     }
 

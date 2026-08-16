@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, videoUrl } from "./api";
+import { api, download, videoUrl } from "./api";
 
 const STATUS_LABELS = {
   queued: "等待中",
@@ -335,14 +335,17 @@ function PlateEditor({ jobId, unit, onSaved }) {
 }
 
 function ReviewEditor({ jobId, unit, onSaved }) {
-  const [verdict, setVerdict] = useState(unit.review?.verdict || "");
+  const savedVerdict = ["accepted", "rejected"].includes(unit.review?.verdict)
+    ? unit.review.verdict
+    : "";
+  const [verdict, setVerdict] = useState(savedVerdict);
   const [note, setNote] = useState(unit.review?.note || "");
   const [reviewer, setReviewer] = useState(unit.review?.reviewer || "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
-    setVerdict(unit.review?.verdict || "");
+    setVerdict(["accepted", "rejected"].includes(unit.review?.verdict) ? unit.review.verdict : "");
     setNote(unit.review?.note || "");
     setReviewer(unit.review?.reviewer || "");
   }, [unit.event_key, unit.review]);
@@ -382,10 +385,6 @@ function ReviewEditor({ jobId, unit, onSaved }) {
           <input type="radio" name={`verdict-${unit.event_key}`} value="rejected" checked={verdict === "rejected"} onChange={(event) => setVerdict(event.target.value)} />
           {noEvent ? "可能漏判" : "AI 誤判"}
         </label>
-        <label className={verdict === "uncertain" ? "choice active warn" : "choice"}>
-          <input type="radio" name={`verdict-${unit.event_key}`} value="uncertain" checked={verdict === "uncertain"} onChange={(event) => setVerdict(event.target.value)} />
-          證據不足
-        </label>
       </fieldset>
       <div className="review-fields">
         <label>
@@ -398,7 +397,11 @@ function ReviewEditor({ jobId, unit, onSaved }) {
         </label>
       </div>
       <div className="review-submit">
-        <span>{unit.review ? `上次審核 ${formatDate(unit.review.reviewed_at)}` : "尚未審核"}</span>
+        <span>
+          {unit.review?.verdict === "uncertain"
+            ? "舊版「證據不足」判定，請重新選擇"
+            : unit.review ? `上次審核 ${formatDate(unit.review.reviewed_at)}` : "尚未審核"}
+        </span>
         <button type="submit" disabled={busy || !verdict}>{busy ? "儲存中…" : "儲存判定"}</button>
       </div>
       {error && <p className="form-message error" role="alert">{error}</p>}
@@ -430,17 +433,15 @@ function EvidenceCard({ jobId, unit, onSeek, onSaved }) {
         <button type="button" className="seek-button" onClick={() => onSeek(event.start_sec ?? event.time_sec)}>跳到事件</button>
       </div>
       <Confidence label={isLitter ? "RT-DETR 模型信心" : "STGCN 模型信心"} value={event.confidence} />
-      {isLitter && (
-        <dl className="evidence-grid">
-          <div><dt>歸因狀態</dt><dd>{ATTRIBUTION_LABELS[event.attribution_status] || event.attribution_status || "NULL／未提供"}</dd></div>
-          <div><dt>可能關聯車輛</dt><dd>{event.vehicle || "NULL"}</dd></div>
-          <div><dt>車牌</dt><dd><PlateEditor jobId={jobId} unit={unit} onSaved={onSaved} /></dd></div>
-          <div><dt>OCR 狀態</dt><dd>{PLATE_LABELS[event.plate_status] || event.plate_status || "—"}</dd></div>
-          <div><dt>OCR 信心</dt><dd>{formatPercent(event.plate_confidence)}</dd></div>
-          <div><dt>事件層級</dt><dd>confirmed litter</dd></div>
-        </dl>
-      )}
-      <p className="evidence-note">模型信心不是準確率；resolved、車輛或車牌仍須人工核對，證據不足可保留 NULL。</p>
+      <dl className="evidence-grid">
+        <div><dt>歸因狀態</dt><dd>{ATTRIBUTION_LABELS[event.attribution_status] || event.attribution_status || "NULL／未提供"}</dd></div>
+        <div><dt>可能關聯車輛</dt><dd>{event.vehicle || "NULL"}</dd></div>
+        <div><dt>車牌</dt><dd><PlateEditor jobId={jobId} unit={unit} onSaved={onSaved} /></dd></div>
+        <div><dt>OCR 狀態</dt><dd>{PLATE_LABELS[event.plate_status] || event.plate_status || "—"}</dd></div>
+        <div><dt>OCR 信心</dt><dd>{formatPercent(event.plate_confidence)}</dd></div>
+        <div><dt>事件層級</dt><dd>{isLitter ? "confirmed litter" : "confirmed urinate"}</dd></div>
+      </dl>
+      <p className="evidence-note">模型信心不是準確率；resolved、車輛或車牌仍須人工核對，無可靠關聯時保留 NULL。</p>
     </article>
   );
 }
@@ -522,6 +523,8 @@ function App() {
   const [config, setConfig] = useState(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [exportMessage, setExportMessage] = useState("");
 
   const loadJobs = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true);
@@ -563,6 +566,28 @@ function App() {
     setTab(nextTab);
     setSelectedId(null);
     setDetail(null);
+    setExportMessage("");
+  }
+
+  async function exportReviewed() {
+    setExportBusy(true);
+    setExportMessage("");
+    try {
+      const result = await download("/api/exports/reviewed", { method: "POST" });
+      const url = URL.createObjectURL(result.blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = result.filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setExportMessage("已下載違規片段與 Excel 壓縮檔");
+    } catch (requestError) {
+      setExportMessage(requestError.message);
+    } finally {
+      setExportBusy(false);
+    }
   }
 
   async function updatedCase(nextCase) {
@@ -592,6 +617,15 @@ function App() {
             已審核 <span>{counts.reviewed}</span>
           </button>
         </nav>
+        {tab === "reviewed" && (
+          <div className="review-export">
+            <button type="button" disabled={exportBusy || counts.reviewed === 0} onClick={exportReviewed}>
+              {exportBusy ? "正在剪輯與整理…" : "匯出已審核違規"}
+            </button>
+            <small>只匯出完整審核案件中判定「AI 辨識正確」的事件。</small>
+            {exportMessage && <span role="status">{exportMessage}</span>}
+          </div>
+        )}
         {error && <div className="global-error" role="alert">{error}</div>}
         {loading ? <div className="list-loading">載入案件中…</div> : <CaseList jobs={jobs} selectedId={selectedId} onSelect={setSelectedId} />}
         <div className="case-navigation">

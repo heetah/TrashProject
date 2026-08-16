@@ -91,8 +91,21 @@ Production 不再另外產生 `summary.json` 或 `events.jsonl`。JSON 先寫入
 | `attribution_status` | string / null | Smart Backtrack 狀態，例如 `resolved`、`dustbin`、`pending` |
 | `review_required` | boolean | 固定為 `true` |
 
-Urinate 事件只保留：`type`、`track_id`、`time_sec`、`confidence`、
-`review_required`。
+Urinate 事件欄位：
+
+| 欄位 | 型別 | 說明 |
+|---|---|---|
+| `type` | string | `urinate` |
+| `track_id` | integer / null | STGCN confirmed person track |
+| `time_sec` | number / null | Temporal confirmation 時間 |
+| `start_sec` / `end_sec` | number / null | 已累積 STGCN evidence 到 confirmation 的可剪輯區間 |
+| `confidence` | number / null | STGCN confidence，不是 accuracy |
+| `vehicle` | string / null | Confirmed 人物經 action actor history 回追到的 vehicle/scooter |
+| `plate` | string / null | 關聯車輛的 OCR 車牌；失敗時為 `null` |
+| `plate_confidence` | number / null | OCR confidence |
+| `plate_status` | string / null | 與垃圾事件相同的 OCR 狀態集合 |
+| `attribution_status` | string / null | 找到 action 車輛候選時為 `resolved`，否則 `dustbin` |
+| `review_required` | boolean | 固定為 `true` |
 
 ## 證據限制
 
@@ -100,6 +113,8 @@ Urinate 事件只保留：`type`、`track_id`、`time_sec`、`confidence`、
 - `detection_accuracy` 沒有人工 reviewed labels 時必須保持 `null`。
 - `passed_vehicle_count` 以 tracker ID 計算；ID fragmentation 可能高估實際車數。
 - `attribution_status=resolved` 仍是模型歸因，不是 ground truth。
+- Urinate 的 `start_sec` 由已累積 evidence 秒數回推，供看片與剪輯，不代表人工標定的
+  行為開始時間。
 - Person、vehicle 或 plate 證據不足時保留 `null`，交由人工複核。
 
 ## 研究 sidecar

@@ -76,6 +76,10 @@ button {
 .review-tabs button { display: flex; justify-content: space-between; border-color: transparent; padding: 10px 12px; color: var(--muted); background: transparent; }
 .review-tabs button.active { color: var(--ink); background: #e7ebe6; }
 .review-tabs span { font-variant-numeric: tabular-nums; }
+.review-export { display: grid; gap: 6px; margin: 0 16px 11px; }
+.review-export button { width: 100%; }
+.review-export small, .review-export span { color: var(--muted); font-size: 10px; line-height: 1.4; }
+.review-export span { color: var(--accent); }
 
 .case-list { min-height: 0; flex: 1; overflow-y: auto; padding: 0 10px 14px; scrollbar-width: thin; }
 .case-row {
@@ -163,7 +167,7 @@ button {
 .plate-error { color: var(--danger); font-size: 10px; font-weight: 500; }
 
 .review-form { display: flex; flex-direction: column; border-top: 1px solid var(--line); }
-.review-form fieldset { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 0; border: 0; padding: 0; }
+.review-form fieldset { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; margin: 0; border: 0; padding: 0; }
 .review-form legend { margin-bottom: 8px; font-size: 12px; font-weight: 800; }
 .choice { display: flex; align-items: center; gap: 5px; border: 1px solid var(--line); border-radius: 7px; padding: 7px 6px; color: var(--muted); font-size: 11px; cursor: pointer; }
 .choice input { margin: 0; accent-color: var(--accent); }

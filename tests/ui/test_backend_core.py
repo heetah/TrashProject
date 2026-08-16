@@ -1,9 +1,11 @@
 import io
 import json
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from openpyxl import load_workbook
 
 from UI.backend.config import build_config
 from UI.backend.database import Database
@@ -24,6 +26,7 @@ def make_config(tmp_path: Path):
             "UI_ALLOWED_INPUT_ROOTS": str(allowed),
             "UI_FRONTEND_DIST": str(tmp_path / "dist"),
             "UI_LOG_ROOT": str(tmp_path / "logs"),
+            "UI_EXPORT_ROOT": str(tmp_path / "exports"),
             "UI_IMPORT_EXISTING": "0",
             "UI_WORKER_ENABLED": "0",
         },
@@ -157,6 +160,109 @@ def test_plate_correction_persists_without_overwriting_ai_or_reviewing(tmp_path)
 
     assert restarted.delete_plate_correction(job_id, "litter:7") is True
     assert restarted.get_case(job_id)["review_units"][0]["plate_correction"] is None
+
+
+def test_urinate_plate_can_be_corrected(tmp_path):
+    config, _allowed = make_config(tmp_path)
+    event = {
+        "type": "urinate",
+        "track_id": 3,
+        "time_sec": 8.0,
+        "start_sec": 3.0,
+        "end_sec": 8.0,
+        "confidence": 0.91,
+        "vehicle": "scooter:8",
+        "plate": None,
+        "plate_status": "attempted_no_result",
+    }
+    write_existing_result(config.output_root, [event])
+    database = Database(config.database_path)
+    database.initialize()
+    service = ReviewService(config, database)
+    service.discover_existing()
+    job_id = service.list_cases("unreviewed")["items"][0]["id"]
+
+    correction = service.save_plate_correction(
+        job_id, "urinate:3:8.0", corrected_plate="abc-5678"
+    )
+
+    assert correction["corrected_plate"] == "ABC-5678"
+
+
+def test_uncertain_is_rejected_and_legacy_uncertain_remains_unreviewed(tmp_path):
+    config, _allowed = make_config(tmp_path)
+    event = {"type": "litter", "id": 3, "start_sec": 2.0, "end_sec": 3.0}
+    write_existing_result(config.output_root, [event])
+    database = Database(config.database_path)
+    database.initialize()
+    service = ReviewService(config, database)
+    service.discover_existing()
+    job_id = service.list_cases("unreviewed")["items"][0]["id"]
+
+    with pytest.raises(ValueError, match="accepted 或 rejected"):
+        service.save_review(job_id, "litter:3", verdict="uncertain")
+
+    database.save_review(job_id, "litter:3", "uncertain", "舊資料", "舊審核者")
+    detail = service.get_case(job_id)
+    assert detail["job"]["review_status"] == "unreviewed"
+    assert detail["job"]["reviewed_units"] == 0
+
+
+def test_reviewed_export_contains_accepted_clips_and_excel(tmp_path, monkeypatch):
+    config, _allowed = make_config(tmp_path)
+    event = {
+        "type": "urinate",
+        "track_id": 3,
+        "time_sec": 8.0,
+        "start_sec": 3.0,
+        "end_sec": 8.0,
+        "confidence": 0.91,
+        "vehicle": "scooter:8",
+        "plate": "AI-0000",
+        "plate_confidence": 0.82,
+        "plate_status": "recognized",
+        "attribution_status": "resolved",
+    }
+    write_existing_result(config.output_root, [event])
+    database = Database(config.database_path)
+    database.initialize()
+    service = ReviewService(config, database)
+    service.discover_existing()
+    job_id = service.list_cases("unreviewed")["items"][0]["id"]
+    event_key = "urinate:3:8.0"
+    service.save_plate_correction(job_id, event_key, corrected_plate="HUM-1234")
+    service.save_review(
+        job_id,
+        event_key,
+        verdict="accepted",
+        note="=HYPERLINK(\"bad\")",
+        reviewer="測試員",
+    )
+
+    commands = []
+
+    def fake_ffmpeg(command, *, stdout, stderr, text, check):
+        commands.append(command)
+        Path(command[-1]).write_bytes(b"clip")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr("UI.backend.exporter.subprocess.run", fake_ffmpeg)
+    archive_path = service.export_reviewed_violations()
+
+    assert archive_path.parent == config.export_root
+    with zipfile.ZipFile(archive_path) as archive:
+        names = archive.namelist()
+        assert "違規清單.xlsx" in names
+        clips = [name for name in names if name.startswith("clips/")]
+        assert len(clips) == 1
+        workbook = load_workbook(io.BytesIO(archive.read("違規清單.xlsx")))
+    sheet = workbook["違規清單"]
+    headers = [cell.value for cell in sheet[1]]
+    assert sheet.cell(2, headers.index("違規類型") + 1).value == "隨地便溺"
+    assert sheet.cell(2, headers.index("車牌") + 1).value == "HUM-1234"
+    assert sheet.cell(2, headers.index("車牌來源") + 1).value == "人工修正"
+    assert sheet.cell(2, headers.index("備註") + 1).value.startswith("'")
+    assert commands[0][commands[0].index("-ss") + 1] == "0.000"
 
 
 def test_no_event_video_still_requires_human_review(tmp_path):

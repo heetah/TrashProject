@@ -12,10 +12,11 @@ from typing import Any, Iterable
 from .analysis import load_analysis, review_units
 from .config import UIConfig
 from .database import Database, utc_now
+from .exporter import build_reviewed_export
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm"}
-REVIEW_VERDICTS = {"accepted", "rejected", "uncertain"}
+REVIEW_VERDICTS = {"accepted", "rejected"}
 MAX_CORRECTED_PLATE_LENGTH = 32
 
 
@@ -40,6 +41,7 @@ class ReviewService:
         self.config.upload_root.mkdir(parents=True, exist_ok=True)
         self.config.output_root.mkdir(parents=True, exist_ok=True)
         self.config.log_root.mkdir(parents=True, exist_ok=True)
+        self.config.export_root.mkdir(parents=True, exist_ok=True)
 
     def _validate_video(self, path: Path, *, allowed_roots: Iterable[Path]) -> Path:
         resolved = path.expanduser().resolve()
@@ -181,7 +183,11 @@ class ReviewService:
                 analysis_error = str(exc)
 
         total_units = len(units)
-        reviewed_units = sum(1 for unit in units if unit.get("review"))
+        reviewed_units = sum(
+            1
+            for unit in units
+            if (unit.get("review") or {}).get("verdict") in REVIEW_VERDICTS
+        )
         review_status = (
             "reviewed"
             if job["status"] == "completed" and total_units > 0 and reviewed_units == total_units
@@ -231,7 +237,7 @@ class ReviewService:
             )
         return {"job": public, "analysis": analysis, "review_units": units}
 
-    def _require_litter_event(self, job_id: str, event_key: str) -> None:
+    def _require_plate_event(self, job_id: str, event_key: str) -> None:
         case = self.get_case(job_id)
         unit = next(
             (item for item in case["review_units"] if item["event_key"] == event_key),
@@ -239,8 +245,8 @@ class ReviewService:
         )
         if unit is None:
             raise ValueError("event_key 不屬於這支影片")
-        if unit["kind"] != "litter":
-            raise ValueError("只有垃圾事件可以人工修正車牌")
+        if unit["kind"] not in {"litter", "urinate"}:
+            raise ValueError("只有垃圾或隨地便溺事件可以人工修正車牌")
 
     def save_plate_correction(
         self,
@@ -256,11 +262,11 @@ class ReviewService:
             raise ValueError(f"車牌不可超過 {MAX_CORRECTED_PLATE_LENGTH} 字")
         if any(character in plate for character in "\r\n\t"):
             raise ValueError("車牌不可包含換行或定位字元")
-        self._require_litter_event(job_id, event_key)
+        self._require_plate_event(job_id, event_key)
         return self.database.save_plate_correction(job_id, event_key, plate)
 
     def delete_plate_correction(self, job_id: str, event_key: str) -> bool:
-        self._require_litter_event(job_id, event_key)
+        self._require_plate_event(job_id, event_key)
         return self.database.delete_plate_correction(job_id, event_key)
 
     def save_review(
@@ -273,7 +279,7 @@ class ReviewService:
         reviewer: str = "",
     ) -> dict[str, Any]:
         if verdict not in REVIEW_VERDICTS:
-            raise ValueError("verdict 必須是 accepted、rejected 或 uncertain")
+            raise ValueError("verdict 必須是 accepted 或 rejected")
         if len(note) > 2000:
             raise ValueError("備註不可超過 2000 字")
         if len(reviewer) > 80:
@@ -284,6 +290,57 @@ class ReviewService:
             raise ValueError("event_key 不屬於這支影片")
         return self.database.save_review(
             job_id, event_key, verdict, note.strip(), reviewer.strip()
+        )
+
+    def export_reviewed_violations(self) -> Path:
+        """匯出所有已完整審核案件中 verdict=accepted 的實際事件。"""
+        violations: list[dict[str, Any]] = []
+        for job in self.list_cases("reviewed")["items"]:
+            case = self.get_case(job["id"])
+            analysis = case.get("analysis") or {}
+            duration_sec = (analysis.get("video") or {}).get("duration_sec")
+            for unit in case["review_units"]:
+                review = unit.get("review") or {}
+                event = unit.get("event")
+                if review.get("verdict") != "accepted" or not isinstance(event, dict):
+                    continue
+                correction = unit.get("plate_correction") or {}
+                corrected_plate = correction.get("corrected_plate")
+                ai_plate = event.get("plate")
+                event_type = str(event.get("type") or unit.get("kind") or "event")
+                violations.append(
+                    {
+                        "job_id": job["id"],
+                        "original_name": job["original_name"],
+                        "source_video": job.get("output_video"),
+                        "video_duration_sec": duration_sec,
+                        "violation_type": (
+                            "亂丟垃圾" if event_type == "litter" else
+                            "隨地便溺" if event_type == "urinate" else event_type
+                        ),
+                        "event_key": unit["event_key"],
+                        "event_start_sec": event.get("start_sec", event.get("time_sec")),
+                        "event_end_sec": event.get("end_sec", event.get("time_sec")),
+                        "confidence": event.get("confidence"),
+                        "vehicle": event.get("vehicle"),
+                        "plate": corrected_plate or ai_plate,
+                        "plate_source": (
+                            "人工修正" if corrected_plate else
+                            "AI OCR" if ai_plate else "未取得"
+                        ),
+                        "plate_confidence": event.get("plate_confidence"),
+                        "attribution_status": event.get("attribution_status"),
+                        "reviewer": review.get("reviewer"),
+                        "reviewed_at": review.get("reviewed_at"),
+                        "note": review.get("note"),
+                    }
+                )
+        return build_reviewed_export(
+            violations,
+            export_root=self.config.export_root,
+            ffmpeg_executable=self.config.ffmpeg_executable,
+            pre_roll_sec=self.config.export_pre_roll_sec,
+            post_roll_sec=self.config.export_post_roll_sec,
         )
 
     def retry(self, job_id: str) -> dict[str, Any]:

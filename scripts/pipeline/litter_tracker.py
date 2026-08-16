@@ -242,6 +242,9 @@ class GlobalLitterTracker:
         self.violators = {}                 # {(cls, track_id): {ttl, center, action, ...}}
         self.next_id = 0
         self.person_to_vehicle_history = {}
+        # (person_id, action_frame)→vehicle，避免同一 person 多次 episode 被片尾最新車輛覆蓋。
+        self._action_vehicle_associations = {}
+        self._latest_action_event_frames = {}
         # 情境二 dismount 持久邊：person_id -> {vehicle_key, first_frame, last_bound_frame, bound_count}。
         self._dismount_edges = {}
         self._current_frame_index = 0
@@ -2072,6 +2075,13 @@ class GlobalLitterTracker:
             except (TypeError, ValueError):
                 continue
 
+            event_frame = action_info.get('new_urinate_event_frame')
+            if event_frame is not None:
+                try:
+                    self._latest_action_event_frames[person_id] = int(event_frame)
+                except (TypeError, ValueError):
+                    pass
+
             person_key = ('person', person_id)
             person_center = actor_center_map.get(person_key)
             historical_vehicle_key, historical_vehicle_center, historical_person_center = (
@@ -2095,6 +2105,11 @@ class GlobalLitterTracker:
                 self.person_to_vehicle_history[person_id] = vehicle_key
 
             if vehicle_key is not None:
+                action_event_frame = self._latest_action_event_frames.get(person_id)
+                if action_event_frame is not None:
+                    self._action_vehicle_associations.setdefault(
+                        (person_id, action_event_frame), vehicle_key
+                    )
                 vehicle_center = actor_center_map.get(vehicle_key)
                 if vehicle_center is None and vehicle_key == historical_vehicle_key:
                     vehicle_center = historical_vehicle_center
@@ -2110,6 +2125,10 @@ class GlobalLitterTracker:
                 marked_violators.add(vehicle_key)
 
         return marked_violators
+
+    def get_action_vehicle_associations(self):
+        """回傳 confirmed urinate 人物實際回追到的車輛，不暴露可變內部狀態。"""
+        return dict(self._action_vehicle_associations)
 
     def _actor_key(self, actor):
         # 將 actor 統一成 (class, track_id) key，避免 person/vehicle id 空間互相衝突。

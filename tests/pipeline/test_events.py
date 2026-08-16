@@ -100,6 +100,30 @@ def test_urinate_per_track_events_preferred_and_sorted():
     assert "confirmed_count" not in out[0]  # per-track 模式不帶聚合欄位
 
 
+def test_urinate_event_keeps_backtracked_vehicle_and_plate():
+    out = build_urinate_events(
+        [{"track_id": 3, "frame_index": 300, "conf": 0.81, "evidence_sec": 5.2}],
+        {"stgcn_urinate_confirmed": 1},
+        fps=30,
+        person_vehicle_map={(3, 300): ("scooter", 8)},
+        vehicle_history={
+            8: {"license_plate": {"number": "XYZ5678", "conf": 0.93}}
+        },
+    )
+
+    assert out[0]["vehicle"] == {"cls": "scooter", "track_id": 8}
+    assert out[0]["license_plate"] == "XYZ5678"
+    assert out[0]["license_plate_confidence"] == 0.93
+    assert out[0]["license_plate_status"] == "recognized"
+    assert out[0]["attribution_status"] == "resolved"
+    assert out[0]["time_segment"] == {
+        "start_sec": 4.8,
+        "end_sec": 10.0,
+        "basis": "stgcn_evidence_to_confirmation",
+        "human_reviewed": False,
+    }
+
+
 def test_build_run_events_sorts_litter_by_frame_then_urinate():
     litter_events = [
         {"litter_id": 2, "frame_index": 200, "bbox": [0, 0, 1, 1], "center": [0, 0],
@@ -246,7 +270,14 @@ def test_analysis_compacts_urinate_event():
         "type": "urinate",
         "track_id": 3,
         "time_sec": 12.5,
+        "start_sec": 12.5,
+        "end_sec": 12.5,
         "confidence": 0.81,
+        "vehicle": None,
+        "plate": None,
+        "plate_confidence": None,
+        "plate_status": None,
+        "attribution_status": None,
         "review_required": True,
     }]
 

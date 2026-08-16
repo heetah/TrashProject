@@ -24,6 +24,7 @@ def make_app(tmp_path: Path):
             "UI_ALLOWED_INPUT_ROOTS": str(allowed),
             "UI_FRONTEND_DIST": str(tmp_path / "dist"),
             "UI_LOG_ROOT": str(tmp_path / "logs"),
+            "UI_EXPORT_ROOT": str(tmp_path / "exports"),
             "UI_IMPORT_EXISTING": "0",
             "UI_WORKER_ENABLED": "0",
         },
@@ -81,6 +82,13 @@ def test_review_api_moves_completed_case_to_reviewed(tmp_path):
     assert payload["counts"]["reviewed"] == 1
     assert payload["items"][0]["id"] == job_id
 
+    response = client.put(
+        f"/api/jobs/{job_id}/reviews/video:no-ai-event",
+        json={"verdict": "uncertain"},
+    )
+    assert response.status_code == 400
+    assert "accepted 或 rejected" in response.get_json()["error"]
+
 
 def test_plate_correction_api_preserves_ai_plate(tmp_path):
     app, outputs = make_app(tmp_path)
@@ -134,3 +142,18 @@ def test_plate_correction_api_preserves_ai_plate(tmp_path):
     response = client.delete(f"/api/jobs/{job_id}/events/litter:7/plate")
     assert response.status_code == 200
     assert response.get_json()["case"]["review_units"][0]["plate_correction"] is None
+
+
+def test_reviewed_export_api_returns_zip_download(tmp_path, monkeypatch):
+    app, outputs = make_app(tmp_path)
+    archive = outputs / "reviewed_violations.zip"
+    archive.write_bytes(b"PK\x05\x06" + b"\x00" * 18)
+    service = app.extensions["ui_service"]
+    monkeypatch.setattr(service, "export_reviewed_violations", lambda: archive)
+
+    response = app.test_client().post("/api/exports/reviewed")
+
+    assert response.status_code == 200
+    assert response.mimetype == "application/zip"
+    assert "attachment" in response.headers["Content-Disposition"]
+    assert "reviewed_violations.zip" in response.headers["Content-Disposition"]

@@ -168,11 +168,14 @@ conda run -n rtdetr python scripts/main.py /path/to/video.mp4
 呼叫上述 `scripts/main.py`。React 讀取 Flask 提供的 analysis JSON，顯示 annotated
 影片與摘要，並在桌面版右欄列出全部 confirmed litter/STGCN 事件、模型 confidence、
 Smart Backtrack 狀態、可能車輛與 OCR 證據；每個事件的證據與人工判定共用一卡片。
-車牌可保存獨立人工修正版，不覆寫 AI OCR 值。介面分為未審核／已審核兩頁。
+Confirmed 隨地便溺也會顯示 STGCN 動作回追所得的關聯車輛、OCR 狀態與車牌；車牌可
+保存獨立人工修正版，不覆寫 AI OCR 值。介面分為未審核／已審核兩頁。
 
-人工 accepted/rejected/uncertain 與備註只寫入 `UI/data/ui.sqlite3`，不修改 production
-analysis JSON。重新啟動後工作與審核仍保留，也可重新掃描 `output/` 下既有的
-`*_annotated_analysis.json`。完整設定、安裝、啟動與 API 見 [`UI/README.md`](UI/README.md)。
+人工 accepted/rejected 與備註只寫入 `UI/data/ui.sqlite3`，不修改 production analysis
+JSON。已審核頁可將所有完整審核案件中 accepted 的實際事件匯出成 ZIP；每個事件有獨立
+MP4 片段，並附一份列出違規、關聯車輛、車牌與審核資料的 Excel。重新啟動後工作與審核
+仍保留，也可重新掃描 `output/` 下既有的 `*_annotated_analysis.json`。完整設定、安裝、
+啟動與 API 見 [`UI/README.md`](UI/README.md)。
 
 ### 常用環境變數
 
