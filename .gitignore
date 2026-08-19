@@ -1,5 +1,7 @@
 __pycache__/
 .agents/
+.claude/
+.pytest_cache/
 .streamlit/
 .vscode/
 dataset-*/

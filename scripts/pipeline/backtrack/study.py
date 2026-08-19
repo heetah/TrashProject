@@ -56,12 +56,16 @@ class StudyConfig:
     ac_weight: float = 0.75
     bc_support_bonus: float = 0.25
     sigma_floor_px: float = 2.0
+    two_point_max_back_seconds: float = 0.4
+    two_point_prior_cost: float = 1.0
+    max_forward_release_seconds: float = 0.5
     distance_weight: float = 1.0
     time_weight: float = 1.0
     kalman_process_noise_scale: float = 1.0
     kalman_measurement_noise_scale: float = 1.0
     kalman_max_extrapolation_seconds: Optional[float] = None
     confidence_weighted_trajectory: Optional[bool] = None
+    ac_overlap_weight: Optional[float] = None
 
     def __post_init__(self):
         if self.stage not in {
@@ -73,10 +77,18 @@ class StudyConfig:
             raise ValueError("top-k must be positive")
         if self.dustbin_cost <= 0.0 or self.sigma_floor_px <= 0.0:
             raise ValueError("dustbin_cost and sigma_floor_px must be positive")
+        if self.two_point_max_back_seconds < 0.0:
+            raise ValueError("two_point_max_back_seconds must be non-negative")
+        if self.two_point_prior_cost < 0.0:
+            raise ValueError("two_point_prior_cost must be non-negative")
+        if self.max_forward_release_seconds < 0.0:
+            raise ValueError("max_forward_release_seconds must be non-negative")
         if self.distance_weight < 0.0 or self.time_weight < 0.0:
             raise ValueError("distance/time weights must be non-negative")
         if self.distance_weight + self.time_weight <= 0.0:
             raise ValueError("at least one distance/time weight must be positive")
+        if self.ac_overlap_weight is not None and self.ac_overlap_weight < 0.0:
+            raise ValueError("ac_overlap_weight must be non-negative")
         if self.kalman_process_noise_scale <= 0.0:
             raise ValueError("kalman_process_noise_scale must be positive")
         if self.kalman_measurement_noise_scale <= 0.0:
@@ -99,6 +111,19 @@ class StudyConfig:
 
     def resolver_config(self, fps: float) -> SmartBacktrackConfig:
         defaults = SmartBacktrackConfig.from_env(fps=fps)
+        cost_config = BacktrackCostConfig.for_stage(
+            self.stage,
+            distance_weight=float(self.distance_weight),
+            time_weight=float(self.time_weight),
+        )
+        if self.ac_overlap_weight is not None:
+            cost_config = replace(
+                cost_config,
+                ac_weights={
+                    **cost_config.ac_weights,
+                    "overlap": float(self.ac_overlap_weight),
+                },
+            )
         use_kalman_rts = self.stage in {
             "kalman_rts", "uncertainty", "reverse", "full"
         }
@@ -116,11 +141,12 @@ class StudyConfig:
             ac_weight=float(self.ac_weight),
             bc_support_bonus=float(self.bc_support_bonus),
             sigma_floor_px=float(self.sigma_floor_px),
-            cost_config=BacktrackCostConfig.for_stage(
-                self.stage,
-                distance_weight=float(self.distance_weight),
-                time_weight=float(self.time_weight),
+            two_point_max_back_seconds=float(self.two_point_max_back_seconds),
+            two_point_prior_cost=float(self.two_point_prior_cost),
+            max_forward_release_seconds=float(
+                self.max_forward_release_seconds
             ),
+            cost_config=cost_config,
             use_kalman_rts=use_kalman_rts,
             confidence_aware_kalman=self.stage != "kalman_rts",
             use_uncertainty_gates=self.stage in {
@@ -267,6 +293,7 @@ def replay_candidates(
             "release_frame": resolution.release_frame,
             "release_point": resolution.release_point,
             "margin_to_second": resolution.margin_to_second,
+            "actor_margins": dict(resolution.actor_margins),
         }
         video = record.get("video", {})
         trial_record = build_candidate_record(

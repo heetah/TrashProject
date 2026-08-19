@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from pipeline.backtrack.costs import (
     ActorObservation,
@@ -98,6 +99,83 @@ def test_release_hypotheses_fall_back_to_birth_when_fit_is_impossible():
     assert hypotheses[0].model == "birth_fallback"
     assert hypotheses[0].prior_cost >= 6.0
     np.testing.assert_allclose(hypotheses[0].mean_uv, [12.0, 34.0])
+
+
+def test_two_point_release_uses_constant_velocity_with_bounded_horizon():
+    hypotheses = build_release_hypotheses(
+        points_uv=[(100.0, 200.0), (110.0, 220.0)],
+        frame_indices=[20, 22],
+        birth_frame=20,
+        max_back_frames=50,
+        fps=10,
+        two_point_max_back_seconds=0.3,
+        two_point_prior_cost=1.0,
+    )
+
+    assert [item.frame_index for item in hypotheses] == [17, 18, 19, 20]
+    assert all(item.model == "constant_velocity_2point" for item in hypotheses)
+    np.testing.assert_allclose(hypotheses[-1].mean_uv, [100.0, 200.0])
+    np.testing.assert_allclose(hypotheses[0].mean_uv, [85.0, 170.0])
+    np.testing.assert_allclose(hypotheses[-1].velocity_uv, [50.0, 100.0])
+    assert np.trace(hypotheses[0].covariance_uv) > np.trace(
+        hypotheses[-1].covariance_uv
+    )
+    assert hypotheses[0].prior_cost > hypotheses[-1].prior_cost == 1.0
+
+
+def test_two_point_release_is_fps_invariant_in_seconds():
+    low = build_release_hypotheses(
+        [(100.0, 200.0), (110.0, 220.0)], [20, 22],
+        birth_frame=20, max_back_frames=30, fps=10,
+    )
+    high = build_release_hypotheses(
+        [(100.0, 200.0), (110.0, 220.0)], [60, 66],
+        birth_frame=60, max_back_frames=90, fps=30,
+    )
+
+    np.testing.assert_allclose(low[0].mean_uv, high[0].mean_uv)
+    np.testing.assert_allclose(low[0].velocity_uv, high[0].velocity_uv)
+    np.testing.assert_allclose(low[0].covariance_uv, high[0].covariance_uv)
+
+
+def test_ballistic_release_window_may_extend_after_detector_birth():
+    hypotheses = build_release_hypotheses(
+        points_uv=[(100.0, 200.0), (105.0, 180.0), (110.0, 190.0), (115.0, 220.0)],
+        frame_indices=[20, 21, 22, 23],
+        birth_frame=20,
+        max_back_frames=2,
+        fps=10,
+        max_forward_release_seconds=0.5,
+    )
+
+    assert [item.frame_index for item in hypotheses] == [18, 19, 20, 21, 22, 23]
+    assert hypotheses[2].prior_cost == 0.0
+    assert hypotheses[-1].prior_cost > 0.0
+
+
+def test_c_bc_emits_zero_weight_causality_diagnostics_without_changing_total():
+    vehicle = [ActorObservation(
+        cls_name="vehicle",
+        track_id=2,
+        frame_index=10,
+        bbox=(80.0, 80.0, 140.0, 140.0),
+    )]
+    release = _release(10, (110.0, 110.0))
+
+    without = compute_c_bc([release], vehicle, fps=10)
+    with_context = compute_c_bc(
+        [release], vehicle, fps=10,
+        litter_last_point=(180.0, 180.0),
+        litter_last_frame=11,
+    )
+
+    assert with_context.total == pytest.approx(without.total)
+    assert with_context.weights["reverse_direction"] == 0.0
+    assert with_context.weights["exit_deficit"] == 0.0
+    assert with_context.weights["relative_motion_deficit"] == 0.0
+    assert set((
+        "reverse_direction", "exit_deficit", "relative_motion_deficit"
+    )).issubset(with_context.raw_features)
 
 
 def test_c_ba_uses_upper_body_release_zone_not_person_footpoint():

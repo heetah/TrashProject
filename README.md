@@ -94,7 +94,15 @@ STGCN 不判斷 littering。預設 sequence window 為 100 frames；urinate 使�
 
 ### Litter object-event
 
-RT-DETR 使用 BGR 加 temporal change map 的 4-channel 輸入。模型輸出的 `litter` bbox 只是 candidate，必須依序通過：
+RT-DETR 4-channel inference 對齊
+`/mnt/8tb_hdd/under115a/4c-yolo/run_4ch.py`：OpenCV BGR frame 先轉成 RGB，
+第四通道使用相鄰幀 grayscale absolute difference，每幀 min-max normalization 到
+`0..255` 後乘 `1.5` 並 clip 為 `uint8`。Ultralytics 對 4-channel NumPy input
+不會自動交換 BGR/RGB；送入 predictor 的 channel order 因此必須明確為
+`[R, G, B, change]`，再由 predictor 除以 `255` 形成最終 model tensor。單幀、
+batch、batch repair 與 TensorRT smoke test 共用同一個 input builder。
+
+模型輸出的 `litter` bbox 只是 candidate，必須依序通過：
 
 1. Bbox size/aspect-ratio filter。
 2. 全框 motion evidence。
@@ -159,6 +167,24 @@ OUTPUT_ROOT=output \
 conda run -n rtdetr python scripts/main.py /path/to/video.mp4
 ```
 
+若要逐支處理 `/mnt/8tb_hdd/under115a/litter_vidshort/litter_order` 內的影片，使用：
+
+```bash
+bash scripts/run_litter_order.sh
+```
+
+腳本會遞迴尋找 `.mp4`、`.avi`、`.mov`、`.mkv`、`.wmv`、`.m4v`，依檔名字典序逐支
+呼叫 `scripts/main.py`，預設輸出到 `output/litter_order/`。可用環境變數覆寫輸入資料夾、
+輸出位置或 conda 環境：
+
+```bash
+INPUT_DIR=/path/to/videos OUTPUT_ROOT=output/my_run CONDA_ENV=rtdetr \
+bash scripts/run_litter_order.sh
+```
+
+每支影片仍會產生自己的 `_annotated.mp4` 與 `_annotated_analysis.json`；任一影片失敗時，
+腳本會繼續處理其他影片，最後以非零狀態結束並列出失敗數量。
+
 請勿沿用舊版本的 `--batch`、`--disable-action`、`--disable-plate`、`--no-engine`、`--trash-conf` 參數；目前 CLI 不接受這些選項。
 
 ### Flask + React 人工複核介面
@@ -196,6 +222,10 @@ MP4 片段，並附一份列出違規、關聯車輛、車牌與審核資料的 
 | `SMART_BACKTRACK_STUDY_STAGE` | `full` | Research ablation stage；production 預設不變 |
 | `SMART_BACKTRACK_DT_DISTANCE_WEIGHT` | `1.0` | D+T stage 的 gate-normalized distance weight |
 | `SMART_BACKTRACK_DT_TIME_WEIGHT` | `1.0` | D+T stage 的 gate-normalized time weight |
+| `SMART_BACKTRACK_TWO_POINT_MAX_BACK_SEC` | `0.4` | 兩點 litter 軌跡最多反推秒數 |
+| `SMART_BACKTRACK_TWO_POINT_PRIOR_COST` | `1.0` | 兩點常速 release hypothesis 基礎 prior cost |
+| `SMART_BACKTRACK_MAX_FORWARD_RELEASE_SEC` | `0.5` | ballistic release window 可晚於 detector birth 的上限；仍受已觀測 airborne 軌跡限制 |
+| `LITTER_DEBUG` | `0` | 設為 `1` 時輸出逐幀診斷，並在 annotated video 顯示 person/vehicle/scooter track ID |
 | `OUTPUT_ROOT` | `.` | Output directory；建議明確設為 `output` |
 
 完整預設值以 `scripts/pipeline/config.py` 與各環境變數使用點為準。
@@ -215,6 +245,19 @@ conda run -n rtdetr python scripts/backtrack_study.py replay \
   --config artifacts/distance_time.json --split validation \
   --output artifacts/distance_time_validation.jsonl
 ```
+
+固定案例 manifest 可用 shard runner 重跑；每個 worker 寫獨立 TSV，且明確
+啟用 compact research sidecar：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 WORKER_INDEX=0 WORKER_COUNT=2 \
+  MANIFEST=artifacts/backtrack_study/multi_actor_v1.json \
+  OUTPUT_ROOT=output/backtrack_multi_actor_v1 \
+  scripts/run_backtrack_fixed_cases.sh
+```
+
+`exit_code=0` 只代表 pipeline 完成。無人工 reviewed route 的案例只能比較
+candidate coverage、route 變化與 margin，不可宣稱 attribution accuracy。
 
 `stage` 可為 `distance_time`、`kalman_rts`、`confidence`、`uncertainty`、
 `reverse` 或 `full`。其中 distance/time 以 birth anchor 與原始 actor
@@ -238,6 +281,20 @@ frame，不會因預測點剛好落在 release frame 就被改寫為零。
 建立人工盲標 queue 時使用 `scripts/backtrack_annotations.py init`；輸出的
 annotation schema 不複製 selected route、cost、rank 或 release prediction。
 
+### Smart Backtrack 版本比較簡報
+
+簡報由 live backtrack contract 產生，文字、方塊與數學式均為可編輯物件；可重建
+16 頁 ODP 與 PPTX：
+
+```bash
+python3 scripts/create_backtrack_slides.py
+```
+
+輸出至 `artifacts/presentations/smart_backtrack_version_comparison_20260819.pptx`
+與同名 `.odp`。內容比較 D+T 舊版與 release-synchronized 新版，並涵蓋
+Kalman/RTS、confidence/covariance、C_BA/C_AC/C_BC、route cost、Min-Cost Flow、
+NULL、margin 與 replay evidence。
+
 ## 輸出
 
 假設輸入為 `resize.mp4`，且 `OUTPUT_ROOT=output`：
@@ -257,6 +314,8 @@ Schema version `2.0.0` 只保留 `video`、`summary`、`events` 三區，供
 
 `SMART_BACKTRACK_SIDECAR=0` 為預設。研究時明確設為 `1` 才會額外輸出
 `*_backtrack_candidates.jsonl`；該 sidecar 不供網頁使用，也不是 ground truth。
+Replay 用的 `resolver_input` 不保存 OCR 專用 `plate_actor_frames`／`plate_roi` 像素；
+Smart resolver 不讀取這些影像資料，人物／車輛幾何、ID、confidence 與垃圾軌跡仍完整保留。
 
 ## 測試
 

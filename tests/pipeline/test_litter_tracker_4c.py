@@ -705,6 +705,19 @@ class TestLitterCandidateFilter:
         drop, reason = litter_candidate_is_vehicle_fp(litter, [], prev_litter_history=hist)
         assert not drop, f"vertical throw must be kept (got reason={reason})"
 
+    def test_keeps_descent_after_internal_apex_even_above_birth_height(self):
+        """Rise-then-fall arc must not be mistaken for a horizontal streak."""
+        from smallFunction import litter_candidate_is_vehicle_fp
+        litter = _lbox(445, 245, half=5)
+        hist = [(500, 300), (475, 230), (460, 235)]
+
+        drop, reason = litter_candidate_is_vehicle_fp(
+            litter, [], prev_litter_history=hist
+        )
+
+        assert not drop, f"ballistic descent must survive streak gate ({reason=})"
+
+
     def test_drops_comoving_with_vehicle(self):
         """Candidate near a moving vehicle, moving at the vehicle's velocity → drop."""
         from smallFunction import litter_candidate_is_vehicle_fp
@@ -733,6 +746,105 @@ class TestLitterCandidateFilter:
         thrower_key, _ = tracker._find_thrower_for_litter(
             _lbox(1945.5, 156.0, half=5), [vehicle], history=history)
         assert thrower_key == ('vehicle', 2)
+
+
+class TestReleaseTimeActorCausality:
+
+    def test_late_passerby_cannot_confirm_actorless_birth(self):
+        from litterTracker import GlobalLitterTracker
+        tracker = GlobalLitterTracker(fps=10)
+        try:
+            tracker.update([_lbox(500, 300)], [], frame_index=0)
+            tracker.update([_lbox(510, 315)], [], frame_index=1)
+            passerby = _vehicle_actor(
+                track_id=7, x1=300, y1=250, x2=500, y2=420
+            )
+            active, _ = tracker.update(
+                [_lbox(520, 335)], [passerby], frame_index=2
+            )
+            assert all(
+                item['state'] != 'confirmed' for item in active.values()
+            )
+        finally:
+            tracker.close()
+
+    def test_arc_with_consistent_release_actor_confirms(self):
+        from litterTracker import GlobalLitterTracker
+        tracker = GlobalLitterTracker(fps=10)
+        actor = _person_actor(
+            track_id=2, x1=390, y1=220, x2=430, y2=340
+        )
+        try:
+            points = [
+                (440, 300), (430, 250), (420, 220),
+                (410, 235), (400, 270), (390, 305),
+            ]
+            confirmed = False
+            for frame_index, (cx, cy) in enumerate(points):
+                active, _ = tracker.update(
+                    [_lbox(cx, cy)], [actor], frame_index=frame_index
+                )
+                confirmed = confirmed or any(
+                    item['state'] == 'confirmed' for item in active.values()
+                )
+            assert confirmed
+        finally:
+            tracker.close()
+
+    def test_vehicle_to_person_handoff_keeps_release_causality(self):
+        from litterTracker import GlobalLitterTracker
+        tracker = GlobalLitterTracker(fps=10)
+        vehicle = _vehicle_actor(
+            track_id=1, x1=390, y1=220, x2=490, y2=340
+        )
+        person = _person_actor(
+            track_id=2, x1=360, y1=180, x2=420, y2=360
+        )
+        try:
+            tracker.update([_lbox(440, 300)], [vehicle], frame_index=0)
+            tracker.update([_lbox(430, 250)], [vehicle], frame_index=1)
+            points = [(420, 220), (410, 235), (400, 270), (390, 305)]
+            confirmed = False
+            for offset, (cx, cy) in enumerate(points, start=2):
+                active, _ = tracker.update(
+                    [_lbox(cx, cy)], [person], frame_index=offset
+                )
+                confirmed = confirmed or any(
+                    item['state'] == 'confirmed' for item in active.values()
+                )
+            assert confirmed
+        finally:
+            tracker.close()
+
+    def test_actorless_birth_allows_downward_dominant_two_point_fast_drop(self):
+        from litterTracker import GlobalLitterTracker
+        tracker = GlobalLitterTracker(fps=10)
+        vehicle = _vehicle_actor(
+            track_id=5, x1=300, y1=250, x2=500, y2=420
+        )
+        try:
+            tracker.update([_lbox(520, 300)], [], frame_index=0)
+            active, _ = tracker.update(
+                [_lbox(550, 350)], [vehicle], frame_index=1
+            )
+            assert any(item['state'] == 'confirmed' for item in active.values())
+        finally:
+            tracker.close()
+
+    def test_actorless_birth_rejects_horizontal_dominant_fast_drop(self):
+        from litterTracker import GlobalLitterTracker
+        tracker = GlobalLitterTracker(fps=10)
+        vehicle = _vehicle_actor(
+            track_id=5, x1=300, y1=250, x2=500, y2=420
+        )
+        try:
+            tracker.update([_lbox(520, 300)], [], frame_index=0)
+            active, _ = tracker.update(
+                [_lbox(605, 360)], [vehicle], frame_index=1
+            )
+            assert all(item['state'] != 'confirmed' for item in active.values())
+        finally:
+            tracker.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from pipeline.backtrack.annotations import load_records
-from pipeline.backtrack.sidecar import write_jsonl
+from pipeline.backtrack.sidecar import SCHEMA_NAME, write_jsonl
 from pipeline.backtrack.study import (
     build_manifest, evaluate_trial, load_config, replay_candidates,
 )
@@ -13,6 +13,13 @@ from pipeline.backtrack.study import (
 
 def _json(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _candidate_records(path):
+    return [
+        record for record in load_records(path)
+        if record.get("schema") == SCHEMA_NAME
+    ]
 
 
 def main():
@@ -37,19 +44,19 @@ def main():
     args = parser.parse_args()
 
     if args.command == "manifest":
-        result = build_manifest(load_records(args.candidates), seed=args.seed)
+        result = build_manifest(_candidate_records(args.candidates), seed=args.seed)
         Path(args.output).write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return
     if args.command == "replay":
         records, summary = replay_candidates(
-            load_records(args.candidates), load_config(args.config),
+            _candidate_records(args.candidates), load_config(args.config),
             manifest=_json(args.manifest), split=args.split,
         )
         write_jsonl(records, args.output)
         print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
         return
     report = evaluate_trial(
-        load_records(args.candidates), load_records(args.annotations),
+        _candidate_records(args.candidates), load_records(args.annotations),
         manifest=_json(args.manifest), split=args.split,
     )
     Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

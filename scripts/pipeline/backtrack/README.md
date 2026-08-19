@@ -35,15 +35,26 @@ Semantics:
 - `C_BA` uses a predicted person upper-body release zone plus an
   uncertainty-independent physical-distance gate. Larger covariance can only
   weaken a match; it cannot make a distant person valid.
-- `C_AC` uses only person/vehicle endpoint, overlap, time, quality and
-  uncertainty evidence. It requires sustained support or a strong
-  enter/exit endpoint, and does not reuse the litter anchor.
+- `C_AC` uses person/vehicle endpoint, time, quality and uncertainty evidence.
+  Bbox overlap is still recorded for ablation but has zero production weight:
+  a wrong-depth vehicle bbox can cover the person. It requires sustained
+  support or a strong enter/exit endpoint, and does not reuse the litter anchor.
 - `C_BC` is a hard gate only for direct-vehicle routes. On person routes it is
   optional support at the same release frame as `C_BA`, so a person may leave
   a vehicle, walk away, then throw.
 - Person pruning ranks completed `B->A->C` routes, not `C_BA` alone.
-- A 1-2 point litter history receives a dustbin-level prior instead of
-  pretending that a precise ballistic fit exists.
+- A one-point litter history receives a dustbin-level prior. Two distinct
+  observations use a constant-velocity reverse hypothesis for at most 0.4 s,
+  with anisotropic covariance growth and an explicit short-track prior;
+  three or more points use the ballistic model.
+- Litter confirmation requires an actor already supported at the release/birth
+  observation; a later passer-by cannot retroactively confirm detector noise.
+- Rise-then-fall tracks use descent from their internal apex, so a real arc may
+  return near its release height without being rejected as a horizontal streak.
+- Full-stage `C_BC` sidecars also expose `reverse_direction`, `exit_deficit`
+  and `relative_motion_deficit`. Their production weights are zero: the reviewed
+  seven-case ablation showed inconsistent directions under two-point occlusion,
+  so they remain diagnostics rather than unvalidated rewards.
 - Person and vehicle capacities are unbounded: one person may explain several
   litter events and one vehicle may link to several people/events.
 - Every event has a NULL route. Invalid or highly uncertain candidates are not
@@ -63,6 +74,9 @@ SMART_BACKTRACK_DIRECT_VEHICLE_COST=0.9
 SMART_BACKTRACK_AC_WEIGHT=0.75
 SMART_BACKTRACK_BC_SUPPORT_BONUS=0.25
 SMART_BACKTRACK_SIGMA_FLOOR=2.0
+SMART_BACKTRACK_TWO_POINT_MAX_BACK_SEC=0.4
+SMART_BACKTRACK_TWO_POINT_PRIOR_COST=1.0
+SMART_BACKTRACK_MAX_FORWARD_RELEASE_SEC=0.5
 SMART_BACKTRACK_SIDECAR=0
 SMART_BACKTRACK_STUDY_STAGE=full  # full | distance_time | kalman_rts | confidence | uncertainty | reverse
 SMART_BACKTRACK_DT_DISTANCE_WEIGHT=1.0
@@ -115,6 +129,10 @@ missing actor evidence as a zero synchronization gap.
 New candidate rows contain `resolver_input`, the JSON-safe immutable worker
 task required for replay. Rows without it are diagnostic-only and are rejected
 by the replay CLI rather than silently re-running a different pipeline.
+`resolver_input` intentionally excludes legacy `plate_actor_frames` and every
+`plate_roi` image buffer: Smart resolver never reads those OCR-only pixels, and
+expanding NumPy crops into JSON would make sidecars several GB. Actor geometry,
+track IDs, confidence, observation flags and litter history remain replayable.
 
 ## Candidate/component sidecar
 
@@ -141,11 +159,13 @@ Schema `smart-backtrack-candidates/v1` contains:
   `feature_details` showing all three together;
 - routes before top-K pruning, pruning reason, final ranked routes and exactly
   one full NULL route;
-- selected assignment, scaled Min-Cost Flow cost and margin.
+- selected assignment, microscale Min-Cost Flow cost, route margin, distinct
+  person/vehicle margins and NULL-vs-non-NULL margin.
 
 JSON is strict: non-finite values become JSON `null`, never `NaN` or
-`Infinity`. Cost scaling uses the same half-away-from-zero rule as the flow
-solver.
+`Infinity`. Cost scaling uses `1e6` microscale precision and the same
+half-away-from-zero rule as the flow solver; this prevents sub-0.001 actor
+differences from becoming route-ID ties.
 
 To create sidecars without writing annotated videos:
 
@@ -237,6 +257,10 @@ conda run -n rtdetr python tools/backtrack_annotations.py evaluate \
   --annotations artifacts/backtrack_annotations.jsonl \
   -o artifacts/backtrack_metrics.json
 ```
+
+When `--candidates` points to a pipeline output directory, the evaluator reads
+only `smart-backtrack-candidates/v1` records and ignores adjacent frontend
+analysis JSON files.
 
 The report separates candidate coverage from ranking quality and includes
 Exact Route Top-1, Recall@1/3/5, person/vehicle/route coverage, release interval

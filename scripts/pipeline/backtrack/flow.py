@@ -14,7 +14,10 @@ import math
 from typing import Any, Dict, Hashable, List, Mapping, Optional, Sequence, Tuple
 
 
-COST_SCALE = 1000
+# Milliscale quantization erased real sub-0.001 differences between actors and
+# let deterministic route-id ordering decide the winner.  Microscale keeps the
+# integer-flow objective while preserving those measured cost differences.
+COST_SCALE = 1_000_000
 SYNTHETIC_NULL_ROUTE_ID = "__null__"
 
 
@@ -191,7 +194,7 @@ def solve_event_routes(
     Non-finite candidate costs are rejected.  A finite synthetic NULL route is
     added whenever an event has no valid explicit NULL candidate.
 
-    Costs are optimized as integers at ``COST_SCALE=1000``.  Consequently,
+    Costs are optimized as integers at ``COST_SCALE=1_000_000``. Consequently,
     ``margin_to_second`` is also reported in the quantized objective units
     converted back to float.  A zero margin means an objective tie.
     """

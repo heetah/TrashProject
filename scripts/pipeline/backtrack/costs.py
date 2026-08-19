@@ -28,9 +28,15 @@ class BacktrackCostConfig:
         "direct_distance": 1.0, "spatial_mahalanobis": .2,
         "uncertainty": .2, "time": .35, "quality": .4,
         "release_prior": 1.0,
+        # Research diagnostics. Zero keeps production ranking unchanged until
+        # reviewed ablation demonstrates a stable direction across cases.
+        "reverse_direction": 0.0, "exit_deficit": 0.0,
+        "relative_motion_deficit": 0.0,
     })
     ac_weights: Mapping[str, float] = field(default_factory=lambda: {
-        "endpoint_proximity": 1.0, "overlap": .8, "time": .2,
+        # Wrong-depth vehicle boxes often cover a nearby person. Footpoint
+        # distance is primary; overlap remains recorded but has zero weight.
+        "endpoint_proximity": 1.0, "overlap": 0.0, "time": .2,
         "quality": .3, "uncertainty": .15, "continuity": .25,
     })
     # Production/full keeps the historical feature values. Research D+T
@@ -513,6 +519,8 @@ def compute_c_bc(
     max_uncertainty_height_ratio: float = 1.5,
     normalized_distance_gate: float = 0.8,
     cost_config: Optional[BacktrackCostConfig] = None,
+    litter_last_point: Optional[Sequence[float]] = None,
+    litter_last_frame: Optional[int] = None,
 ) -> CostCell:
     """Direct litter-vehicle route with a hard physical release gate."""
 
@@ -601,6 +609,53 @@ def compute_c_bc(
             "quality": quality,
             "release_prior": float(release.prior_cost),
         }
+        if litter_last_point is not None and litter_last_frame is not None:
+            try:
+                last_point = np.asarray(litter_last_point, dtype=float).reshape(2)
+                later_vehicle = min(
+                    vehicles,
+                    key=lambda item: (
+                        abs(item.frame_index - int(litter_last_frame)),
+                        item.frame_index,
+                    ),
+                )
+                outward = release.mean_uv - vehicle.center
+                velocity_norm = float(np.linalg.norm(release.velocity_uv))
+                outward_norm = float(np.linalg.norm(outward))
+                outward_cosine = float(
+                    release.velocity_uv @ outward
+                    / max(velocity_norm * outward_norm, 1e-6)
+                )
+                scale = max(np.hypot(vehicle.width, vehicle.height), 1.0)
+                release_box_distance = float(np.linalg.norm(
+                    _point_to_rect_vector(release.mean_uv, vehicle.bbox)
+                ))
+                later_box_distance = float(np.linalg.norm(
+                    _point_to_rect_vector(last_point, later_vehicle.bbox)
+                ))
+                exit_gain = (
+                    later_box_distance - release_box_distance
+                ) / scale
+                release_center_distance = float(
+                    np.linalg.norm(release.mean_uv - vehicle.center)
+                )
+                later_center_distance = float(
+                    np.linalg.norm(last_point - later_vehicle.center)
+                )
+                relative_gain = (
+                    later_center_distance - release_center_distance
+                ) / scale
+                raw_features.update({
+                    "reverse_direction": (1.0 - np.clip(
+                        outward_cosine, -1.0, 1.0
+                    )) * 0.5,
+                    "exit_deficit": max(0.25 - exit_gain, 0.0),
+                    "relative_motion_deficit": max(
+                        0.25 - relative_gain, 0.0
+                    ),
+                })
+            except (TypeError, ValueError):
+                pass
         weights = dict(resolved_cost_config.bc_weights) or {
             "direct_distance": 1.0,
             "spatial_mahalanobis": 0.2,

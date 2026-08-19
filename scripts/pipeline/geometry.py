@@ -50,6 +50,7 @@ def estimate_global_shift(prev_frame, curr_frame, downscale=SHAKE_DOWNSCALE):
 # 隨車部件（車燈/後照鏡/車身）與純水平條紋（橫越畫面的車/機車被拉成條）不該進 tracker。
 LITTER_FP_CONTAINMENT_THR = 0.85       # 候選與某車輛 bbox 重疊達此值 → 隨車部件
 LITTER_FP_STREAK_RATIO = 5.0           # horizontal 位移 > 此倍率 × downward → 純水平條紋（非重力下墜）
+LITTER_FP_ARC_MIN_DESCENT = 7.0        # 最高點後至少下降此像素，才視為重力下降證據
 LITTER_FP_NEAREST_VEHICLE_DIST = 40.0  # 候選距車輛 bbox 此值內才做共動判斷（像素）
 LITTER_FP_COMOTION_MIN_VEH_STEP = 4.0  # 該步車輛位移 ≥ 此值才足以判斷共動（px/frame）
 LITTER_FP_COMOTION_MAX_REL = 4.0       # 該步 litter 相對車輛位移 ≤ 此值視為隨車（px/frame）
@@ -861,7 +862,27 @@ def litter_candidate_is_vehicle_fp(litter_box, actors, vehicle_history=None,
         x0, y0 = float(hist[0][0]), float(hist[0][1])
         down = lcy - y0
         horiz = abs(lcx - x0)
-        if horiz > LITTER_FP_STREAK_RATIO * max(down, 1e-6):
+        # An airborne throw may first rise (smaller image y) and then descend.
+        # A clear descent from the observed apex is independent evidence of
+        # gravity-driven motion even before it falls below release height.
+        arc_points = [
+            (float(point[0]), float(point[1])) for point in hist
+        ] + [(lcx, lcy)]
+        apex_index = min(
+            range(len(arc_points)), key=lambda index: arc_points[index][1]
+        )
+        apex_x, apex_y = arc_points[apex_index]
+        descent_from_apex = lcy - apex_y
+        descent_horiz = abs(lcx - apex_x)
+        has_gravity_descent = (
+            apex_index < len(arc_points) - 1 and
+            descent_from_apex >= LITTER_FP_ARC_MIN_DESCENT and
+            descent_horiz <= LITTER_FP_STREAK_RATIO * descent_from_apex
+        )
+        if (
+            horiz > LITTER_FP_STREAK_RATIO * max(down, 1e-6)
+            and not has_gravity_descent
+        ):
             # 真正從車窗/車斗邊緣拋出的輕物，一開始可能幾乎水平飛行。
             # 只有軌跡剛出生、起點在車框內且本幀已明顯離開同一車框時，
             # 才不在此前處理 gate 丟棄；後續仍需通過 holding、vehicle-relative
@@ -944,7 +965,7 @@ def validate_trajectory(centroid_history):
 
     # 拋物線（先升後降）識別：上升段 downward_ratio 必然偏低，但落下段應清楚向下。
     # 條件：終點低於起點（is_falling）、有明顯高點（peak 不在兩端）、落下段夠長且向下。
-    if not is_valid and is_falling and len(pts) >= 4:
+    if not is_valid and len(pts) >= 4:
         ys = pts[:, 1]
         peak_idx = int(np.argmin(ys))  # 最高點（Y 最小）
         if 1 <= peak_idx < len(pts) - 1:
@@ -952,8 +973,15 @@ def validate_trajectory(centroid_history):
             descent_steps = np.diff(descent)
             descent_ratio = np.count_nonzero(descent_steps >= -2.0) / max(len(descent_steps), 1)
             descent_disp = float(ys[-1] - ys[peak_idx])
-            # 落下段向下明確、下降幅度夠大、整體軌跡不雜亂
-            if descent_ratio >= 0.8 and descent_disp >= 10.0 and straightness > 0.65:
+            # Release and landing may have similar image y.  Require at least
+            # two descent steps after an internal apex instead of requiring the
+            # final point to lie below the birth point.
+            if (
+                len(descent_steps) >= 2 and
+                descent_ratio >= 0.8 and
+                descent_disp >= 10.0 and
+                straightness > 0.50
+            ):
                 is_valid = True
 
     return is_valid, straightness

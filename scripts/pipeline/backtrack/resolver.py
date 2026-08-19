@@ -18,7 +18,7 @@ from .costs import (
     compute_c_bc,
     topk_valid,
 )
-from .flow import Assignment, RouteCandidate, solve_event_routes
+from .flow import COST_SCALE, Assignment, RouteCandidate, solve_event_routes
 from .kalman import KalmanConfig, TrackMeasurement, smooth_tracklet
 from .trajectory import (
     ReleaseHypothesis,
@@ -55,6 +55,9 @@ class SmartBacktrackConfig:
     ac_weight: float = 0.75
     bc_support_bonus: float = 0.25
     sigma_floor_px: float = 2.0
+    two_point_max_back_seconds: float = 0.4
+    two_point_prior_cost: float = 1.0
+    max_forward_release_seconds: float = 0.5
     cost_config: BacktrackCostConfig = field(default_factory=BacktrackCostConfig)
     # Research switches default to the current production behavior.  They are
     # intentionally constructor-only; production never reads them from env.
@@ -109,6 +112,18 @@ class SmartBacktrackConfig:
             sigma_floor_px=max(
                 0.25, _float_env("SMART_BACKTRACK_SIGMA_FLOOR", 2.0)
             ),
+            two_point_max_back_seconds=max(
+                0.0,
+                _float_env("SMART_BACKTRACK_TWO_POINT_MAX_BACK_SEC", 0.4),
+            ),
+            two_point_prior_cost=max(
+                0.0,
+                _float_env("SMART_BACKTRACK_TWO_POINT_PRIOR_COST", 1.0),
+            ),
+            max_forward_release_seconds=max(
+                0.0,
+                _float_env("SMART_BACKTRACK_MAX_FORWARD_RELEASE_SEC", 0.5),
+            ),
             cost_config=BacktrackCostConfig.for_stage(
                 study_stage,
                 distance_weight=distance_weight,
@@ -134,6 +149,7 @@ class SmartResolution:
     direct_vehicle: bool
     total_cost: float
     margin_to_second: Optional[float]
+    actor_margins: Mapping[str, object]
     route_type: str
     route_id: str
     release_frame: Optional[int]
@@ -145,6 +161,90 @@ class SmartResolution:
     @property
     def actor_key(self):
         return self.person_key if self.person_key is not None else self.vehicle_key
+
+
+def _actor_specific_margins(routes: Sequence[RouteCandidate]):
+    """Separate route ambiguity from person/vehicle identity ambiguity.
+
+    Multiple releases or route types can describe the same actor.  Those are
+    first collapsed to the actor's cheapest complete route; only then is the
+    runner-up *distinct actor* compared.  This prevents same-actor route ties
+    from being mistaken for an identity tie.
+    """
+
+    def _margin_for(field_name):
+        best_by_actor = {}
+        for route in routes:
+            if route.is_null or not math.isfinite(float(route.cost)):
+                continue
+            actor_key = getattr(route, field_name)
+            if actor_key is None:
+                continue
+            old = best_by_actor.get(actor_key)
+            candidate = (float(route.cost), str(route.route_id))
+            if old is None or candidate < old:
+                best_by_actor[actor_key] = candidate
+        ranked = sorted(
+            (
+                (cost_and_route[0], repr(actor_key), actor_key, cost_and_route[1])
+                for actor_key, cost_and_route in best_by_actor.items()
+            ),
+            key=lambda item: (item[0], item[1], item[3]),
+        )
+        if not ranked:
+            return {
+                "best_key": None,
+                "best_cost": None,
+                "second_key": None,
+                "second_cost": None,
+                "margin": None,
+                "tie_count": 0,
+            }
+        best_cost, _, best_key, _ = ranked[0]
+        second = ranked[1] if len(ranked) >= 2 else None
+        # Flow costs are quantized to 0.001.  Count identities within the same
+        # quantized objective cell as tied, while preserving the raw margin.
+        tie_count = sum(
+            1 for cost, *_rest in ranked
+            if int(math.floor(cost * COST_SCALE + 0.5))
+            == int(math.floor(best_cost * COST_SCALE + 0.5))
+        )
+        return {
+            "best_key": best_key,
+            "best_cost": best_cost,
+            "second_key": second[2] if second is not None else None,
+            "second_cost": second[0] if second is not None else None,
+            "margin": (
+                max(0.0, float(second[0] - best_cost))
+                if second is not None else None
+            ),
+            "tie_count": int(tie_count),
+        }
+
+    finite_null = [
+        float(route.cost) for route in routes
+        if route.is_null and math.isfinite(float(route.cost))
+    ]
+    finite_non_null = [
+        float(route.cost) for route in routes
+        if not route.is_null and math.isfinite(float(route.cost))
+    ]
+    null_cost = min(finite_null) if finite_null else None
+    best_non_null = min(finite_non_null) if finite_non_null else None
+    return {
+        "person": _margin_for("person_key"),
+        "vehicle": _margin_for("vehicle_key"),
+        "null": {
+            "null_cost": null_cost,
+            "best_non_null_cost": best_non_null,
+            # Positive: non-NULL is cheaper. Negative: NULL is safer.
+            "margin": (
+                float(null_cost - best_non_null)
+                if null_cost is not None and best_non_null is not None
+                else None
+            ),
+        },
+    }
 
 
 def _cell_payload(cell: Optional[CostCell]):
@@ -319,6 +419,9 @@ class SmartBacktrackResolver:
                 else [1.0] * len(points)
             ),
             fallback_prior_cost=self.config.dustbin_cost,
+            two_point_max_back_seconds=self.config.two_point_max_back_seconds,
+            two_point_prior_cost=self.config.two_point_prior_cost,
+            max_forward_release_seconds=self.config.max_forward_release_seconds,
         )
 
     def _build_actor_tracks(self, task):
@@ -537,6 +640,15 @@ class SmartBacktrackResolver:
             key: values for key, values in actor_tracks.items()
             if key[0] in ("vehicle", "scooter")
         }
+        litter_points = list(task.get("history") or [])
+        litter_frames = list(task.get("history_frames") or [])
+        litter_count = min(len(litter_points), len(litter_frames))
+        bc_context = {}
+        if litter_count:
+            bc_context = {
+                "litter_last_point": litter_points[litter_count - 1],
+                "litter_last_frame": litter_frames[litter_count - 1],
+            }
         max_uncertainty_ratio = (
             1.5 if self.config.use_uncertainty_gates else float("inf")
         )
@@ -549,6 +661,7 @@ class SmartBacktrackResolver:
             releases, vehicle_tracks, fps,
             cost_config=self.config.cost_config,
             max_uncertainty_height_ratio=max_uncertainty_ratio,
+            **bc_context,
         )
         ac_costs = build_ac_costs(
             person_tracks, vehicle_tracks, fps,
@@ -574,6 +687,7 @@ class SmartBacktrackResolver:
                 [release], observations, fps,
                 cost_config=self.config.cost_config,
                 max_uncertainty_height_ratio=max_uncertainty_ratio,
+                **bc_context,
             )
             for vehicle_key, observations in vehicle_tracks.items()
             for release in releases
@@ -930,6 +1044,7 @@ class SmartBacktrackResolver:
             direct_vehicle=bool(route.is_direct_vehicle),
             total_cost=float(assignment.total_cost),
             margin_to_second=assignment.margin_to_second,
+            actor_margins=_actor_specific_margins(routes),
             route_type=str(route.route_type),
             route_id=str(route.route_id),
             release_frame=metadata.get("release_frame"),

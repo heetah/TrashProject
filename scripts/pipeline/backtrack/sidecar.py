@@ -16,8 +16,9 @@ from typing import Any, Iterable, List, Optional
 
 
 SCHEMA_NAME = "smart-backtrack-candidates/v1"
-COST_SCALE = 1000
+COST_SCALE = 1_000_000
 _ACTOR_CLASSES = frozenset(("person", "vehicle", "scooter"))
+_RESOLVER_INPUT_EXCLUDED_FIELDS = frozenset(("plate_actor_frames", "plate_roi"))
 
 
 def _json_safe(value: Any) -> Any:
@@ -75,6 +76,36 @@ def _json_key(value: Any) -> str:
     if isinstance(value, (tuple, list)):
         return "|".join(str(item) for item in value)
     return str(value)
+
+
+def _strip_runtime_media(value: Any) -> Any:
+    """Copy replay data while dropping runtime-only image payloads.
+
+    ``plate_actor_frames`` exists only for legacy plate ROI recovery and is
+    never read by ``SmartBacktrackResolver``.  Serializing its ``plate_roi``
+    ndarrays expands every crop into nested JSON pixel arrays, making a small
+    resolver sidecar grow to gigabytes.  Keep geometry/IDs/confidence intact,
+    but exclude image data from the research contract.
+    """
+
+    if isinstance(value, Mapping):
+        return {
+            key: _strip_runtime_media(item_value)
+            for key, item_value in value.items()
+            if str(key) not in _RESOLVER_INPUT_EXCLUDED_FIELDS
+        }
+    if isinstance(value, list):
+        return [_strip_runtime_media(item_value) for item_value in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_runtime_media(item_value) for item_value in value)
+    return value
+
+
+def _resolver_input(task: Mapping) -> dict:
+    """Return immutable Smart-resolver input without OCR image buffers."""
+
+    stripped = _strip_runtime_media(task)
+    return _json_safe(stripped) if isinstance(stripped, Mapping) else {}
 
 
 def _finite_float(value: Any) -> Optional[float]:
@@ -278,7 +309,7 @@ def _candidate_actor_tracklets(task: Mapping) -> List[dict]:
                 )
             )
             group_key = (class_name, track_id, tracklet_uid)
-            observation = dict(actor)
+            observation = _strip_runtime_media(dict(actor))
             observation["frame_index"] = frame_index
             grouped.setdefault(group_key, []).append(_json_safe(observation))
 
@@ -334,6 +365,9 @@ def _build_assignment(event: Mapping, serialized_routes: List[dict]) -> dict:
         if selected is not None
         else _scaled_cost(backtrack.get("score"))
     )
+    actor_margins = backtrack.get("actor_margins")
+    if not isinstance(actor_margins, Mapping):
+        actor_margins = _serialized_actor_margins(serialized_routes)
     return {
         "status": _json_safe(
             event.get("backtrack_status", backtrack.get("status"))
@@ -353,8 +387,74 @@ def _build_assignment(event: Mapping, serialized_routes: List[dict]) -> dict:
         "margin_to_second": _json_safe(
             backtrack.get("margin_to_second")
         ),
+        "actor_margins": _json_safe(actor_margins),
         "release_frame": _json_safe(backtrack.get("release_frame")),
         "release_point": _json_safe(backtrack.get("release_point")),
+    }
+
+
+def _serialized_actor_margins(serialized_routes: List[dict]) -> dict:
+    """Recover identity margins for old runtime events from their route table."""
+
+    def grouped_margin(key_name):
+        groups = {}
+        for route in serialized_routes:
+            key = route.get(key_name)
+            cost = _finite_float(route.get("cost"))
+            if key is None or cost is None or route.get("route_type") == "null":
+                continue
+            token = json.dumps(_json_safe(key), ensure_ascii=False, sort_keys=True)
+            old = groups.get(token)
+            if old is None or cost < old[0]:
+                groups[token] = (cost, _json_safe(key))
+        ranked = sorted(groups.values(), key=lambda item: (item[0], repr(item[1])))
+        if not ranked:
+            return {
+                "best_key": None, "best_cost": None,
+                "second_key": None, "second_cost": None,
+                "margin": None, "tie_count": 0,
+            }
+        best = ranked[0]
+        second = ranked[1] if len(ranked) >= 2 else None
+        best_scaled = _scaled_cost(best[0])
+        return {
+            "best_key": best[1],
+            "best_cost": best[0],
+            "second_key": second[1] if second is not None else None,
+            "second_cost": second[0] if second is not None else None,
+            "margin": (
+                max(0.0, second[0] - best[0])
+                if second is not None else None
+            ),
+            "tie_count": sum(
+                _scaled_cost(cost) == best_scaled for cost, _key in ranked
+            ),
+        }
+
+    null_costs = [
+        _finite_float(route.get("cost")) for route in serialized_routes
+        if route.get("route_type") == "null"
+    ]
+    non_null_costs = [
+        _finite_float(route.get("cost")) for route in serialized_routes
+        if route.get("route_type") != "null"
+    ]
+    null_costs = [cost for cost in null_costs if cost is not None]
+    non_null_costs = [cost for cost in non_null_costs if cost is not None]
+    null_cost = min(null_costs) if null_costs else None
+    best_non_null = min(non_null_costs) if non_null_costs else None
+    return {
+        "person": grouped_margin("person_key"),
+        "vehicle": grouped_margin("vehicle_key"),
+        "null": {
+            "null_cost": null_cost,
+            "best_non_null_cost": best_non_null,
+            "margin": (
+                null_cost - best_non_null
+                if null_cost is not None and best_non_null is not None
+                else None
+            ),
+        },
     }
 
 
@@ -435,7 +535,7 @@ def build_candidate_record(
         # without loading a model or relying on a mutable tracker cache.  This
         # is deliberately separate from the human-facing annotation schema;
         # annotation tools never expose it as a model decision.
-        "resolver_input": _json_safe(task),
+        "resolver_input": _resolver_input(task),
     }
 
 

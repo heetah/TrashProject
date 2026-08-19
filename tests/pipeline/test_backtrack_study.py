@@ -1,6 +1,57 @@
 import pytest
 
-from pipeline.backtrack.resolver import SmartBacktrackConfig, SmartBacktrackResolver
+from pipeline.backtrack.resolver import (
+    SmartBacktrackConfig,
+    SmartBacktrackResolver,
+    _actor_specific_margins,
+)
+from pipeline.backtrack.flow import RouteCandidate
+
+
+def test_actor_specific_margin_collapses_routes_for_the_same_identity():
+    routes = [
+        RouteCandidate(
+            "vehicle-1-direct", 1.0002,
+            vehicle_key=("vehicle", 1), route_type="direct_vehicle",
+        ),
+        RouteCandidate(
+            "vehicle-1-person", 1.0004,
+            person_key=("person", 7), vehicle_key=("vehicle", 1),
+        ),
+        RouteCandidate(
+            "vehicle-2", 1.31,
+            vehicle_key=("vehicle", 2), route_type="direct_vehicle",
+        ),
+        RouteCandidate(
+            "person-8", 1.0003,
+            person_key=("person", 8), route_type="person",
+        ),
+        RouteCandidate("null", 7.0, route_type="null"),
+    ]
+
+    margins = _actor_specific_margins(routes)
+
+    assert margins["vehicle"]["best_key"] == ("vehicle", 1)
+    assert margins["vehicle"]["second_key"] == ("vehicle", 2)
+    assert margins["vehicle"]["margin"] == pytest.approx(0.3098)
+    assert margins["vehicle"]["tie_count"] == 1
+    assert margins["person"]["best_key"] == ("person", 8)
+    assert margins["person"]["second_key"] == ("person", 7)
+    assert margins["person"]["margin"] == pytest.approx(0.0001)
+    assert margins["person"]["tie_count"] == 1
+    assert margins["null"]["margin"] == pytest.approx(5.9998)
+
+
+def test_study_config_can_ablate_ac_overlap_without_changing_other_weights():
+    baseline = StudyConfig(stage="full").resolver_config(fps=10).cost_config
+    trial = StudyConfig(
+        stage="full", ac_overlap_weight=0.2
+    ).resolver_config(fps=10).cost_config
+
+    assert baseline.ac_weights["overlap"] == pytest.approx(0.0)
+    assert trial.ac_weights["overlap"] == pytest.approx(0.2)
+    assert trial.ba_weights == baseline.ba_weights
+    assert trial.bc_weights == baseline.bc_weights
 from pipeline.backtrack.costs import BacktrackCostConfig, compute_c_ba
 from pipeline.backtrack.trajectory import ReleaseHypothesis
 from pipeline.backtrack.costs import ActorObservation

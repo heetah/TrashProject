@@ -320,6 +320,82 @@ def _birth_fallback(
     )
 
 
+def _two_point_constant_velocity_hypotheses(
+    points_uv: Sequence[Sequence[float]],
+    frame_indices: Sequence[int],
+    birth_frame: int,
+    max_back_frames: int,
+    fps: float,
+    sigma_floor_px: float,
+    max_back_seconds: float,
+    prior_cost: float,
+    extrapolation_cost_per_second: float,
+) -> List[ReleaseHypothesis]:
+    """Build conservative reverse hypotheses from exactly two observations."""
+
+    points = np.asarray(points_uv, dtype=float)
+    frames = np.asarray(frame_indices, dtype=int)
+    order = np.argsort(frames, kind="stable")
+    points = points[order]
+    frames = frames[order]
+    unique_frames = np.unique(frames)
+    if (
+        points.shape != (2, 2)
+        or unique_frames.size != 2
+        or not np.isfinite(points).all()
+        or not np.isfinite(float(fps))
+        or float(fps) <= 0.0
+    ):
+        return []
+    frame_delta = int(frames[1]) - int(frames[0])
+    if frame_delta <= 0:
+        return []
+    velocity = (points[1] - points[0]) / (frame_delta / float(fps))
+    speed = float(np.linalg.norm(velocity))
+    if speed > 1e-9:
+        direction = velocity / speed
+    else:
+        direction = np.asarray([1.0, 0.0], dtype=float)
+    normal = np.asarray([-direction[1], direction[0]], dtype=float)
+
+    horizon_frames = min(
+        max(int(max_back_frames), 0),
+        max(int(round(float(max_back_seconds) * float(fps))), 0),
+    )
+    lower = int(birth_frame) - horizon_frames
+    hypotheses = []
+    for frame_index in range(lower, int(birth_frame) + 1):
+        seconds_from_first = (
+            int(frame_index) - int(frames[0])
+        ) / float(fps)
+        seconds_before_birth = max(
+            (int(birth_frame) - int(frame_index)) / float(fps), 0.0
+        )
+        mean = points[0] + velocity * seconds_from_first
+        # Two samples determine velocity but cannot estimate acceleration.
+        # Uncertainty grows anisotropically backward: most along the observed
+        # motion direction, less across it. Physical distance gates remain
+        # independent in the cost layer.
+        sigma_along = float(sigma_floor_px) + 0.35 * speed * seconds_before_birth
+        sigma_cross = float(sigma_floor_px) + 0.15 * speed * seconds_before_birth
+        covariance = (
+            sigma_along ** 2 * np.outer(direction, direction)
+            + sigma_cross ** 2 * np.outer(normal, normal)
+        )
+        hypotheses.append(ReleaseHypothesis(
+            frame_index=int(frame_index),
+            mean_uv=mean,
+            covariance_uv=covariance,
+            velocity_uv=velocity,
+            model="constant_velocity_2point",
+            prior_cost=(
+                float(prior_cost)
+                + seconds_before_birth * float(extrapolation_cost_per_second)
+            ),
+        ))
+    return hypotheses
+
+
 def build_release_hypotheses(
     points_uv: Sequence[Sequence[float]],
     frame_indices: Sequence[int],
@@ -331,12 +407,31 @@ def build_release_hypotheses(
     extrapolation_cost_per_second: float = 0.35,
     confidences: Optional[Sequence[float]] = None,
     fallback_prior_cost: float = 6.0,
+    two_point_max_back_seconds: float = 0.3,
+    two_point_prior_cost: float = 1.0,
+    max_forward_release_seconds: float = 0.5,
 ) -> List[ReleaseHypothesis]:
     """Fit a trajectory and enumerate release frames from birth backwards.
 
     A birth-only fallback is always returned when fitting is impossible, so the
     caller can route to a dustbin instead of crashing or inventing certainty.
     """
+
+    point_count = min(len(points_uv), len(frame_indices))
+    if point_count == 2:
+        hypotheses = _two_point_constant_velocity_hypotheses(
+            list(points_uv)[-2:],
+            list(frame_indices)[-2:],
+            birth_frame=birth_frame,
+            max_back_frames=max_back_frames,
+            fps=fps,
+            sigma_floor_px=sigma_floor_px,
+            max_back_seconds=two_point_max_back_seconds,
+            prior_cost=two_point_prior_cost,
+            extrapolation_cost_per_second=extrapolation_cost_per_second,
+        )
+        if hypotheses:
+            return hypotheses
 
     model = fit_ballistic_trajectory(
         points_uv,
@@ -359,9 +454,15 @@ def build_release_hypotheses(
 
     hypotheses = []
     lower = int(birth_frame) - max(int(max_back_frames), 0)
-    for frame_index in range(lower, int(birth_frame) + 1):
+    upper = min(
+        int(model.observed_frame_max),
+        int(birth_frame) + max(
+            int(round(float(max_forward_release_seconds) * float(fps))), 0
+        ),
+    )
+    for frame_index in range(lower, upper + 1):
         mean, covariance, velocity = model.predict(frame_index)
-        seconds_before_birth = (int(birth_frame) - frame_index) / float(fps)
+        seconds_from_birth = abs(int(birth_frame) - frame_index) / float(fps)
         hypotheses.append(
             ReleaseHypothesis(
                 frame_index=frame_index,
@@ -369,7 +470,7 @@ def build_release_hypotheses(
                 covariance_uv=covariance,
                 velocity_uv=velocity,
                 model="ballistic",
-                prior_cost=max(seconds_before_birth, 0.0)
+                prior_cost=seconds_from_birth
                 * float(extrapolation_cost_per_second),
             )
         )

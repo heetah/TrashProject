@@ -60,6 +60,7 @@ MIN_VEHICLE_RELATIVE_SEPARATION = 60.0  # litter 相對載體車輛的最小淨�
 # === 快速落下特例 (10fps 場景，age=2 vehicle thrower) ===
 FAST_DROP_MIN_DOWNWARD = 35.0
 FAST_DROP_MIN_HORIZ_RATIO = 0.15         # 真丟擲水平/向下 > 0.15；< 0.15 多為 detector jitter
+FAST_DROP_ACTORLESS_MAX_HORIZ_RATIO = 1.20  # 無 birth actor 時，須為向下主導，避免遠方車輛晚到認領
 FAST_DROP_MAX_FRAME_GAP = 2
 
 # === Fall-then-stable confirm（driver throw → 落地不動）===
@@ -416,6 +417,7 @@ class GlobalLitterTracker:
                 # 繼承剛出生時記錄的肇事者，並在 pending 階段依 homography 座標重新評分。
                 thrower_key = l_data.get('thrower_key')
                 thrower_center = l_data.get('thrower_center')
+                birth_thrower_key = l_data.get('birth_thrower_key')
 
                 # ===== 時空軌跡 =====
                 if state == 'pending':
@@ -504,6 +506,32 @@ class GlobalLitterTracker:
                     is_downward_enough_effective = (
                         downward_disp >= effective_min_downward
                     )
+                    ys_for_release = [float(p[1]) for p in l_data['history']]
+                    apex_index = int(np.argmin(ys_for_release)) if ys_for_release else 0
+                    fall_from_apex = (
+                        float(ys_for_release[-1] - ys_for_release[apex_index])
+                        if ys_for_release and apex_index < len(ys_for_release) - 1
+                        else 0.0
+                    )
+                    descent_steps_after_apex = max(
+                        len(ys_for_release) - apex_index - 1, 0
+                    )
+                    has_arc_descent = (
+                        apex_index > 0 and
+                        descent_steps_after_apex >= 2 and
+                        fall_from_apex >= effective_min_downward
+                    )
+                    is_downward_enough_effective = (
+                        is_downward_enough_effective or has_arc_descent
+                    )
+                    # Attribution can rank several actors later, but event
+                    # confirmation itself needs release-time causal support.
+                    # A passer-by acquired only after birth must not turn noise
+                    # into a confirmed litter event.
+                    release_actor_supported = (
+                        birth_thrower_key is not None and
+                        thrower_key is not None
+                    )
                     # 若 thrower 為車輛，且水平位移遠大於向下位移（純水平滑動），則不 confirm。
                     is_horiz_ratio_ok = True
                     if is_vehicle_thrower and downward_disp > 0:
@@ -566,7 +594,7 @@ class GlobalLitterTracker:
                         is_horiz_ratio_ok and
                         is_step_velocity_ok and
                         vehicle_relative_ok and
-                        thrower_key is not None and
+                        release_actor_supported and
                         not is_static_candidate and
                         not stationary_locked
                     )
@@ -578,7 +606,7 @@ class GlobalLitterTracker:
                         is_horiz_ratio_ok and
                         is_step_velocity_ok and
                         vehicle_relative_ok and
-                        thrower_key is not None and
+                        release_actor_supported and
                         not is_static_candidate and
                         not stationary_locked
                     )
@@ -603,7 +631,7 @@ class GlobalLitterTracker:
                         fall_stable_tail_ok and
                         is_step_velocity_ok and
                         vehicle_relative_ok and
-                        thrower_key is not None and
+                        release_actor_supported and
                         not stationary_locked
                     )
 
@@ -627,6 +655,14 @@ class GlobalLitterTracker:
                         downward_disp > 0 and
                         (horizontal_disp / downward_disp) >= 0.15
                     )
+                    actorless_fast_drop_supported = (
+                        birth_thrower_key is None and
+                        thrower_key is not None and
+                        is_vehicle_thrower and
+                        downward_disp > 0 and
+                        (horizontal_disp / downward_disp)
+                        <= FAST_DROP_ACTORLESS_MAX_HORIZ_RATIO
+                    )
                     can_confirm_vehicle_fast_drop = (
                         is_vehicle_thrower and
                         age == self.min_confirm_age and
@@ -639,7 +675,7 @@ class GlobalLitterTracker:
                         is_horiz_ratio_ok and
                         is_step_velocity_ok and
                         vehicle_relative_ok and
-                        thrower_key is not None and
+                        (release_actor_supported or actorless_fast_drop_supported) and
                         not is_static_candidate and
                         not stationary_locked
                     )
@@ -652,14 +688,16 @@ class GlobalLitterTracker:
                             f"  [TRK fi={frame_index} lid={best_id} age={age}] "
                             f"span={history_max_span:.1f} moved={moved_dist:.1f} "
                             f"down={downward_disp:.1f} horiz={horizontal_disp:.1f} "
-                            f"thrower={thrower_key} veh={is_vehicle_thrower} "
+                            f"thrower={thrower_key} birth_thrower={birth_thrower_key} "
+                            f"release_actor_ok={release_actor_supported} veh={is_vehicle_thrower} "
                             f"eff_age={effective_min_age} eff_down={effective_min_downward:.0f} "
                             f"horiz_ok={is_horiz_ratio_ok} step_ok={is_step_velocity_ok} "
                             f"body_ok={vehicle_relative_ok} carrier={carrier_key} ov={vehicle_body_overlap:.2f} rel_sep={vehicle_rel_sep} "
                             f"static={is_static_candidate} locked={stationary_locked} "
                             f"traj={is_physics_valid} "
                             f"can_traj={can_confirm_by_trajectory} can_mot={can_confirm_by_motion} "
-                            f"can_fast={can_confirm_vehicle_fast_drop} gap={fast_drop_frame_gap} rel_ok={fast_drop_release_ok} "
+                            f"can_fast={can_confirm_vehicle_fast_drop} actorless_fast={actorless_fast_drop_supported} "
+                            f"gap={fast_drop_frame_gap} rel_ok={fast_drop_release_ok} "
                             f"can_fs={can_confirm_fall_then_stable} fall={fall_disp_history:.0f}"
                         )
 
@@ -765,6 +803,7 @@ class GlobalLitterTracker:
                     'history': l_data['history'],
                     'missed': 0,
                     'thrower_key': thrower_key,
+                    'birth_thrower_key': birth_thrower_key,
                     'thrower_center': thrower_center,
                     'age': age,
                     'state': state,
@@ -810,6 +849,7 @@ class GlobalLitterTracker:
                     'history': [centroid],
                     'missed': 0,
                     'thrower_key': thrower_key,        # 紀錄嫌疑犯
+                    'birth_thrower_key': thrower_key,  # release-time causal anchor
                     'thrower_center': thrower_center,
                     'age': 1,
                     'state': 'pending',
@@ -1429,6 +1469,7 @@ class GlobalLitterTracker:
             'direct_vehicle': bool(resolution.direct_vehicle),
             'score': float(resolution.total_cost),
             'margin_to_second': resolution.margin_to_second,
+            'actor_margins': dict(resolution.actor_margins),
             'route_type': str(resolution.route_type),
             'route_id': str(resolution.route_id),
             'release_frame': resolution.release_frame,
@@ -1768,6 +1809,7 @@ class GlobalLitterTracker:
             'direct_vehicle': bool(result.get('direct_vehicle', False)),
             'score': result.get('score'),
             'margin_to_second': result.get('margin_to_second'),
+            'actor_margins': result.get('actor_margins'),
             'route_type': result.get('route_type'),
             'route_id': result.get('route_id'),
             'release_frame': result.get('release_frame'),

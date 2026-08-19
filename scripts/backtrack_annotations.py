@@ -5,9 +5,22 @@ import json
 from pathlib import Path
 
 from pipeline.backtrack.annotations import (
+    ANNOTATION_SCHEMA, CANDIDATE_SCHEMA, AnnotationError,
     evaluate_candidates, init_annotations_from_path, load_records,
     validate_records, write_records,
 )
+
+
+def _records_with_schema(path, schema):
+    records = [
+        record for record in load_records(path)
+        if record.get("schema") == schema
+    ]
+    if not records:
+        raise AnnotationError(
+            "{} contains no {} records".format(path, schema)
+        )
+    return records
 
 
 def main():
@@ -31,7 +44,10 @@ def main():
         result = validate_records(load_records(args.annotations), args.require_reviewed)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         raise SystemExit(0 if result["valid"] else 1)
-    report = evaluate_candidates(load_records(args.candidates), load_records(args.annotations))
+    report = evaluate_candidates(
+        _records_with_schema(args.candidates, CANDIDATE_SCHEMA),
+        _records_with_schema(args.annotations, ANNOTATION_SCHEMA),
+    )
     Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 

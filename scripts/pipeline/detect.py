@@ -7,6 +7,7 @@ import os
 from pipeline.plate import detect_license_plates, dispatch_license_plate_rois, get_plate_number
 from pipeline.profiling import profile_block
 from pipeline.devices import BBOX_DEVICE, BBOX_HALF, TRASH_DEVICE, TRASH_HALF
+from pipeline.litter.input4c import build_litter_model_input, compute_pixel_change_map
 from pipeline.geometry import (
     SHAKE_COOLDOWN_SEC,
     SHAKE_SHIFT_FLOOR_PX,
@@ -23,34 +24,6 @@ BLACK = (0, 0, 0)
 WARN = (0, 0, 255)
 
 
-def compute_pixel_change_map(prev_frame, curr_frame):
-    """Return a grayscale image visualising per-pixel absolute difference.
-
-    4c model design principle: the change map must preserve magnitude.
-    Static scenes → near-zero output.  Moving objects → bright pixels.
-    cv2.normalize is intentionally avoided: it collapses a near-zero noise
-    range (e.g. 0-2) to 0-255, making the 4th channel indistinguishable
-    from a scene with heavy motion.  Direct scaling retains the magnitude
-    relationship the model was trained on.
-
-    Args:
-        prev_frame: Previous frame (H, W, 3) BGR uint8
-        curr_frame: Current frame (H, W, 3) BGR uint8
-
-    Returns:
-        diff_gray: Grayscale change map (H, W) uint8
-    """
-    if prev_frame is None:
-        # First frame: return zeros for change map
-        return np.zeros(curr_frame.shape[:2], dtype=np.uint8)
-
-    diff = cv2.absdiff(prev_frame, curr_frame)  # shape H×W×3, uint8
-    diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)  # collapse to 1 channel
-    # Scale up raw magnitude without normalising.
-    # Factor 2.0: a 30-pixel diff (clear motion) → 60, clipped at 255.
-    # A 1-2 pixel sensor noise → 2-4, stays near zero as intended.
-    diff_gray = np.clip(diff_gray.astype(np.float32) * 2.0, 0, 255).astype(np.uint8)
-    return diff_gray
 ACTOR_CLASSES = ('person', 'scooter', 'vehicle')
 VEHICLE_LIKE_CLASSES = ('scooter', 'vehicle')
 ACTION_WARNING_LABELS = {
@@ -503,9 +476,8 @@ def _stage_collect_litter_candidates(vehicle_active, model_trash, precomputed_tr
         chunk_results = []
     elif precomputed_trash_results is None:
         with profile_block(profiler, "detect.rtdetr_litter_predict"):
-            # 計算像素變化圖,並創建 4 通道輸入 (RGB + change map)。
-            change_map = compute_pixel_change_map(prev_frame, frame)
-            frame_4ch = np.dstack((frame, change_map))
+            # Reference-compatible 4-channel input: RGB + normalized change map。
+            frame_4ch = build_litter_model_input(prev_frame, frame)
             chunk_results = model_trash.predict(
                 frame_4ch, conf=trash_conf, device=TRASH_DEVICE, half=TRASH_HALF, verbose=False,
             )
@@ -753,6 +725,7 @@ def _stage_render_actors(annotated_frame, render_objects, violator_display_cache
                          violator_display_max_jump, color_dict, person_action_map,
                          vehicle_history, box_thickness, font_scale, text_thickness, profiler):
     # 統一渲染 actor:違規者紅框,正常人車用各類別顏色。
+    show_track_ids = os.environ.get("LITTER_DEBUG", "0") not in ("0", "")
     with profile_block(profiler, "detect.render_actors"):
         for obj in render_objects:
             x1, y1, x2, y2 = map(int, obj['box'])
@@ -776,14 +749,16 @@ def _stage_render_actors(annotated_frame, render_objects, violator_display_cache
                 cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), WARN, box_thickness + 2)
                 plate_str = get_plate_number(vehicle_history, track_id) if cls_name in VEHICLE_LIKE_CLASSES else ""
                 warning_label = _warning_label_for_action(cache_entry.get('action'))
-                label_text = f"{cls_name} -{warning_label}- {plate_str}".strip()
+                id_text = f" ID:{track_id}" if show_track_ids else ""
+                label_text = f"{cls_name}{id_text} -{warning_label}- {plate_str}".strip()
                 cv2.putText(annotated_frame, label_text, (x1, max(10, y1 - 35)),
                             cv2.FONT_HERSHEY_SIMPLEX, font_scale, WARN, text_thickness)
             else:
                 # 正常路人/車輛。
                 color = color_dict.get(cls_name, BLACK)
                 cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, box_thickness)
-                label_text = cls_name
+                id_text = f" ID:{track_id}" if show_track_ids else ""
+                label_text = f"{cls_name}{id_text}"
                 if cls_name == 'person' and track_id in person_action_map:
                     action_info = person_action_map[track_id]
                     stgcn_conf = action_info.get('stgcn_conf', action_info.get('conf', 0.0))
@@ -791,9 +766,9 @@ def _stage_render_actors(annotated_frame, render_objects, violator_display_cache
                         action_name = _warning_label_for_action(action_info.get('action'))
                         color = WARN
                         cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, box_thickness + 2)
-                        label_text = f"person {action_name} STGCN {stgcn_conf:.2f}"
+                        label_text = f"person{id_text} {action_name} STGCN {stgcn_conf:.2f}"
                     else:
-                        label_text = f"person {action_info.get('action', 'normal')} STGCN {stgcn_conf:.2f}"
+                        label_text = f"person{id_text} {action_info.get('action', 'normal')} STGCN {stgcn_conf:.2f}"
                 cv2.putText(annotated_frame, label_text, (x1, max(10, y1 - 10)),
                             cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, text_thickness)
 
@@ -1066,7 +1041,7 @@ def _run_batched_trash_predict(model_trash, frames, trash_conf, export_batch_siz
                                profiler=None, zero_repair="adjacent",
                                zero_repair_context=None, stats=None, prev_frames=None):
     # 批次 RTDETR litter predict；尾端不足 batch 時用最後一幀 padding，輸出再裁回原長度。
-    # 創建 4 通道輸入：將每幀的 BGR 與變化圖 (change map) 堆疊成 (H, W, 4) 格式。
+    # 創建 reference-compatible 4-channel input：RGB + normalized change map。
     if model_trash is None:
         return [[] for _ in frames]
     if prev_frames is None:
@@ -1074,9 +1049,7 @@ def _run_batched_trash_predict(model_trash, frames, trash_conf, export_batch_siz
 
     infer_frames = []
     for frame, prev_frame in zip(frames, prev_frames):
-        change_map = compute_pixel_change_map(prev_frame, frame)
-        frame_4ch = np.dstack((frame, change_map))
-        infer_frames.append(frame_4ch)
+        infer_frames.append(build_litter_model_input(prev_frame, frame))
 
     if export_batch_size > len(infer_frames):
         infer_frames.extend([infer_frames[-1]] * (export_batch_size - len(infer_frames)))
@@ -1107,8 +1080,7 @@ def _run_batched_trash_predict(model_trash, frames, trash_conf, export_batch_siz
         )
         result_list = []
         for frame, prev_frame in zip(frames, prev_frames):
-            change_map = compute_pixel_change_map(prev_frame, frame)
-            frame_4ch = np.dstack((frame, change_map))
+            frame_4ch = build_litter_model_input(prev_frame, frame)
             repair_source = [frame_4ch] * export_batch_size if export_batch_size > 1 else frame_4ch
             with profile_block(profiler, "detect.rtdetr_litter_predict_batch_repair"):
                 repair_results = model_trash.predict(
@@ -1150,8 +1122,7 @@ def _run_batched_trash_predict(model_trash, frames, trash_conf, export_batch_siz
         for pos in repair_positions:
             frame = frames[pos]
             prev_frame = prev_frames[pos] if prev_frames and pos < len(prev_frames) else None
-            change_map = compute_pixel_change_map(prev_frame, frame)
-            frame_4ch = np.dstack((frame, change_map))
+            frame_4ch = build_litter_model_input(prev_frame, frame)
             repair_source = [frame_4ch] * export_batch_size if export_batch_size > 1 else frame_4ch
             with profile_block(profiler, "detect.rtdetr_litter_predict_batch_repair"):
                 repair_results = model_trash.predict(

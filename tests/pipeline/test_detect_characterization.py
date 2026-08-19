@@ -16,7 +16,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
 
-from pipeline.detect import detect
+from pipeline.detect import _stage_render_actors, detect
 from pipeline.litter_tracker import GlobalLitterTracker
 
 COLORS = {
@@ -132,3 +132,30 @@ def test_detect_scenario_a_actors_only():
 def test_detect_scenario_b_with_litter_candidate():
     trash = [_StubResult([_StubBox(0, 0.9, [40, 40, 60, 60])])]
     assert _run(model_trash=_StubTrash(), trash_results=trash, with_motion=True) == GOLDEN["B"]
+
+
+def test_debug_render_includes_actor_track_ids(monkeypatch):
+    labels = []
+    monkeypatch.setenv("LITTER_DEBUG", "1")
+    monkeypatch.setattr(
+        "pipeline.detect.cv2.putText",
+        lambda _frame, text, *_args, **_kwargs: labels.append(text),
+    )
+    frame = np.zeros((120, 160, 3), dtype=np.uint8)
+    _stage_render_actors(
+        frame,
+        [
+            {"box": [10, 10, 40, 80], "cls": "person", "track_id": 7},
+            {"box": [60, 20, 140, 100], "cls": "vehicle", "track_id": 12},
+        ],
+        {},
+        80.0,
+        COLORS,
+        {},
+        _fresh_vehicle_history(),
+        1,
+        0.5,
+        1,
+        None,
+    )
+    assert labels == ["person ID:7", "vehicle ID:12"]

@@ -5,9 +5,10 @@ import os
 from pathlib import Path
 
 import cv2
-import numpy as np
 import torch
 from ultralytics import RTDETR, YOLO
+
+from pipeline.litter.input4c import build_litter_model_input
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -129,22 +130,11 @@ def _keypoint_counts(results, keep_count):
 
 
 def _build_4ch_frames(frames: list) -> list:
-    """將連續 BGR frames 轉成 4-channel (BGR + pixel-change map) 格式。
-    用於 4c trash model 的 smoke test。change map 以相鄰幀 absdiff 計算。
-    """
-    import cv2
+    """將連續 BGR frames 轉成 reference-compatible RGB+change input。"""
     result = []
     for i, fr in enumerate(frames):
         prev = frames[i - 1] if i > 0 else None
-        if prev is None:
-            diff = cv2.cvtColor(
-                cv2.absdiff(np.zeros_like(fr), fr),
-                cv2.COLOR_BGR2GRAY,
-            )
-        else:
-            diff = cv2.cvtColor(cv2.absdiff(prev, fr), cv2.COLOR_BGR2GRAY)
-        diff = np.clip(diff.astype(np.float32) * 2.0, 0, 255).astype(np.uint8)
-        result.append(np.dstack((fr, diff)))
+        result.append(build_litter_model_input(prev, fr))
     return result
 
 
