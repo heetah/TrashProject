@@ -4,10 +4,11 @@
 examine.py 相容 shim 維持不變。
 """
 from . import constants as _constants
+from . import contracts as _contracts
 from . import video_io as _video_io
 from . import motion as _motion
 from . import models as _models
 
-for _m in (_constants, _video_io, _motion, _models):
+for _m in (_constants, _contracts, _video_io, _motion, _models):
     globals().update({k: v for k, v in vars(_m).items() if not k.startswith("__")})
-del _m, _constants, _video_io, _motion, _models
+del _m, _constants, _contracts, _video_io, _motion, _models

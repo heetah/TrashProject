@@ -469,7 +469,8 @@ def _stage_detect_shake(prev_frame, frame, litter_tracker, frame_index, fps, sta
 
 
 def _stage_collect_litter_candidates(vehicle_active, model_trash, precomputed_trash_results,
-                                     prev_frame, frame, trash_conf, stats, profiler):
+                                     prev_frame, frame, trash_conf, stats, profiler,
+                                     prepared_litter_input=None):
     # RTDETR 全圖偵測垃圾候選;車輛閘門關閉或無模型時回空。回傳 [[x1,y1,x2,y2,conf], ...]。
     current_frame_litters = []
     if not vehicle_active or model_trash is None:
@@ -477,7 +478,11 @@ def _stage_collect_litter_candidates(vehicle_active, model_trash, precomputed_tr
     elif precomputed_trash_results is None:
         with profile_block(profiler, "detect.rtdetr_litter_predict"):
             # Reference-compatible 4-channel input: RGB + normalized change map。
-            frame_4ch = build_litter_model_input(prev_frame, frame)
+            frame_4ch = (
+                prepared_litter_input
+                if prepared_litter_input is not None
+                else build_litter_model_input(prev_frame, frame)
+            )
             chunk_results = model_trash.predict(
                 frame_4ch, conf=trash_conf, device=TRASH_DEVICE, half=TRASH_HALF, verbose=False,
             )
@@ -809,7 +814,8 @@ def detect(frame, model_bbox, model_trash,
            stats=None,
            actor_mode="track",
            actor_track_iou=0.3,
-           prev_frame=None):
+           prev_frame=None,
+           prepared_litter_input=None):
     # 單幀偵測入口：負責一幀內完整 actor、litter、違規者、渲染流程。
     if violator_display_cache is None:
         violator_display_cache = {}
@@ -864,6 +870,7 @@ def detect(frame, model_bbox, model_trash,
     current_frame_litters = _stage_collect_litter_candidates(
         vehicle_active, model_trash, precomputed_trash_results,
         prev_frame, frame, trash_conf, stats, profiler,
+        prepared_litter_input=prepared_litter_input,
     )
 
     filtered_frame_litters = _stage_filter_litter_candidates(
@@ -1039,7 +1046,8 @@ def _select_zero_repair_positions(box_counts, mode, context=None):
 
 def _run_batched_trash_predict(model_trash, frames, trash_conf, export_batch_size,
                                profiler=None, zero_repair="adjacent",
-                               zero_repair_context=None, stats=None, prev_frames=None):
+                               zero_repair_context=None, stats=None, prev_frames=None,
+                               prepared_inputs=None):
     # 批次 RTDETR litter predict；尾端不足 batch 時用最後一幀 padding，輸出再裁回原長度。
     # 創建 reference-compatible 4-channel input：RGB + normalized change map。
     if model_trash is None:
@@ -1047,9 +1055,18 @@ def _run_batched_trash_predict(model_trash, frames, trash_conf, export_batch_siz
     if prev_frames is None:
         prev_frames = [None] * len(frames)
 
-    infer_frames = []
-    for frame, prev_frame in zip(frames, prev_frames):
-        infer_frames.append(build_litter_model_input(prev_frame, frame))
+    if prepared_inputs is not None:
+        if len(prepared_inputs) != len(frames):
+            raise ValueError(
+                "prepared_inputs and frames length mismatch: "
+                f"{len(prepared_inputs)} != {len(frames)}"
+            )
+        infer_frames = list(prepared_inputs)
+    else:
+        infer_frames = [
+            build_litter_model_input(prev_frame, frame)
+            for frame, prev_frame in zip(frames, prev_frames)
+        ]
 
     if export_batch_size > len(infer_frames):
         infer_frames.extend([infer_frames[-1]] * (export_batch_size - len(infer_frames)))
@@ -1079,8 +1096,7 @@ def _run_batched_trash_predict(model_trash, frames, trash_conf, export_batch_siz
             f"Warning: batched RTDETR failed; repairing frame-by-frame with padded batch source: {exc}",
         )
         result_list = []
-        for frame, prev_frame in zip(frames, prev_frames):
-            frame_4ch = build_litter_model_input(prev_frame, frame)
+        for frame_4ch in infer_frames[:len(frames)]:
             repair_source = [frame_4ch] * export_batch_size if export_batch_size > 1 else frame_4ch
             with profile_block(profiler, "detect.rtdetr_litter_predict_batch_repair"):
                 repair_results = model_trash.predict(
@@ -1120,9 +1136,7 @@ def _run_batched_trash_predict(model_trash, frames, trash_conf, export_batch_siz
         )
         _add_stat(stats, "rtdetr_batch_zero_repaired_frames", len(repair_positions))
         for pos in repair_positions:
-            frame = frames[pos]
-            prev_frame = prev_frames[pos] if prev_frames and pos < len(prev_frames) else None
-            frame_4ch = build_litter_model_input(prev_frame, frame)
+            frame_4ch = infer_frames[pos]
             repair_source = [frame_4ch] * export_batch_size if export_batch_size > 1 else frame_4ch
             with profile_block(profiler, "detect.rtdetr_litter_predict_batch_repair"):
                 repair_results = model_trash.predict(
@@ -1242,12 +1256,18 @@ def detect_batch(frames, model_bbox, model_trash,
                  rtdetr_batch_context=None,
                  actor_mode="track",
                  actor_track_iou=0.3,
-                 prev_frames=None):
+                 prev_frames=None,
+                 prepared_litter_inputs=None):
     # 批次偵測入口：RTDETR 批次推理、actor 可跳幀快取，最後逐幀套用單幀後處理。
     if not frames:
         return []
     if len(frames) != len(fg_masks):
         raise ValueError(f"frames and fg_masks length mismatch: {len(frames)} != {len(fg_masks)}")
+    if prepared_litter_inputs is not None and len(prepared_litter_inputs) != len(frames):
+        raise ValueError(
+            "prepared_litter_inputs and frames length mismatch: "
+            f"{len(prepared_litter_inputs)} != {len(frames)}"
+        )
     if violator_display_cache is None:
         violator_display_cache = {}
     if yolo_seg_cache is None:
@@ -1285,8 +1305,15 @@ def detect_batch(frames, model_bbox, model_trash,
                 actor_mode=actor_mode,
                 actor_track_iou=actor_track_iou,
                 prev_frame=prev_frame,
+                prepared_litter_input=(
+                    prepared_litter_inputs[pos]
+                    if prepared_litter_inputs is not None
+                    else None
+                ),
             )
-            for frame, fg_mask, frame_index, prev_frame in zip(frames, fg_masks, frame_indices, prev_frames)
+            for pos, (frame, fg_mask, frame_index, prev_frame) in enumerate(
+                zip(frames, fg_masks, frame_indices, prev_frames)
+            )
         ]
 
     # 批次前處理：actor 結果可跳幀快取，litter 結果用 RTDETR 批次推理。
@@ -1319,6 +1346,7 @@ def detect_batch(frames, model_bbox, model_trash,
             zero_repair_context=rtdetr_batch_context,
             stats=stats,
             prev_frames=prev_frames,
+            prepared_inputs=prepared_litter_inputs,
         )
     else:
         _add_stat(stats, "vehicle_gate_skipped_trash_batches")

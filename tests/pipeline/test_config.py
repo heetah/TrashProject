@@ -7,9 +7,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"
 
 from pipeline.config import PipelineConfig
 
-# 這些預設必須等於翻新前 main.py 內的固定字面值,確保 config 化「行為不變」。
+# 既有參數維持翻新前 main.py 固定值；新參數固定 production 預設，避免未設 env 時漂移。
 EXPECTED_DEFAULTS = {
     "batch_size": 8,
+    "pipeline_queue_size": 8,
+    "prepare_4c_in_reader": True,
     "yolo_seg_frame_skip": 2,
     "actor_mode": "predict",
     "rtdetr_zero_repair": "off",
@@ -39,19 +41,24 @@ def test_defaults_match_legacy_literals():
 
 
 def test_from_env_without_env_equals_defaults(monkeypatch):
-    for name in ("PIPELINE_BATCH", "BBOX_CONF", "TRASH_CONF", "ACTION_WINDOW",
-                 "VIOLATOR_DISPLAY_TTL", "WRITER_CRF"):
+    for name in ("PIPELINE_BATCH", "PIPELINE_QUEUE_SIZE", "PIPELINE_PREPARE_4C",
+                 "BBOX_CONF", "TRASH_CONF", "ACTION_WINDOW", "VIOLATOR_DISPLAY_TTL",
+                 "WRITER_CRF"):
         monkeypatch.delenv(name, raising=False)
     assert PipelineConfig.from_env() == PipelineConfig()
 
 
 def test_from_env_overrides(monkeypatch):
     monkeypatch.setenv("PIPELINE_BATCH", "4")
+    monkeypatch.setenv("PIPELINE_QUEUE_SIZE", "12")
+    monkeypatch.setenv("PIPELINE_PREPARE_4C", "0")
     monkeypatch.setenv("BBOX_CONF", "0.6")
     monkeypatch.setenv("WRITER_PRESET", "medium")
     monkeypatch.setenv("ACTION_WINDOW", "150")
     cfg = PipelineConfig.from_env()
     assert cfg.batch_size == 4
+    assert cfg.pipeline_queue_size == 12
+    assert cfg.prepare_4c_in_reader is False
     assert cfg.bbox_conf == 0.6
     assert cfg.writer_preset == "medium"
     assert cfg.action_window == 150

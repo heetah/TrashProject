@@ -54,7 +54,9 @@ trashProject/
 ```text
 輸入監視器影片
   -> 模型 preload / warmup
-  -> 背景讀取 frame + temporal motion mask
+  -> 有界背景 reader queue
+      -> 讀取 frame + temporal motion mask
+      -> 預先建立 RT-DETR 4-channel input
   -> YOLO-Seg vehicle/scooter detection
   -> vehicle gate
       ├── YOLO-Pose person detection/tracking/keypoints
@@ -71,6 +73,16 @@ trashProject/
   -> annotated video + analysis.json
   -> optional research backtrack sidecar
 ```
+
+背景 reader 以 `PreparedFrame(index, source_bgr, foreground_mask,
+litter_model_input)` 傳遞每幀資料。`source_bgr` 維持未標註，供 motion、OCR 與證據影像使用；
+第四通道前處理在主執行緒處理前一批 GPU inference 時準備下一批，RT-DETR batch 不再於
+呼叫 `predict()` 前等待 RGB 轉換、相鄰幀差分與 4-channel 拼接。Queue 為有界且逐幀保留
+`index`，主流程會驗證 batch index 連續才推論，避免重排或跨影片狀態污染。
+
+這是 CPU preprocessing／GPU inference 的跨批 overlap，不代表 YOLO-Seg、YOLO-Pose、
+RT-DETR 或 STGCN 的 CUDA kernels 同時執行。主模型同幀順序及所有事件確認、歸因、OCR
+證據責任都保持不變。
 
 ## 模組責任
 
@@ -208,6 +220,8 @@ MP4 片段，並附一份列出違規、關聯車輛、車牌與審核資料的 
 | 變數 | 預設 | 說明 |
 |---|---:|---|
 | `PIPELINE_BATCH` | `8` | Pipeline batch size |
+| `PIPELINE_QUEUE_SIZE` | `8` | Prepared frame 有界 queue；預設保留一個 batch，避免高解析影片無界佔用 RAM |
+| `PIPELINE_PREPARE_4C` | `1` | 在背景 reader 預先建立 RT-DETR 4-channel input；設 `0` 回到主推論執行緒即時建立 |
 | `YOLO_SEG_FRAME_SKIP` | `2` | Vehicle/scooter detector cadence |
 | `BBOX_CONF` | `0.45` | Actor confidence |
 | `TRASH_CONF` | `0.4` | Litter candidate confidence |

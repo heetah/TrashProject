@@ -204,6 +204,44 @@ class TestLitterModelInput:
             model.source[1], _import_input_builder()(first, second)
         )
 
+    def test_batched_runtime_accepts_prepared_inputs_without_rebuilding(self, monkeypatch):
+        from pipeline import detect as detect_module
+
+        class CaptureModel:
+            def __init__(self):
+                self.source = None
+
+            def predict(self, source, **_kwargs):
+                self.source = source
+                return [SimpleNamespace(boxes=[]) for _ in source]
+
+        prev, first = self._frames()
+        second = np.roll(first, 1, axis=1)
+        prepared = [
+            _import_input_builder()(prev, first),
+            _import_input_builder()(first, second),
+        ]
+        monkeypatch.setattr(
+            detect_module,
+            "build_litter_model_input",
+            lambda *_args: (_ for _ in ()).throw(AssertionError("must not rebuild")),
+        )
+        model = CaptureModel()
+
+        detect_module._run_batched_trash_predict(
+            model,
+            [first, second],
+            trash_conf=0.4,
+            export_batch_size=2,
+            zero_repair="off",
+            prev_frames=[prev, first],
+            prepared_inputs=prepared,
+        )
+
+        assert model.source is not prepared
+        np.testing.assert_array_equal(model.source[0], prepared[0])
+        np.testing.assert_array_equal(model.source[1], prepared[1])
+
     def test_tensorrt_smoke_uses_same_input_contract(self):
         from export_tensorrt import _build_4ch_frames
 

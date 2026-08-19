@@ -28,6 +28,7 @@ from pipeline.backtrack.sidecar import (
     write_jsonl as write_backtrack_jsonl,
 )
 from pipeline.config import PipelineConfig
+from pipeline.litter.input4c import build_litter_model_input
 
 from pipeline.infra import (
     SUPPORTED_BATCH_SIZES,
@@ -41,7 +42,6 @@ from pipeline.infra import (
     DEFAULT_MOTION_CLOSE_ITERATIONS,
     DEFAULT_MOTION_MIN_COMPONENT_AREA,
     DEFAULT_MOTION_MIN_LARGEST_COMPONENT_RATIO,
-    DEFAULT_READER_QUEUE_SIZE,
     DEFAULT_CAPTURE_BUFFER_SIZE,
     MotionMaskBuilder,
     AsyncFFmpegVideoWriter,
@@ -273,7 +273,8 @@ if __name__ == "__main__":
                 raise RuntimeError(f"Invalid video size for {video_path}: {width}x{height}")
             print(
                 f"VideoCapture backend: {capture_backend}; "
-                f"hw_accel=any; async_reader=True; reader_queue={DEFAULT_READER_QUEUE_SIZE}"
+                f"hw_accel=any; async_reader=True; reader_queue={cfg.pipeline_queue_size}; "
+                f"prepare_4c_in_reader={cfg.prepare_4c_in_reader and _RTDETR_ENABLED}"
             )
 
             with profiler.time_block("video.open_writer"):
@@ -337,7 +338,12 @@ if __name__ == "__main__":
                     cap,
                     motion_masker,
                     profiler,
-                    queue_size=DEFAULT_READER_QUEUE_SIZE,
+                    queue_size=cfg.pipeline_queue_size,
+                    litter_input_builder=(
+                        build_litter_model_input
+                        if cfg.prepare_4c_in_reader and _RTDETR_ENABLED
+                        else None
+                    ),
                 )
             cap = None
 
@@ -345,9 +351,27 @@ if __name__ == "__main__":
             with profiler.time_block("process.video_loop_total"):
                 with tqdm(total=total_frames, desc="Processing Video... ", unit="frame") as pbar:
                     while True:
-                        frames, fg_masks = frame_reader.read_batch(_BATCH_SIZE)
-                        if not frames:
+                        prepared_frames = frame_reader.read_prepared_batch(_BATCH_SIZE)
+                        if not prepared_frames:
                             break
+
+                        expected_indices = list(
+                            range(frame_index, frame_index + len(prepared_frames))
+                        )
+                        packet_indices = [packet.index for packet in prepared_frames]
+                        if packet_indices != expected_indices:
+                            raise RuntimeError(
+                                "Prepared frame order mismatch: "
+                                f"expected {expected_indices}, got {packet_indices}"
+                            )
+
+                        frames = [packet.source_bgr for packet in prepared_frames]
+                        fg_masks = [packet.foreground_mask for packet in prepared_frames]
+                        prepared_litter_inputs = (
+                            [packet.litter_model_input for packet in prepared_frames]
+                            if prepared_frames[0].litter_model_input is not None
+                            else None
+                        )
 
                         with profiler.time_block("detect.total"):
                             # Create prev_frames list: first frame's prev is last_frame from previous batch
@@ -380,6 +404,7 @@ if __name__ == "__main__":
                                 actor_mode=_ACTOR_MODE,
                                 actor_track_iou=cfg.actor_track_iou,
                                 prev_frames=prev_frames,
+                                prepared_litter_inputs=prepared_litter_inputs,
                             )
                             # Update last_frame for next batch
                             if frames:

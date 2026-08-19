@@ -2,7 +2,8 @@
 """管線執行參數的單一集中設定。
 
 原本這些值以魔術數字散落在 main.py 主流程;集中成一個 dataclass 後,調參/擴充只需改
-一處,並可透過環境變數覆寫(from_env)。預設值 = 原 main.py 的固定值,行為不變。
+一處,並可透過環境變數覆寫(from_env)。既有參數沿用原固定值；新增 pipeline queue 與
+4-channel 背景前處理則在此提供明確預設。
 
 注意:模組內部各自在「使用點」讀取的 env(VEHICLE_GATE*、ACTION_URINATE_*、BBOX_DEVICE …)
 維持原樣,不搬進此處;本設定只收斂原本 main.py 硬編碼、無覆寫管道的執行參數。
@@ -36,10 +37,24 @@ def _env_str(name, default):
     return v if v not in (None, "") else default
 
 
+def _env_bool(name, default):
+    v = os.environ.get(name)
+    if v in (None, ""):
+        return bool(default)
+    normalized = str(v).strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    return bool(default)
+
+
 @dataclass
 class PipelineConfig:
     # --- 批次 / 偵測路徑 ---
     batch_size: int = 8
+    pipeline_queue_size: int = 8
+    prepare_4c_in_reader: bool = True
     yolo_seg_frame_skip: int = 2
     actor_mode: str = "predict"
     rtdetr_zero_repair: str = "off"
@@ -66,10 +81,12 @@ class PipelineConfig:
 
     @classmethod
     def from_env(cls):
-        # 環境變數覆寫;未設定者沿用預設(= 原固定值),故不設任何 env 時行為與過去一致。
+        # 環境變數覆寫；未設定者沿用 dataclass 中明確的 production 預設。
         d = cls()
         return cls(
             batch_size=_env_int("PIPELINE_BATCH", d.batch_size),
+            pipeline_queue_size=_env_int("PIPELINE_QUEUE_SIZE", d.pipeline_queue_size),
+            prepare_4c_in_reader=_env_bool("PIPELINE_PREPARE_4C", d.prepare_4c_in_reader),
             yolo_seg_frame_skip=_env_int("YOLO_SEG_FRAME_SKIP", d.yolo_seg_frame_skip),
             actor_mode=_env_str("ACTOR_MODE", d.actor_mode),
             rtdetr_zero_repair=_env_str("RTDETR_ZERO_REPAIR", d.rtdetr_zero_repair),
