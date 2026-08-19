@@ -60,7 +60,8 @@ Semantics:
 - Every event has a NULL route. Invalid or highly uncertain candidates are not
   forced into a match.
 
-Environment controls (defaults shown):
+Production entrypoint 會從 repository root `.env` 載入以下控制項；shell 明確 export 的值優先，
+完整集中範本見 root `.env.example`。Environment controls (defaults shown):
 
 ```text
 SMART_BACKTRACK=1

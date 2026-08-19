@@ -165,7 +165,17 @@ OCR 只處理已可靠歸因的 vehicle/scooter ROI。無法辨識、低信心�
 conda run -n rtdetr ...
 ```
 
-目前 `scripts/main.py` 只接受一個 positional video path；batch、threshold 與輸出位置主要使用環境變數。
+目前 `scripts/main.py` 只接受一個 positional video path；模型路徑、batch、threshold、
+device、motion 與輸出位置集中在 repository root 的 `.env`。首次 checkout 可由範本建立：
+
+```bash
+cp .env.example .env
+```
+
+載入優先序為「shell／UI worker 已 export 的值 > `.env` > 程式內安全預設」，因此單次命令
+仍可覆寫設定，UI job 的獨立輸出路徑也不會被 `.env` 蓋掉。若要切換多組設定，可先 export
+`PIPELINE_ENV_FILE=/absolute/path/to/profile.env`；設定檔內的相對模型路徑一律以 repository root
+解析。`.env` 是本機檔案且不進 Git，完整可提交範本為 [`.env.example`](.env.example)。
 
 ```bash
 OUTPUT_ROOT=output PIPELINE_BATCH=8 \
@@ -201,8 +211,9 @@ bash scripts/run_litter_order.sh
 
 ### Flask + React 人工複核介面
 
-`UI/` 是獨立 web application，不把 Flask/React 混入 `scripts/`。Flask 把上傳影片或
-`.env` allowlist 內的資料夾影片排入 SQLite queue，再由單一 background worker 逐支
+`UI/` 是獨立 web application，不把 Flask/React 混入 `scripts/`。UI server 設定仍使用
+`UI/.env`；production inference 使用 root `.env`。Flask 把上傳影片或 UI allowlist 內的
+資料夾影片排入 SQLite queue，再由單一 background worker 逐支
 呼叫上述 `scripts/main.py`。React 讀取 Flask 提供的 analysis JSON，顯示 annotated
 影片與摘要，並在桌面版右欄列出全部 confirmed litter/STGCN 事件、模型 confidence、
 Smart Backtrack 狀態、可能車輛與 OCR 證據；每個事件的證據與人工判定共用一卡片。
@@ -219,18 +230,30 @@ MP4 片段，並附一份列出違規、關聯車輛、車牌與審核資料的 
 
 | 變數 | 預設 | 說明 |
 |---|---:|---|
+| `MODEL_BBOX_PATH` / `MODEL_BBOX_PATH_BATCH` | `modules_weight/...` | YOLO-Seg 單幀／batch 權重；相對 repository root |
+| `MODEL_TRASH_PATH` / `MODEL_TRASH_PATH_BATCH` | `modules_weight/best-rtdetr-4c-background.pt` | RT-DETR 單幀／batch 權重 |
+| `POSE_MODEL_PATH` | `modules_weight/yolo26x-pose.pt` | YOLO-Pose 權重 |
+| `STGCN_WEIGHT_PATH` / `STGCN_CONFIG_PATH` | `modules_weight/...` / `mmaction2/...` | STGCN checkpoint 與 config |
+| `PLATE_MODEL_PATH` | `modules_weight/best-licnese-plate.pt` | 車牌 detector 權重 |
+| `PREFER_TENSORRT` | `1` | 優先嘗試同模型的 matching `.engine`，失敗仍依既有候選回退 |
 | `PIPELINE_BATCH` | `8` | Pipeline batch size |
 | `PIPELINE_QUEUE_SIZE` | `8` | Prepared frame 有界 queue；預設保留一個 batch，避免高解析影片無界佔用 RAM |
 | `PIPELINE_PREPARE_4C` | `1` | 在背景 reader 預先建立 RT-DETR 4-channel input；設 `0` 回到主推論執行緒即時建立 |
 | `YOLO_SEG_FRAME_SKIP` | `2` | Vehicle/scooter detector cadence |
 | `BBOX_CONF` | `0.45` | Actor confidence |
 | `TRASH_CONF` | `0.4` | Litter candidate confidence |
+| `ACTION_POSE_CONF` | `0.3` | YOLO-Pose person confidence |
 | `ACTION_WINDOW` | `100` | STGCN sequence frames |
 | `URINATION_WINDOW_SEC` | `8.0` | Urinate evidence window |
 | `URINATION_MIN_SEC` | `5.0` | Binary evidence minimum |
 | `VEHICLE_GATE` | `1` | Vehicle gate enable |
 | `VEHICLE_GATE_TTL_SEC` | `3.0` | Recent vehicle TTL |
 | `RTDETR_ENABLED` | `1` | Litter detector/OCR enable |
+| `PLATE_DETECT_CONF` | `0.6` | 送入 plate detector 的 confidence |
+| `PLATE_ACCEPT_DETECT_CONF` | `0.8` | 接受車牌 bbox 的最低 confidence |
+| `PLATE_OCR_CONFIDENCE` | `0.85` | 接受 OCR 文字的最低 confidence；不足時維持失敗狀態，不猜牌 |
+| `MOTION_DIFF_THRESHOLD` | `10` | Temporal motion mask 灰階差 threshold |
+| `MOTION_MIN_COMPONENT_AREA` | `4` | Litter motion evidence 的最小 component 面積 |
 | `SMART_BACKTRACK` | `1` | Smart attribution enable |
 | `SMART_BACKTRACK_SIDECAR` | `0` | Research candidate sidecar；需明確設 `1` 啟用 |
 | `SMART_BACKTRACK_STUDY_STAGE` | `full` | Research ablation stage；production 預設不變 |
@@ -242,7 +265,10 @@ MP4 片段，並附一份列出違規、關聯車輛、車牌與審核資料的 
 | `LITTER_DEBUG` | `0` | 設為 `1` 時輸出逐幀診斷，並在 annotated video 顯示 person/vehicle/scooter track ID |
 | `OUTPUT_ROOT` | `.` | Output directory；建議明確設為 `output` |
 
-完整預設值以 `scripts/pipeline/config.py` 與各環境變數使用點為準。
+其餘 action smoothing、video I/O、writer、Smart Backtrack 與 legacy research 開關都已列在
+`.env.example`。演算法內部固定 class mapping、4-channel preprocessing contract 與低頻物理 gate
+仍保留在 live code，避免一般部署調參意外改變證據責任。型別化 production 預設以
+`scripts/pipeline/config.py` 為準。
 
 ### 反追蹤研究 replay
 

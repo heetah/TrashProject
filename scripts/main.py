@@ -1,8 +1,14 @@
-import cv2
 import os
 import argparse
 from pathlib import Path
 from collections import defaultdict, deque
+
+from pipeline.config import PipelineConfig, load_project_env
+
+# 必須早於 Torch/Ultralytics 與 pipeline.devices import，device/model 設定才會完整生效。
+LOADED_ENV_PATH = load_project_env()
+
+import cv2
 from tqdm import tqdm
 
 from ultralytics import YOLO
@@ -27,22 +33,10 @@ from pipeline.backtrack.sidecar import (
     build_run_record as build_backtrack_run_record,
     write_jsonl as write_backtrack_jsonl,
 )
-from pipeline.config import PipelineConfig
 from pipeline.litter.input4c import build_litter_model_input
 
 from pipeline.infra import (
     SUPPORTED_BATCH_SIZES,
-    DEFAULT_FG_MASK_SCALE,
-    DEFAULT_MOTION_DIFF_THRESHOLD,
-    DEFAULT_MOTION_DILATE_ITERATIONS,
-    DEFAULT_MOTION_BLUR_KERNEL,
-    DEFAULT_MOTION_OPEN_KERNEL,
-    DEFAULT_MOTION_OPEN_ITERATIONS,
-    DEFAULT_MOTION_CLOSE_KERNEL,
-    DEFAULT_MOTION_CLOSE_ITERATIONS,
-    DEFAULT_MOTION_MIN_COMPONENT_AREA,
-    DEFAULT_MOTION_MIN_LARGEST_COMPONENT_RATIO,
-    DEFAULT_CAPTURE_BUFFER_SIZE,
     MotionMaskBuilder,
     AsyncFFmpegVideoWriter,
     AsyncVideoFrameReader,
@@ -71,33 +65,15 @@ COLORS = {
     'scooter': (0, 255, 255) # 黃色
 }
 
-# 預設模型路徑：batch 1 使用一般權重；batch N 使用 batch 匯出/訓練資料夾中的權重。
-POSE_MODEL_PATH = '/home/se_copilot/trashProject/modules_weight/yolo26x-pose.pt'
-STGCN_WEIGHT_PATH = '/home/se_copilot/trashProject/modules_weight/best_stgcn_0623.pth'
-STGCN_CONFIG_PATH = '/home/se_copilot/trashProject/mmaction2/configs/skeleton/stgcnpp/custom_trash_stgcnpp.py'
-
-MODEL_BBOX_PATH = '/home/se_copilot/trashProject/modules_weight/best-yolo-seg_v3.pt'
-MODEL_TRASH_PATH = '/home/se_copilot/trashProject/modules_weight/best-rtdetr-4c-background.pt'
-MODEL_BBOX_PATH_BATCH = '/home/se_copilot/trashProject/modules_weight/batch/best-yolo-seg_v3.pt'
-# best-rtdetr-4c.pt 無 batch/ 版本；batch engine 由 export_tensorrt.py 在同目錄產出 best-rtdetr-4c_b8.engine。
-MODEL_TRASH_PATH_BATCH = '/home/se_copilot/trashProject/modules_weight/best-rtdetr-4c-background.pt'
-
-
-def _default_model_paths_for_batch(batch_size):
-    # 使用者未手動指定模型時，依 batch 自動切換成對應權重。
-    if int(batch_size) > 1:
-        return MODEL_BBOX_PATH_BATCH, MODEL_TRASH_PATH_BATCH
-    return MODEL_BBOX_PATH, MODEL_TRASH_PATH
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("file", nargs="?", help="video path or file name in resources/", default="TThrow.mp4")
     args = parser.parse_args()
-    _set_ffmpeg_bin(_select_ffmpeg_bin(None))
+    cfg = PipelineConfig.from_env()
+    _set_ffmpeg_bin(_select_ffmpeg_bin(cfg.ffmpeg_bin))
 
     # 資源句柄與計數器集中管理，finally 可安全釋放攝影機與輸出檔。
-    profiler = PipelineProfiler(enabled=True)
+    profiler = PipelineProfiler(enabled=cfg.profile_enabled)
     cap = None
     out = None
     frame_reader = None
@@ -107,18 +83,18 @@ if __name__ == "__main__":
 
     try:
         with profiler.time_block("pipeline.total_wall"):
-            # 執行參數集中於 PipelineConfig(預設 = 原固定值,可用環境變數覆寫);
-            # vehicle gate 永遠開啟(VEHICLE_GATE 預設 "1"),快速偵測路徑
-            # (actor_mode=predict, rtdetr_zero_repair=off)永遠啟用。
-            cfg = PipelineConfig.from_env()
+            # 執行參數集中於 root .env + PipelineConfig；未設定時保留原 production 預設。
+            # Vehicle gate、actor fast path 與 zero-repair 都可由 .env 明確覆寫。
             _BATCH_SIZE = cfg.batch_size
             _YOLO_SEG_FRAME_SKIP = cfg.yolo_seg_frame_skip
             _ACTOR_MODE = cfg.actor_mode
             _RTDETR_ZERO_REPAIR = cfg.rtdetr_zero_repair
-            _RTDETR_ENABLED = os.environ.get("RTDETR_ENABLED", "1") != "0"
+            _RTDETR_ENABLED = cfg.rtdetr_enabled
 
-            prefer_engine = True
-            default_bbox_model_path, default_trash_model_path = _default_model_paths_for_batch(_BATCH_SIZE)
+            prefer_engine = cfg.prefer_tensorrt
+            default_bbox_model_path, default_trash_model_path = cfg.model_paths_for_batch(
+                _BATCH_SIZE
+            )
             desired_actor_batch_size = _estimate_actor_batch_size(_BATCH_SIZE, _YOLO_SEG_FRAME_SKIP)
             bbox_candidate_batches = [desired_actor_batch_size]
             for candidate_batch in sorted(SUPPORTED_BATCH_SIZES, reverse=True):
@@ -135,8 +111,11 @@ if __name__ == "__main__":
                 bbox_candidate_batches,
             )
             trash_model_candidates = _model_path_candidates(default_trash_model_path, prefer_engine, _BATCH_SIZE)
-            pose_model_candidates = _model_path_candidates(POSE_MODEL_PATH, prefer_engine, 1)
+            pose_model_candidates = _model_path_candidates(
+                cfg.pose_model_path, prefer_engine, 1
+            )
 
+            print(f"Configuration file: {LOADED_ENV_PATH or 'built-in defaults'}")
             print("Preloading all configured models before video processing...")
             print(f"Pipeline batch size: {_BATCH_SIZE}")
             print(f"Actor mode: {_ACTOR_MODE}")
@@ -150,19 +129,19 @@ if __name__ == "__main__":
             print("Extreme speed: detector fast path enabled; STGCN/OCR keep their normal enable flags.")
             # STGCN 先載入 pose model 與 skeleton classifier，後續只在偵測到 person 時更新。
             print(f"Pose model candidates: {pose_model_candidates}")
-            print(f"STGCN weight: {STGCN_WEIGHT_PATH}")
+            print(f"STGCN weight: {cfg.stgcn_weight_path}")
             with profiler.time_block("model_load.action_module_total"):
                 action_module = STGCNActionModule(
                     pose_model_path=pose_model_candidates,
-                    stgcn_weight_path=STGCN_WEIGHT_PATH,
-                    stgcn_config_path=STGCN_CONFIG_PATH,
+                    stgcn_weight_path=cfg.stgcn_weight_path,
+                    stgcn_config_path=cfg.stgcn_config_path,
                     action_threshold=cfg.action_threshold,
                     urinate_conf_high=None,
                     urinate_conf_low=None,
                     window_size=cfg.action_window,
                     urination_window_sec=cfg.urination_window_sec,
                     urination_min_sec=cfg.urination_min_sec,
-                    device=os.environ.get("ACTION_DEVICE"),
+                    device=cfg.action_device,
                     profiler=profiler,
                 )
             action_module.warmup(profiler=profiler)
@@ -232,22 +211,22 @@ if __name__ == "__main__":
             with profiler.time_block("setup.motion_masker"):
                 # motion mask 只用於判定 litter bbox 是否有動態像素；confirmed 規則仍由 tracker 控制。
                 motion_masker = MotionMaskBuilder(
-                    mode="temporal",
-                    scale_factor=DEFAULT_FG_MASK_SCALE,
-                    diff_threshold=DEFAULT_MOTION_DIFF_THRESHOLD,
-                    dilate_iterations=DEFAULT_MOTION_DILATE_ITERATIONS,
-                    blur_kernel_size=DEFAULT_MOTION_BLUR_KERNEL,
-                    open_kernel_size=DEFAULT_MOTION_OPEN_KERNEL,
-                    open_iterations=DEFAULT_MOTION_OPEN_ITERATIONS,
-                    close_kernel_size=DEFAULT_MOTION_CLOSE_KERNEL,
-                    close_iterations=DEFAULT_MOTION_CLOSE_ITERATIONS,
-                    mog2_detect_shadows=True,
+                    mode=cfg.motion_mask_mode,
+                    scale_factor=cfg.fg_mask_scale,
+                    diff_threshold=cfg.motion_diff_threshold,
+                    dilate_iterations=cfg.motion_dilate_iterations,
+                    blur_kernel_size=cfg.motion_blur_kernel,
+                    open_kernel_size=cfg.motion_open_kernel,
+                    open_iterations=cfg.motion_open_iterations,
+                    close_kernel_size=cfg.motion_close_kernel,
+                    close_iterations=cfg.motion_close_iterations,
+                    mog2_detect_shadows=cfg.motion_mog2_detect_shadows,
                 )
 
             # === 影片處理參數設定 ===
             video_path = _resolve_video_path(args.file)
             # 預設輸出到 CWD；iterate-new.py 透過 subprocess cwd= 控制落點。
-            output_dir = Path(os.environ.get("OUTPUT_ROOT", ".")).expanduser()
+            output_dir = Path(cfg.output_root).expanduser()
             with profiler.time_block("setup.output_dir"):
                 output_dir.mkdir(parents=True, exist_ok=True)
             final_output = str(output_dir / f"{Path(video_path).stem}_annotated.mp4")
@@ -256,10 +235,10 @@ if __name__ == "__main__":
                 # 讀取影片屬性；fps 無效時用 30 避免 writer 初始化失敗。
                 cap, capture_backend = _open_video_capture(
                     video_path,
-                    hw_accel="any",
-                    hw_device=None,
-                    buffer_size=DEFAULT_CAPTURE_BUFFER_SIZE,
-                    read_threads=0,
+                    hw_accel=cfg.video_hw_accel,
+                    hw_device=cfg.video_hw_device,
+                    buffer_size=cfg.video_capture_buffer_size,
+                    read_threads=cfg.video_read_threads,
                     profiler=profiler,
                 )
                 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -273,7 +252,8 @@ if __name__ == "__main__":
                 raise RuntimeError(f"Invalid video size for {video_path}: {width}x{height}")
             print(
                 f"VideoCapture backend: {capture_backend}; "
-                f"hw_accel=any; async_reader=True; reader_queue={cfg.pipeline_queue_size}; "
+                f"hw_accel={cfg.video_hw_accel}; async_reader=True; "
+                f"reader_queue={cfg.pipeline_queue_size}; "
                 f"prepare_4c_in_reader={cfg.prepare_4c_in_reader and _RTDETR_ENABLED}"
             )
 
@@ -392,12 +372,12 @@ if __name__ == "__main__":
                                 profiler=profiler,
                                 moving_threshold=cfg.moving_threshold,
                                 core_moving_threshold=cfg.core_moving_threshold,
-                                motion_min_component_area=DEFAULT_MOTION_MIN_COMPONENT_AREA,
-                                motion_min_largest_component_ratio=DEFAULT_MOTION_MIN_LARGEST_COMPONENT_RATIO,
+                                motion_min_component_area=cfg.motion_min_component_area,
+                                motion_min_largest_component_ratio=cfg.motion_min_largest_component_ratio,
                                 batch_size=_BATCH_SIZE,
                                 bbox_batch_size=bbox_runtime_batch_size,
                                 trash_batch_size=trash_runtime_batch_size,
-                                fg_mask_scale=DEFAULT_FG_MASK_SCALE,
+                                fg_mask_scale=cfg.fg_mask_scale,
                                 stats=detection_stats,
                                 rtdetr_zero_repair=_RTDETR_ZERO_REPAIR,
                                 rtdetr_batch_context=rtdetr_batch_context,

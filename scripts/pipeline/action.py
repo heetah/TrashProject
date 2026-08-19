@@ -101,6 +101,7 @@ class STGCNActionModule:
         self.device = torch.device(selected_device)
         self.pose_half = _can_use_half(selected_device)
         self.pose_imgsz = _int_env("ACTION_POSE_IMGSZ", 0)
+        self.pose_conf = min(1.0, max(0.0, _float_env("ACTION_POSE_CONF", 0.3)))
         self.action_threshold = float(action_threshold)
         self.track_iou_threshold = float(track_iou_threshold)
         # urinate 雙門檻（double thresholding / 遲滯）：
@@ -123,8 +124,10 @@ class STGCNActionModule:
         # 因此預設開啟 bbox 正規化（ACTION_BBOX_NORM=1）：用關鍵點外接框當 crop 尺寸，
         # 與訓練分布一致。若之後重新用全幀訓練，可設 ACTION_BBOX_NORM=0 關閉。
         self.bbox_normalize = _int_env("ACTION_BBOX_NORM", 1) != 0
-        self.bbox_norm_pad = 0.15
-        self.bbox_norm_conf = 0.3
+        self.bbox_norm_pad = max(0.0, _float_env("ACTION_BBOX_NORM_PAD", 0.15))
+        self.bbox_norm_conf = min(
+            1.0, max(0.0, _float_env("ACTION_BBOX_NORM_CONF", 0.3))
+        )
         # 關鍵點時序補值/平滑：對 window 內低信心關鍵點做線性內插，再做輕量移動平均去抖。
         self.kp_smooth_enable = _int_env("ACTION_KP_SMOOTH", 1) != 0
         self.kp_smooth_window = max(1, _int_env("ACTION_KP_SMOOTH_WIN", 3))
@@ -573,7 +576,7 @@ class STGCNActionModule:
             return persons, frame_skeletons
 
         pose_kwargs = {
-            "conf": 0.3,
+            "conf": self.pose_conf,
             "persist": True,
             "verbose": False,
             "device": self.pose_device,
