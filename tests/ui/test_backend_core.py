@@ -9,6 +9,7 @@ from openpyxl import load_workbook
 
 from UI.backend.config import build_config
 from UI.backend.database import Database
+from UI.backend.analysis import load_analysis
 from UI.backend.runner import PipelineWorker
 from UI.backend.service import ReviewService
 
@@ -60,6 +61,34 @@ def write_existing_result(root: Path, events=None):
     path = root / "clip_annotated_analysis.json"
     path.write_text(json.dumps(analysis_payload(events)), encoding="utf-8")
     return path
+
+
+def test_ui_accepts_analysis_schema_2_1_with_litter_diagnostics(tmp_path):
+    path = tmp_path / "clip_annotated_analysis.json"
+    payload = analysis_payload()
+    payload["schema_version"] = "2.1.0"
+    payload["litter_detection"] = {
+        "rtdetr_4channel": {
+            "enabled": True,
+            "candidate_count": 2,
+            "detected_frame_count": 1,
+            "detected_frames": [{"frame_index": 12, "candidate_count": 2}],
+        },
+        "geometry_passed": {
+            "candidate_count": 1,
+            "detected_frame_count": 1,
+            "detected_frames": [{"frame_index": 12, "candidate_count": 1}],
+        },
+        "motion_holding_passed": {
+            "candidate_count": 0,
+            "detected_frame_count": 0,
+            "detected_frames": [],
+        },
+        "confirmed_event_count": 0,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert load_analysis(path)["litter_detection"] == payload["litter_detection"]
 
 
 def test_config_reads_dotenv_without_overriding_exported_values(tmp_path):

@@ -1,6 +1,6 @@
 # Analysis JSON 輸出格式
 
-- Schema version：`2.0.0`
+- Schema version：`2.1.0`
 - 產生位置：與 annotated MP4 相同資料夾
 - 命名：`<影片名>_annotated_analysis.json`
 - 數量：每支輸入影片一份，不跨影片累積
@@ -19,10 +19,41 @@ Production 不再另外產生 `summary.json` 或 `events.jsonl`。JSON 先寫入
 
 ```json
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "video": {
     "file": "resize_annotated.mp4",
     "duration_sec": 135.0
+  },
+  "litter_detection": {
+    "rtdetr_4channel": {
+      "enabled": true,
+      "confidence_threshold": 0.4,
+      "evaluated_frame_count": 4020,
+      "vehicle_gate_skipped_frame_count": 30,
+      "candidate_count": 3,
+      "detected_frame_count": 2,
+      "detected_frames": [
+        {"frame_index": 870, "candidate_count": 1},
+        {"frame_index": 871, "candidate_count": 2}
+      ]
+    },
+    "geometry_passed": {
+      "candidate_count": 2,
+      "detected_frame_count": 2,
+      "detected_frames": [
+        {"frame_index": 870, "candidate_count": 1},
+        {"frame_index": 871, "candidate_count": 1}
+      ]
+    },
+    "motion_holding_passed": {
+      "candidate_count": 2,
+      "detected_frame_count": 2,
+      "detected_frames": [
+        {"frame_index": 870, "candidate_count": 1},
+        {"frame_index": 871, "candidate_count": 1}
+      ]
+    },
+    "confirmed_event_count": 1
   },
   "summary": {
     "litter_event_count": 1,
@@ -60,6 +91,25 @@ Production 不再另外產生 `summary.json` 或 `events.jsonl`。JSON 先寫入
 |---|---|---|
 | `file` | string / null | Annotated MP4 檔名 |
 | `duration_sec` | number | Annotated MP4 秒數 |
+
+### `litter_detection`
+
+這一區是 RT-DETR candidate 到 confirmed event 的執行診斷，不是人工標註或 accuracy。
+所有 `frame_index` 都是從 `0` 開始；同一幀可能有多個 bbox，因此
+`candidate_count` 是 bbox observation 數，不是影片中不重複的垃圾物件數。
+
+| 欄位 | 型別 | 說明 |
+|---|---|---|
+| `rtdetr_4channel.enabled` | boolean | 本次是否啟用 RT-DETR 4-channel branch |
+| `rtdetr_4channel.confidence_threshold` | number / null | 本次 `TRASH_CONF`；模型輸出低於此值不會進入 candidate |
+| `rtdetr_4channel.evaluated_frame_count` | integer | 車輛 gate 開啟且實際交由此 branch 評估的幀數 |
+| `rtdetr_4channel.vehicle_gate_skipped_frame_count` | integer | 因 vehicle gate 不 active 而略過 litter branch 的幀數；這些幀不能解讀為 RT-DETR 漏檢 |
+| `rtdetr_4channel.candidate_count` | integer | RT-DETR 輸出的 `litter` bbox 總數，尚未套用 geometry/motion/holding |
+| `rtdetr_4channel.detected_frame_count` | integer | 至少有一個 RT-DETR `litter` bbox 的幀數 |
+| `rtdetr_4channel.detected_frames` | object[] | 各辨識幀的 `frame_index` 與該幀 `candidate_count` |
+| `geometry_passed` | object | 通過 bbox 尺寸與長寬比後的相同三個統計欄位 |
+| `motion_holding_passed` | object | 再通過 camera-shake、motion、core-motion、vehicle FP 與 holding gate 後的相同三個統計欄位 |
+| `confirmed_event_count` | integer | 最終由 `GlobalLitterTracker` 確認的事件數，與 `summary.litter_event_count` 相同 |
 
 ### `summary`
 
@@ -109,6 +159,9 @@ Urinate 事件欄位：
 
 ## 證據限制
 
+- `rtdetr_4channel.candidate_count=0` 只能代表「有評估的幀沒有通過 `TRASH_CONF` 的
+  litter bbox」；若 `enabled=false` 或 `evaluated_frame_count=0`，不能解讀為模型漏檢。
+- `candidate_count` 是跨幀 bbox observation 數；同一實體可能連續多幀被計數。
 - Confidence 是模型分數，不是準確率。
 - `detection_accuracy` 沒有人工 reviewed labels 時必須保持 `null`。
 - `passed_vehicle_count` 以 tracker ID 計算；ID fragmentation 可能高估實際車數。

@@ -1,0 +1,44 @@
+# Supported environment: Python 3.11 on Linux x86_64.
+# Install with: conda run -n rtdetr python -m pip install -r requirements.txt
+
+# Production detection, tracking, geometry, and video I/O.
+numpy==1.26.4
+scipy==1.13.1
+opencv-python==4.10.0.84
+opencv-contrib-python==4.10.0.84
+torch==2.13.0
+torchvision==0.28.0
+ultralytics==8.4.127
+tqdm==4.70.0
+lap==0.5.13
+
+# NVIDIA inference acceleration and reproducible model export tooling.
+tensorrt==11.2.1.2
+nvidia-modelopt[onnx]==0.46.0
+onnx==1.21.0
+onnxruntime-gpu==1.24.4
+
+# Vendored MMAction2 1.2.0 / STGCN runtime.
+mmcv-lite==2.1.0
+mmengine==0.10.7
+einops==0.8.2
+matplotlib>=3.7,<3.11
+Pillow>=10,<13
+yapf==0.40.1
+
+# PaddleX single-model plate text recognition.
+paddlepaddle==3.3.1
+paddlex[ocr-core]==3.7.2
+
+# Flask review UI and reviewed-case spreadsheet export.
+Flask==3.1.2
+Werkzeug>=3.1,<4
+openpyxl==3.1.5
+
+# Repository unit/integration tests.
+pytest>=8,<10
+
+# Deliberately optional and therefore not installed here:
+# - transformers: guarded compatibility import; STGCN does not require it.
+# - paddleocr: legacy python_tools/tests only; production uses PaddleX.
+# - decord: generic MMAction video loader; production passes skeleton dicts.

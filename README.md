@@ -138,7 +138,9 @@ actor detections
   -> RTS smoothing
 
 litter trajectory
-  -> x-linear / y-quadratic reverse hypotheses
+  -> B0/B1 observation-gap release window
+  -> B0/B1/B2 early direction
+  -> constant-velocity / x-linear-y-quadratic reverse hypotheses
 
 release hypotheses + actor tracklets
   -> C_BA(litter, person)
@@ -164,6 +166,30 @@ OCR 只處理已可靠歸因的 vehicle/scooter ROI。無法辨識、低信心�
 ```bash
 conda run -n rtdetr ...
 ```
+
+### Python 依賴
+
+Production pipeline、vendored MMAction2/STGCN、Flask UI backend 與 repository
+測試所需的 Python 套件統一列在 root [`requirements.txt`](requirements.txt)。支援環境為
+Linux x86_64 + Python 3.11；首次建立環境與安裝：
+
+```bash
+conda create --override-channels -c conda-forge -n rtdetr python=3.11 pip -y
+conda install --override-channels -c conda-forge -n rtdetr "nodejs>=22.12,<23" -y
+conda run -n rtdetr python -m pip install --upgrade pip
+conda run -n rtdetr python -m pip install -r requirements.txt
+conda run -n rtdetr npm --prefix UI/frontend ci
+```
+
+GPU 加速與可重現模型匯出所需的 `tensorrt`、`nvidia-modelopt[onnx]`、`onnx`、
+`onnxruntime-gpu` 已納入
+requirements。Live code 會優先使用與 batch 相符的 TensorRT `.engine`，engine 缺失或
+不相容時回退 `.pt` 權重。`transformers`、legacy `paddleocr` 與 generic MMAction `decord`
+仍非 production 必要依賴：STGCN 直接接收 skeleton dict，不走 Decord 影片 loader；production
+車牌文字辨識使用 PaddleX，不使用 legacy PaddleOCR API。
+
+React/Vite 套件不放入 Python requirements，由 `UI/frontend/package-lock.json` 鎖定；
+使用 Node 22 與 `npm ci` 重建，不沿用從其他路徑複製的 `node_modules`。
 
 目前 `scripts/main.py` 只接受一個 positional video path；模型路徑、batch、threshold、
 device、motion 與輸出位置集中在 repository root 的 `.env`。首次 checkout 可由範本建立：
@@ -257,12 +283,15 @@ MP4 片段，並附一份列出違規、關聯車輛、車牌與審核資料的 
 | `SMART_BACKTRACK` | `1` | Smart attribution enable |
 | `SMART_BACKTRACK_SIDECAR` | `0` | Research candidate sidecar；需明確設 `1` 啟用 |
 | `SMART_BACKTRACK_STUDY_STAGE` | `full` | Research ablation stage；production 預設不變 |
+| `SMART_BACKTRACK_RAW_PREFIX` | `1` | confirmed event 才能使用 pre-postprocessing RT-DETR bbox 補 release trajectory；不參與 event confirmation |
 | `SMART_BACKTRACK_DT_DISTANCE_WEIGHT` | `1.0` | D+T stage 的 gate-normalized distance weight |
 | `SMART_BACKTRACK_DT_TIME_WEIGHT` | `1.0` | D+T stage 的 gate-normalized time weight |
-| `SMART_BACKTRACK_TWO_POINT_MAX_BACK_SEC` | `0.4` | 兩點 litter 軌跡最多反推秒數 |
+| `SMART_BACKTRACK_TWO_POINT_MAX_BACK_SEC` | `0.4` | 舊 replay 相容欄位；新版不再作為兩點軌跡的物理截止 |
 | `SMART_BACKTRACK_TWO_POINT_PRIOR_COST` | `1.0` | 兩點常速 release hypothesis 基礎 prior cost |
 | `SMART_BACKTRACK_MAX_FORWARD_RELEASE_SEC` | `0.5` | ballistic release window 可晚於 detector birth 的上限；仍受已觀測 airborne 軌跡限制 |
-| `LITTER_DEBUG` | `0` | 設為 `1` 時輸出逐幀診斷，並在 annotated video 顯示 person/vehicle/scooter track ID |
+| `SMART_BACKTRACK_RELEASE_WINDOW_WEIGHT` | `0.35` | 超出 B0/B1 零成本窗後，每一個 observation-gap 的軟性 prior 增量 |
+| `SMART_BACKTRACK_BC_BOUNDARY_DEPTH_WEIGHT` | `0.0` | `full/reverse` 中 release 點位於 vehicle bbox 深處的軟成本；`0` 關閉，須經 reviewed replay 後才啟用 |
+| `LITTER_DEBUG` | `0` | 設為 `1` 時輸出逐幀診斷；annotated video 顯示 actor track ID，並以洋紅框顯示 RT-DETR 通過 class/confidence、但尚未經 geometry/motion/holding/tracker 後處理的 litter bbox 與 confidence |
 | `OUTPUT_ROOT` | `.` | Output directory；建議明確設為 `output` |
 
 其餘 action smoothing、video I/O、writer、Smart Backtrack 與 legacy research 開關都已列在
@@ -318,6 +347,18 @@ reviewed annotation 時只產生 candidate diagnostics，不能輸出 accuracy �
 cost component。Kalman 補點只提供位置；D+T 的時間差仍取最近真實 detection
 frame，不會因預測點剛好落在 release frame 就被改寫為零。
 
+`reverse/full` 的 release 時間先驗只使用同一條 confirmed litter track 的
+accepted RT-DETR observations。令 `B0`、`B1`、`B2` 為前三個不同 detection
+frame，`H0 = T_B1 - T_B0`，零成本可疑窗為
+`I0 = [T_B0 - H0, T_B0]`。候選時間 `T_r` 超出此窗時才加入
+軟性 prior；反向區使用
+`lambda_w * (T_B0 - H0 - T_r) / H0`，birth 後的已觀測 airborne 區則保留
+`lambda_f * (T_r - T_B0) / FPS`，不作 hard reject。早期來源方向取
+`-(p_B1-p_B0)`，`B2` 只用來計算相鄰速度 cosine consistency。
+`confirm_frame` 不參與 window 或方向。`SMART_BACKTRACK_MAX_BACK_FRAMES`
+仍限制枚舉量，但 sidecar 會標記 `search_truncated`，不可把它解讀成物理上
+不可能更早 release。
+
 建立人工盲標 queue 時使用 `scripts/backtrack_annotations.py init`；輸出的
 annotation schema 不複製 selected route、cost、rank 或 release prediction。
 
@@ -348,8 +389,12 @@ output/resize_annotated_analysis.json
 前端單檔資料源；不跨影片累積狀態。寫檔使用 `.tmp` 後 atomic replace，避免網頁讀到
 半份 JSON。Production 不再另外輸出 `summary.json` 或 `events.jsonl`。
 
-Schema version `2.0.0` 只保留 `video`、`summary`、`events` 三區，供
-`scripts/frontend/dashboard.html` 直接載入。完整欄位、範例與證據限制見
+Schema version `2.1.0` 保留 `video`、`summary`、`events`，並加入
+`litter_detection`：逐層列出 RT-DETR 4-channel 原始 candidate、geometry 通過、
+motion/holding 通過的 bbox observation 總數與 0-based 幀號，最後另列 confirmed event
+數。這能區分「模型沒有輸出」、「後處理淘汰」與「tracker 未確認」；candidate 仍不是
+confirmed event 或 accuracy。`scripts/frontend/dashboard.html` 可直接載入。完整欄位、
+範例與證據限制見
 [`scripts/pipeline/ANALYSIS_JSON.md`](scripts/pipeline/ANALYSIS_JSON.md)。
 
 `SMART_BACKTRACK_SIDECAR=0` 為預設。研究時明確設為 `1` 才會額外輸出

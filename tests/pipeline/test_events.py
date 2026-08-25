@@ -204,8 +204,29 @@ def test_analysis_report_is_compact_and_keeps_accuracy_boundary(tmp_path):
             "output_video": str(output_video),
             "processed_frames": 300,
             "total_frames": 300,
+            "rtdetr_enabled": True,
+            "rtdetr_confidence_threshold": 0.4,
+            "rtdetr_evaluated_frames": 280,
+            "vehicle_gate_skipped_frames": 20,
+            "rtdetr_litter_candidates": 9,
+            "rtdetr_litter_candidate_frames": [
+                {"frame_index": 10, "candidate_count": 2},
+                {"frame_index": 11, "candidate_count": 1},
+                {"frame_index": 12, "candidate_count": 4},
+                {"frame_index": 20, "candidate_count": 2},
+            ],
             "raw_litter_candidates": 7,
+            "geometry_litter_candidate_frames": [
+                {"frame_index": 10, "candidate_count": 2},
+                {"frame_index": 11, "candidate_count": 1},
+                {"frame_index": 12, "candidate_count": 3},
+                {"frame_index": 20, "candidate_count": 1},
+            ],
             "filtered_litter_candidates": 2,
+            "filtered_litter_candidate_frames": [
+                {"frame_index": 10, "candidate_count": 1},
+                {"frame_index": 12, "candidate_count": 1},
+            ],
             "raw_litter_candidate_confidence_mean": 0.61,
             "raw_litter_candidate_confidence_max": 0.93,
             "filtered_litter_candidate_confidence_mean": 0.81,
@@ -217,12 +238,49 @@ def test_analysis_report_is_compact_and_keeps_accuracy_boundary(tmp_path):
         vehicle_history,
         fps=30,
     )
-    assert set(report) == {"schema_version", "video", "summary", "events"}
+    assert set(report) == {
+        "schema_version", "video", "litter_detection", "summary", "events"
+    }
     assert report["video"] == {
         "file": "scene_annotated.mp4",
         "duration_sec": 10.0,
     }
-    assert report["schema_version"] == "2.0.0"
+    assert report["schema_version"] == "2.1.0"
+    assert report["litter_detection"] == {
+        "rtdetr_4channel": {
+            "enabled": True,
+            "confidence_threshold": 0.4,
+            "evaluated_frame_count": 280,
+            "vehicle_gate_skipped_frame_count": 20,
+            "candidate_count": 9,
+            "detected_frame_count": 4,
+            "detected_frames": [
+                {"frame_index": 10, "candidate_count": 2},
+                {"frame_index": 11, "candidate_count": 1},
+                {"frame_index": 12, "candidate_count": 4},
+                {"frame_index": 20, "candidate_count": 2},
+            ],
+        },
+        "geometry_passed": {
+            "candidate_count": 7,
+            "detected_frame_count": 4,
+            "detected_frames": [
+                {"frame_index": 10, "candidate_count": 2},
+                {"frame_index": 11, "candidate_count": 1},
+                {"frame_index": 12, "candidate_count": 3},
+                {"frame_index": 20, "candidate_count": 1},
+            ],
+        },
+        "motion_holding_passed": {
+            "candidate_count": 2,
+            "detected_frame_count": 2,
+            "detected_frames": [
+                {"frame_index": 10, "candidate_count": 1},
+                {"frame_index": 12, "candidate_count": 1},
+            ],
+        },
+        "confirmed_event_count": 1,
+    }
     assert report["summary"]["litter_event_count"] == 1
     assert report["summary"]["urinate_event_count"] == 0
     assert report["summary"]["passed_vehicle_count"] == 2
@@ -250,6 +308,39 @@ def test_analysis_report_is_compact_and_keeps_accuracy_boundary(tmp_path):
     parsed = json.loads(path.read_text(encoding="utf-8"))
     assert parsed == report
     assert not (tmp_path / "scene_annotated_analysis.json.tmp").exists()
+
+
+def test_analysis_keeps_raw_rtdetr_frames_when_nothing_is_confirmed():
+    report = build_analysis_report(
+        {
+            "processed_frames": 90,
+            "rtdetr_enabled": True,
+            "rtdetr_confidence_threshold": 0.4,
+            "rtdetr_evaluated_frames": 75,
+            "vehicle_gate_skipped_frames": 15,
+            "rtdetr_litter_candidates": 3,
+            "rtdetr_litter_candidate_frames": [
+                {"frame_index": 40, "candidate_count": 1},
+                {"frame_index": 41, "candidate_count": 2},
+            ],
+            "raw_litter_candidates": 0,
+            "filtered_litter_candidates": 0,
+        },
+        [],
+        {},
+        fps=30,
+    )
+
+    diagnostics = report["litter_detection"]
+    assert diagnostics["rtdetr_4channel"]["candidate_count"] == 3
+    assert diagnostics["rtdetr_4channel"]["detected_frame_count"] == 2
+    assert diagnostics["rtdetr_4channel"]["detected_frames"] == [
+        {"frame_index": 40, "candidate_count": 1},
+        {"frame_index": 41, "candidate_count": 2},
+    ]
+    assert diagnostics["geometry_passed"]["candidate_count"] == 0
+    assert diagnostics["motion_holding_passed"]["candidate_count"] == 0
+    assert diagnostics["confirmed_event_count"] == 0
 
 
 def test_analysis_compacts_urinate_event():

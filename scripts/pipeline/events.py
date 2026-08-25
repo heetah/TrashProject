@@ -3,9 +3,9 @@
 
 事件建構為純函式，不依賴 GPU/模型，可獨立單元測試。
 
-``analysis.json`` 是前端唯一資料檔，只保留影片長度、confirmed 事件數、
-通行車輛估計、confidence、車牌與精簡事件。沒有人工 reviewed ground truth 時，
-accuracy 固定為 ``null``，不可把 confidence 當成 accuracy。
+``analysis.json`` 是前端唯一資料檔，保留影片長度、RT-DETR/後處理逐幀診斷、
+confirmed 事件數、通行車輛估計、confidence、車牌與精簡事件。沒有人工 reviewed
+ground truth 時，accuracy 固定為 ``null``，不可把 confidence 當成 accuracy。
 
 事件 schema(每行一個 JSON 物件):
   litter:  {type:"litter", frame_index, time_sec, litter_id, bbox:[x1,y1,x2,y2],
@@ -19,7 +19,7 @@ import os
 from pathlib import Path
 
 VEHICLE_LIKE = ("vehicle", "scooter")
-ANALYSIS_SCHEMA_VERSION = "2.0.0"
+ANALYSIS_SCHEMA_VERSION = "2.1.0"
 
 
 def _time_sec(frame_index, fps):
@@ -273,6 +273,39 @@ def _mean(values):
     return _rounded(sum(numbers) / len(numbers)) if numbers else None
 
 
+def _candidate_frame_records(value):
+    """正規化逐幀 candidate 計數；重複幀會合併，輸出依 0-based 幀號排序。"""
+    totals = {}
+    for item in value if isinstance(value, (list, tuple)) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            frame_index = int(item.get("frame_index"))
+            candidate_count = int(item.get("candidate_count"))
+        except (TypeError, ValueError):
+            continue
+        if frame_index < 0 or candidate_count <= 0:
+            continue
+        totals[frame_index] = totals.get(frame_index, 0) + candidate_count
+    return [
+        {"frame_index": frame_index, "candidate_count": totals[frame_index]}
+        for frame_index in sorted(totals)
+    ]
+
+
+def _candidate_stage(run_summary, count_key, frames_key):
+    frames = _candidate_frame_records(run_summary.get(frames_key))
+    try:
+        candidate_count = max(0, int(run_summary.get(count_key, 0) or 0))
+    except (TypeError, ValueError):
+        candidate_count = sum(item["candidate_count"] for item in frames)
+    return {
+        "candidate_count": candidate_count,
+        "detected_frame_count": len(frames),
+        "detected_frames": frames,
+    }
+
+
 def _compact_analysis_event(event):
     if event.get("type") == "litter":
         segment = event.get("time_segment") or {}
@@ -346,6 +379,36 @@ def build_analysis_report(
         "video": {
             "file": Path(output_video).name if output_video else None,
             "duration_sec": _rounded(duration_sec, 3),
+        },
+        "litter_detection": {
+            "rtdetr_4channel": {
+                "enabled": bool(run_summary.get("rtdetr_enabled", False)),
+                "confidence_threshold": _rounded(
+                    run_summary.get("rtdetr_confidence_threshold")
+                ),
+                "evaluated_frame_count": max(
+                    0, int(run_summary.get("rtdetr_evaluated_frames", 0) or 0)
+                ),
+                "vehicle_gate_skipped_frame_count": max(
+                    0, int(run_summary.get("vehicle_gate_skipped_frames", 0) or 0)
+                ),
+                **_candidate_stage(
+                    run_summary,
+                    "rtdetr_litter_candidates",
+                    "rtdetr_litter_candidate_frames",
+                ),
+            },
+            "geometry_passed": _candidate_stage(
+                run_summary,
+                "raw_litter_candidates",
+                "geometry_litter_candidate_frames",
+            ),
+            "motion_holding_passed": _candidate_stage(
+                run_summary,
+                "filtered_litter_candidates",
+                "filtered_litter_candidate_frames",
+            ),
+            "confirmed_event_count": len(litter_events),
         },
         "summary": {
             "litter_event_count": len(litter_events),

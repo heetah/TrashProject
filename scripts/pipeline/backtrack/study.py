@@ -59,6 +59,7 @@ class StudyConfig:
     two_point_max_back_seconds: float = 0.4
     two_point_prior_cost: float = 1.0
     max_forward_release_seconds: float = 0.5
+    release_window_prior_weight: float = 0.35
     distance_weight: float = 1.0
     time_weight: float = 1.0
     kalman_process_noise_scale: float = 1.0
@@ -66,6 +67,10 @@ class StudyConfig:
     kalman_max_extrapolation_seconds: Optional[float] = None
     confidence_weighted_trajectory: Optional[bool] = None
     ac_overlap_weight: Optional[float] = None
+    bc_exit_deficit_weight: float = 0.0
+    bc_relative_motion_deficit_weight: float = 0.0
+    bc_reverse_direction_weight: float = 0.0
+    bc_boundary_depth_weight: float = 0.0
 
     def __post_init__(self):
         if self.stage not in {
@@ -83,12 +88,22 @@ class StudyConfig:
             raise ValueError("two_point_prior_cost must be non-negative")
         if self.max_forward_release_seconds < 0.0:
             raise ValueError("max_forward_release_seconds must be non-negative")
+        if self.release_window_prior_weight < 0.0:
+            raise ValueError("release_window_prior_weight must be non-negative")
         if self.distance_weight < 0.0 or self.time_weight < 0.0:
             raise ValueError("distance/time weights must be non-negative")
         if self.distance_weight + self.time_weight <= 0.0:
             raise ValueError("at least one distance/time weight must be positive")
         if self.ac_overlap_weight is not None and self.ac_overlap_weight < 0.0:
             raise ValueError("ac_overlap_weight must be non-negative")
+        for name in (
+            "bc_exit_deficit_weight",
+            "bc_relative_motion_deficit_weight",
+            "bc_reverse_direction_weight",
+            "bc_boundary_depth_weight",
+        ):
+            if float(getattr(self, name)) < 0.0:
+                raise ValueError("{} must be non-negative".format(name))
         if self.kalman_process_noise_scale <= 0.0:
             raise ValueError("kalman_process_noise_scale must be positive")
         if self.kalman_measurement_noise_scale <= 0.0:
@@ -124,6 +139,28 @@ class StudyConfig:
                     "overlap": float(self.ac_overlap_weight),
                 },
             )
+        if any((
+            self.bc_exit_deficit_weight,
+            self.bc_relative_motion_deficit_weight,
+            self.bc_reverse_direction_weight,
+            self.bc_boundary_depth_weight,
+        )):
+            cost_config = replace(
+                cost_config,
+                bc_weights={
+                    **cost_config.bc_weights,
+                    "exit_deficit": float(self.bc_exit_deficit_weight),
+                    "relative_motion_deficit": float(
+                        self.bc_relative_motion_deficit_weight
+                    ),
+                    "reverse_direction": float(
+                        self.bc_reverse_direction_weight
+                    ),
+                    "boundary_depth": float(
+                        self.bc_boundary_depth_weight
+                    ),
+                },
+            )
         use_kalman_rts = self.stage in {
             "kalman_rts", "uncertainty", "reverse", "full"
         }
@@ -145,6 +182,9 @@ class StudyConfig:
             two_point_prior_cost=float(self.two_point_prior_cost),
             max_forward_release_seconds=float(
                 self.max_forward_release_seconds
+            ),
+            release_window_prior_weight=float(
+                self.release_window_prior_weight
             ),
             cost_config=cost_config,
             use_kalman_rts=use_kalman_rts,

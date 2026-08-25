@@ -14,7 +14,7 @@
   -> output/ui_runs/<job-id>/
        <name>_annotated.mp4
        <name>_annotated_analysis.json
-  -> Flask 驗證 schema 2.0.0 並提供 JSON/media API
+  -> Flask 驗證 schema 2.0.0／2.1.0 並提供 JSON/media API
   -> React 未審核／已審核頁
   -> SQLite 保存逐事件 accepted/rejected、審核者與備註
   -> 已審核 accepted 事件匯出 MP4 片段 + Excel ZIP
@@ -77,12 +77,16 @@ UI_ALLOWED_INPUT_ROOTS=/home/se_copilot/trashProject/resources,/mnt/video_archiv
 首次安裝：
 
 ```bash
-conda run -n rtdetr python -m pip install -r UI/backend/requirements.txt
+conda run -n rtdetr python -m pip install -r requirements.txt
 cd UI/frontend
-npm install
+npm ci
 npm run build
 cd ../..
 ```
+
+Frontend 目前的 Vite 需要 Node `^20.19.0 || >=22.12.0`；本專案驗證版本為
+Node 22。`npm ci` 依 `package-lock.json` 從乾淨狀態重建依賴與 `.bin` symlink，適合 checkout
+與部署驗證；不要直接複製其他 checkout 的 `node_modules`。
 
 匯出片段另需主機可執行 FFmpeg；若執行檔不在 `PATH`，以
 `UI_FFMPEG_EXECUTABLE` 指定絕對路徑。
@@ -136,5 +140,6 @@ Vite 會把 `/api` proxy 到 `VITE_API_PROXY_TARGET`。不要同時啟動多個
 - 內建 worker 只回報 queued/running/completed/failed，沒有逐 frame 百分比。
 - 一個 Flask process 只跑一個 pipeline worker；多 GPU／多人 production deployment
   需要把 queue 與 worker 拆成獨立服務。
-- UI 只讀 production schema 2.0.0，不顯示 research backtrack sidecar，也不把
-  candidate route 當 ground truth。
+- UI 可讀既有 production schema `2.0.0` 與含 `litter_detection` 診斷的 `2.1.0`；
+  React 目前仍以 confirmed events 為主要畫面，不顯示 research backtrack sidecar，也不把
+  candidate 或 route 當 ground truth。

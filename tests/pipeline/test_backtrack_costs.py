@@ -3,6 +3,7 @@ import pytest
 
 from pipeline.backtrack.costs import (
     ActorObservation,
+    BacktrackCostConfig,
     compute_c_ac,
     compute_c_ba,
     compute_c_bc,
@@ -101,26 +102,39 @@ def test_release_hypotheses_fall_back_to_birth_when_fit_is_impossible():
     np.testing.assert_allclose(hypotheses[0].mean_uv, [12.0, 34.0])
 
 
-def test_two_point_release_uses_constant_velocity_with_bounded_horizon():
+def test_two_point_release_uses_gap_window_and_computational_guard():
     hypotheses = build_release_hypotheses(
         points_uv=[(100.0, 200.0), (110.0, 220.0)],
         frame_indices=[20, 22],
         birth_frame=20,
-        max_back_frames=50,
+        max_back_frames=10,
         fps=10,
         two_point_max_back_seconds=0.3,
         two_point_prior_cost=1.0,
     )
 
-    assert [item.frame_index for item in hypotheses] == [17, 18, 19, 20]
+    # The legacy 0.3-second value is no longer a physical cutoff. The 10-frame
+    # max_back guard keeps all hypotheses available for later cost comparison.
+    assert [item.frame_index for item in hypotheses] == list(range(10, 21))
     assert all(item.model == "constant_velocity_2point" for item in hypotheses)
     np.testing.assert_allclose(hypotheses[-1].mean_uv, [100.0, 200.0])
-    np.testing.assert_allclose(hypotheses[0].mean_uv, [85.0, 170.0])
+    np.testing.assert_allclose(hypotheses[0].mean_uv, [50.0, 100.0])
     np.testing.assert_allclose(hypotheses[-1].velocity_uv, [50.0, 100.0])
     assert np.trace(hypotheses[0].covariance_uv) > np.trace(
         hypotheses[-1].covariance_uv
     )
-    assert hypotheses[0].prior_cost > hypotheses[-1].prior_cost == 1.0
+    by_frame = {item.frame_index: item for item in hypotheses}
+    assert by_frame[18].prior_cost == by_frame[20].prior_cost == 1.0
+    assert by_frame[17].prior_cost > 1.0
+    assert by_frame[17].window_prior_cost > 0.0
+    assert by_frame[20].observation_gap_frames == 2
+    assert by_frame[20].zero_cost_window_start_frame == 18
+    assert by_frame[20].zero_cost_window_end_frame == 20
+    assert by_frame[20].source_direction_uv == pytest.approx(
+        (-1.0 / np.sqrt(5.0), -2.0 / np.sqrt(5.0))
+    )
+    assert by_frame[20].search_truncated is True
+    assert by_frame[20].truncation_reason == "max_back_frames_computational_guard"
 
 
 def test_two_point_release_is_fps_invariant_in_seconds():
@@ -150,7 +164,57 @@ def test_ballistic_release_window_may_extend_after_detector_birth():
 
     assert [item.frame_index for item in hypotheses] == [18, 19, 20, 21, 22, 23]
     assert hypotheses[2].prior_cost == 0.0
-    assert hypotheses[-1].prior_cost > 0.0
+    # Forward frames are observed-airborne candidates, so they keep the
+    # seconds-based prior rather than the reverse observation-gap denominator.
+    assert hypotheses[-1].prior_cost == pytest.approx(0.35 * 0.3)
+
+
+def test_three_point_direction_uses_b0_b1_b2_and_reports_consistency():
+    hypotheses = build_release_hypotheses(
+        points_uv=[(10.0, 10.0), (12.0, 10.0), (14.0, 10.0)],
+        frame_indices=[20, 22, 24],
+        birth_frame=20,
+        max_back_frames=4,
+        fps=10,
+    )
+
+    assert hypotheses
+    assert hypotheses[0].direction_consistency == pytest.approx(1.0)
+    assert hypotheses[0].source_direction_uv == pytest.approx((-1.0, 0.0))
+    assert hypotheses[0].zero_cost_window_start_frame == 18
+
+
+def test_release_window_uses_earliest_recovered_observation_not_tracker_birth():
+    hypotheses = build_release_hypotheses(
+        points_uv=[(10.0, 10.0), (12.0, 10.0), (14.0, 11.0)],
+        frame_indices=[18, 20, 22],
+        birth_frame=20,
+        max_back_frames=4,
+        fps=10,
+    )
+
+    assert hypotheses
+    assert hypotheses[0].observation_gap_frames == 2
+    assert hypotheses[0].zero_cost_window_start_frame == 16
+    assert hypotheses[0].zero_cost_window_end_frame == 18
+
+
+def test_gap_window_keeps_older_release_with_soft_penalty():
+    hypotheses = build_release_hypotheses(
+        points_uv=[(100.0, 100.0), (110.0, 100.0)],
+        frame_indices=[20, 21],
+        birth_frame=20,
+        max_back_frames=12,
+        fps=10,
+        window_prior_weight=0.5,
+    )
+    by_frame = {item.frame_index: item for item in hypotheses}
+
+    assert 10 in by_frame  # B0 - 1 second is retained at 10 FPS.
+    assert by_frame[19].window_prior_cost == 0.0
+    assert by_frame[20].window_prior_cost == 0.0
+    assert by_frame[18].window_prior_cost == pytest.approx(0.5)
+    assert by_frame[10].window_prior_cost == pytest.approx(4.5)
 
 
 def test_c_bc_emits_zero_weight_causality_diagnostics_without_changing_total():
@@ -176,6 +240,37 @@ def test_c_bc_emits_zero_weight_causality_diagnostics_without_changing_total():
     assert set((
         "reverse_direction", "exit_deficit", "relative_motion_deficit"
     )).issubset(with_context.raw_features)
+
+
+def test_c_bc_boundary_depth_penalizes_deep_bbox_containment_only_when_enabled():
+    vehicle = [ActorObservation(
+        cls_name="vehicle",
+        track_id=2,
+        frame_index=10,
+        bbox=(0.0, 0.0, 200.0, 100.0),
+    )]
+    deep_release = _release(10, (100.0, 50.0))
+    edge_release = _release(10, (-5.0, 50.0))
+    baseline_deep = compute_c_bc([deep_release], vehicle, fps=10)
+    baseline_edge = compute_c_bc([edge_release], vehicle, fps=10)
+    weighted_config = BacktrackCostConfig(
+        bc_weights={
+            **BacktrackCostConfig().bc_weights,
+            "boundary_depth": 0.5,
+        }
+    )
+    weighted_deep = compute_c_bc(
+        [deep_release], vehicle, fps=10, cost_config=weighted_config
+    )
+    weighted_edge = compute_c_bc(
+        [edge_release], vehicle, fps=10, cost_config=weighted_config
+    )
+
+    assert baseline_deep.raw_features["boundary_depth"] == pytest.approx(1.0)
+    assert baseline_edge.raw_features["boundary_depth"] == pytest.approx(0.0)
+    assert baseline_deep.weights["boundary_depth"] == pytest.approx(0.0)
+    assert weighted_deep.total == pytest.approx(baseline_deep.total + 0.5)
+    assert weighted_edge.total == pytest.approx(baseline_edge.total)
 
 
 def test_c_ba_uses_upper_body_release_zone_not_person_footpoint():

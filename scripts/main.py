@@ -285,8 +285,13 @@ if __name__ == "__main__":
             # 違規顯示快取：僅用於畫面標註持續時間
             violator_display_cache = {}
             detection_stats = {
+                'rtdetr_evaluated_frames': 0,
+                'rtdetr_litter_candidates': 0,
+                'rtdetr_litter_candidate_frames': [],
                 'raw_litter_candidates': 0,
+                'geometry_litter_candidate_frames': [],
                 'filtered_litter_candidates': 0,
+                'filtered_litter_candidate_frames': [],
                 'confirmed_litter_ids': set(),
                 'confirmed_litter_frame_hits': 0,
                 'confirmed_litter_thrower_ids': set(),
@@ -468,7 +473,8 @@ if __name__ == "__main__":
             stgcn_urinate_confirmed = int(detection_stats.get('stgcn_urinate_confirmed', 0))
             print(
                 "Litter detection summary: "
-                f"raw_candidates={detection_stats.get('raw_litter_candidates', 0)}, "
+                f"rtdetr_candidates={detection_stats.get('rtdetr_litter_candidates', 0)}, "
+                f"geometry_passed_candidates={detection_stats.get('raw_litter_candidates', 0)}, "
                 f"motion_filtered_candidates={detection_stats.get('filtered_litter_candidates', 0)}, "
                 f"confirmed_ids={len(confirmed_litter_ids)}, "
                 f"confirmed_frame_hits={detection_stats.get('confirmed_litter_frame_hits', 0)}, "
@@ -501,8 +507,24 @@ if __name__ == "__main__":
                 "stgcn_pose_enabled": True,
                 "plate_enabled": _RTDETR_ENABLED,
                 "duration_sec": round(int(processed_frames) / float(fps), 3),
+                "rtdetr_confidence_threshold": float(cfg.trash_conf),
+                "rtdetr_evaluated_frames": int(
+                    detection_stats.get('rtdetr_evaluated_frames', 0)
+                ),
+                "rtdetr_litter_candidates": int(
+                    detection_stats.get('rtdetr_litter_candidates', 0)
+                ),
+                "rtdetr_litter_candidate_frames": list(
+                    detection_stats.get('rtdetr_litter_candidate_frames', [])
+                ),
                 "raw_litter_candidates": int(detection_stats.get('raw_litter_candidates', 0)),
+                "geometry_litter_candidate_frames": list(
+                    detection_stats.get('geometry_litter_candidate_frames', [])
+                ),
                 "filtered_litter_candidates": int(detection_stats.get('filtered_litter_candidates', 0)),
+                "filtered_litter_candidate_frames": list(
+                    detection_stats.get('filtered_litter_candidate_frames', [])
+                ),
                 "confirmed_litter_ids": len(confirmed_litter_ids),
                 "confirmed_litter_frame_hits": int(detection_stats.get('confirmed_litter_frame_hits', 0)),
                 "confirmed_litter_thrower_ids": len(confirmed_litter_thrower_ids),

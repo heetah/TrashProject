@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Kalman/RTS + reverse trajectory + explicit costs + min-cost-flow resolver."""
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 import os
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -58,6 +58,7 @@ class SmartBacktrackConfig:
     two_point_max_back_seconds: float = 0.4
     two_point_prior_cost: float = 1.0
     max_forward_release_seconds: float = 0.5
+    release_window_prior_weight: float = 0.35
     cost_config: BacktrackCostConfig = field(default_factory=BacktrackCostConfig)
     # Research switches default to the current production behavior.  They are
     # intentionally constructor-only; production never reads them from env.
@@ -72,8 +73,8 @@ class SmartBacktrackConfig:
 
     @classmethod
     def from_env(cls, fps=10.0):
-        # 24 frames was the original 10 FPS research window (=2.4 s).
-        # Scale the default with FPS so the physical look-back duration stays fixed.
+        # 24 frames was the original 10 FPS research search span (=2.4 s).
+        # Scale the computational guard with FPS; it is not a physical gate.
         default_max_back = max(1, int(round(float(fps or 10.0) * 2.4)))
         study_stage = str(
             os.environ.get("SMART_BACKTRACK_STUDY_STAGE", "full")
@@ -91,6 +92,23 @@ class SmartBacktrackConfig:
         )
         if distance_weight + time_weight <= 0.0:
             distance_weight = time_weight = 1.0
+        cost_config = BacktrackCostConfig.for_stage(
+            study_stage,
+            distance_weight=distance_weight,
+            time_weight=time_weight,
+        )
+        boundary_depth_weight = max(
+            0.0,
+            _float_env("SMART_BACKTRACK_BC_BOUNDARY_DEPTH_WEIGHT", 0.0),
+        )
+        if study_stage in {"reverse", "full"} and boundary_depth_weight > 0.0:
+            cost_config = replace(
+                cost_config,
+                bc_weights={
+                    **cost_config.bc_weights,
+                    "boundary_depth": boundary_depth_weight,
+                },
+            )
         return cls(
             max_back_frames=max(
                 1,
@@ -124,11 +142,11 @@ class SmartBacktrackConfig:
                 0.0,
                 _float_env("SMART_BACKTRACK_MAX_FORWARD_RELEASE_SEC", 0.5),
             ),
-            cost_config=BacktrackCostConfig.for_stage(
-                study_stage,
-                distance_weight=distance_weight,
-                time_weight=time_weight,
+            release_window_prior_weight=max(
+                0.0,
+                _float_env("SMART_BACKTRACK_RELEASE_WINDOW_WEIGHT", 0.35),
             ),
+            cost_config=cost_config,
             use_kalman_rts=study_stage in {
                 "kalman_rts", "uncertainty", "reverse", "full"
             },
@@ -315,6 +333,17 @@ def _release_hypothesis_payload(release):
         "velocity_uv": [float(value) for value in release.velocity_uv],
         "model": str(release.model),
         "prior_cost": float(release.prior_cost),
+        "observation_gap_frames": release.observation_gap_frames,
+        "zero_cost_window_start_frame": release.zero_cost_window_start_frame,
+        "zero_cost_window_end_frame": release.zero_cost_window_end_frame,
+        "window_prior_cost": float(release.window_prior_cost),
+        "direction_consistency": release.direction_consistency,
+        "source_direction_uv": (
+            list(release.source_direction_uv)
+            if release.source_direction_uv is not None else None
+        ),
+        "search_truncated": bool(release.search_truncated),
+        "truncation_reason": release.truncation_reason,
     }
 
 
@@ -422,6 +451,7 @@ class SmartBacktrackResolver:
             two_point_max_back_seconds=self.config.two_point_max_back_seconds,
             two_point_prior_cost=self.config.two_point_prior_cost,
             max_forward_release_seconds=self.config.max_forward_release_seconds,
+            window_prior_weight=self.config.release_window_prior_weight,
         )
 
     def _build_actor_tracks(self, task):
@@ -891,6 +921,11 @@ class SmartBacktrackResolver:
                 "ac_weight": float(self.config.ac_weight),
                 "bc_support_bonus": float(self.config.bc_support_bonus),
                 "sigma_floor_px": float(self.config.sigma_floor_px),
+                "release_window_prior_weight": float(
+                    self.config.release_window_prior_weight
+                ),
+                "release_window_semantics": "B0_B1_observation_gap_soft_prior",
+                "max_back_semantics": "computational_guard_not_physical_gate",
                 "use_kalman_rts": bool(self.config.use_kalman_rts),
                 "confidence_aware_kalman": bool(
                     self.config.confidence_aware_kalman

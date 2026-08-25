@@ -44,9 +44,17 @@ Semantics:
   a vehicle, walk away, then throw.
 - Person pruning ranks completed `B->A->C` routes, not `C_BA` alone.
 - A one-point litter history receives a dustbin-level prior. Two distinct
-  observations use a constant-velocity reverse hypothesis for at most 0.4 s,
-  with anisotropic covariance growth and an explicit short-track prior;
-  three or more points use the ballistic model.
+  observations use a constant-velocity reverse hypothesis with anisotropic
+  covariance growth and an explicit short-track prior; three or more points
+  use the ballistic model. The legacy 0.4 s option is replay-compatible only
+  and no longer truncates the physical candidate set.
+- Let `B0/B1/B2` be the first three distinct accepted litter detections.
+  `H0=T_B1-T_B0` defines the zero-cost interval
+  `I0=[T_B0-H0,T_B0]`. Before that interval, the time prior is
+  `lambda_w*(T_B0-H0-T_r)/H0`; post-birth points on the observed airborne
+  path retain `lambda_f*(T_r-T_B0)/FPS`. Candidates remain available. Early source
+  direction is opposite `B0->B1`, while `B2` supplies a velocity-cosine
+  consistency diagnostic. `confirm_frame` participates in neither calculation.
 - Litter confirmation requires an actor already supported at the release/birth
   observation; a later passer-by cannot retroactively confirm detector noise.
 - Rise-then-fall tracks use descent from their internal apex, so a real arc may
@@ -65,8 +73,9 @@ Production entrypoint 會從 repository root `.env` 載入以下控制項；shel
 
 ```text
 SMART_BACKTRACK=1
-SMART_BACKTRACK_MAX_BACK_FRAMES=<2.4 seconds worth of frames; 24 at 10 FPS>
+SMART_BACKTRACK_MAX_BACK_FRAMES=<2.4 seconds worth of frames; 24 at 10 FPS; computational guard>
 SMART_BACKTRACK_CONTEXT_SEC=10.0
+SMART_BACKTRACK_RAW_PREFIX=1
 SMART_BACKTRACK_TOPK_PERSON=5
 SMART_BACKTRACK_TOPK_VEHICLE=5
 SMART_BACKTRACK_DUSTBIN_COST=7.0
@@ -74,15 +83,24 @@ SMART_BACKTRACK_NULL_VEHICLE_COST=1.4
 SMART_BACKTRACK_DIRECT_VEHICLE_COST=0.9
 SMART_BACKTRACK_AC_WEIGHT=0.75
 SMART_BACKTRACK_BC_SUPPORT_BONUS=0.25
+SMART_BACKTRACK_BC_BOUNDARY_DEPTH_WEIGHT=0.0
 SMART_BACKTRACK_SIGMA_FLOOR=2.0
 SMART_BACKTRACK_TWO_POINT_MAX_BACK_SEC=0.4
 SMART_BACKTRACK_TWO_POINT_PRIOR_COST=1.0
 SMART_BACKTRACK_MAX_FORWARD_RELEASE_SEC=0.5
+SMART_BACKTRACK_RELEASE_WINDOW_WEIGHT=0.35
 SMART_BACKTRACK_SIDECAR=0
 SMART_BACKTRACK_STUDY_STAGE=full  # full | distance_time | kalman_rts | confidence | uncertainty | reverse
 SMART_BACKTRACK_DT_DISTANCE_WEIGHT=1.0
 SMART_BACKTRACK_DT_TIME_WEIGHT=1.0
 ```
+
+Confirmed litter 送入 resolver 前，tracker 可從尚未經 geometry/motion/
+holding 後處理的 RT-DETR bbox，向前恢復連續的 raw trajectory prefix。
+Raw bbox 只補 release trajectory；不能建立、延長或確認 litter event。
+`C_BC` 的 `boundary_depth` 是 release 點到原始 vehicle bbox 最近邊界的
+正規化深度。它用來降低巨大遮擋 bbox 把鄰車 release 點吃進車體深處的
+優勢，仍是 soft cost，不會放寬任何 physical hard gate。
 
 `SMART_BACKTRACK=0` keeps the legacy resolver available as a rollback path.
 When smart mode is enabled, the legacy heuristic is used only if the smart
@@ -118,6 +136,9 @@ covariance/Mahalanobis costs, and reverse release fitting. `uncertainty` adds
 confidence and covariance evidence; `reverse` enables ballistic release hypotheses with uniform litter
 weights; `full` additionally restores confidence-weighted trajectory fitting.
 All route types and the full NULL route remain present in every stage.
+`SMART_BACKTRACK_MAX_BACK_FRAMES` bounds enumeration/runtime only. Every emitted
+hypothesis records `search_truncated` and its reason, so research reports do not
+misstate this engineering guard as a physical release-time gate.
 
 `kalman_rts` trial configs may additionally set
 `kalman_process_noise_scale`, `kalman_measurement_noise_scale`, and

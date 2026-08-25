@@ -28,6 +28,50 @@ def _actor(cls_name, track_id, box, confidence=0.9, observed=True):
     }
 
 
+def test_confirmed_only_raw_prefix_recovery_keeps_confirmation_state_separate(monkeypatch):
+    monkeypatch.setenv("SMART_BACKTRACK", "0")
+    tracker = GlobalLitterTracker(distance_threshold=250, fps=10)
+    try:
+        tracker._record_raw_litter_frame([[68, 38, 72, 42, 0.8]], 4)
+        tracker._record_raw_litter_frame([[58, 48, 62, 52, 0.8]], 5)
+        tracker._record_raw_litter_frame(
+            [[48, 58, 52, 62, 0.9], [180, 180, 190, 190, 0.99]], 6
+        )
+
+        history, frames, boxes, confidences, recovered = (
+            tracker._recover_raw_litter_prefix(
+                [(40.0, 70.0), (30.0, 80.0)],
+                [7, 8],
+                [(38, 68, 42, 72), (28, 78, 32, 82)],
+                [0.9, 0.9],
+            )
+        )
+
+        assert frames == [4, 5, 6, 7, 8]
+        assert recovered == [4, 5, 6]
+        assert history[:3] == [(70.0, 40.0), (60.0, 50.0), (50.0, 60.0)]
+        assert boxes[0] == (68.0, 38.0, 72.0, 42.0)
+        assert confidences[0] == 0.8
+        # Raw observations alone never enter active_litters/confirmation.
+        tracker.update(
+            [], [], frame_index=9,
+            raw_detected_litters=[[20, 20, 30, 30, 0.99]],
+        )
+        assert tracker.active_litters == {}
+    finally:
+        tracker.close()
+
+
+def test_raw_prefix_has_explicit_runtime_rollback(monkeypatch):
+    monkeypatch.setenv("SMART_BACKTRACK", "0")
+    monkeypatch.setenv("SMART_BACKTRACK_RAW_PREFIX", "0")
+    tracker = GlobalLitterTracker(distance_threshold=250, fps=10)
+    try:
+        assert tracker._raw_prefix_enabled is False
+    finally:
+        tracker.close()
+
+
 def test_kalman_hungarian_only_keeps_cross_frame_identity():
     tracker = KalmanHungarianTracker(iou_threshold=0.1, max_missed_frames=5)
     first = tracker.update(
@@ -66,6 +110,33 @@ def test_actor_cache_reuse_is_not_a_new_kalman_measurement():
     assert cached[0]["observed"] is False
     assert cached[0]["source"] == "cache"
     assert source[0]["observed"] is True
+
+
+def test_confirm_frame_does_not_change_release_window_or_direction():
+    config = SmartBacktrackConfig(
+        max_back_frames=12,
+        release_window_prior_weight=0.5,
+    )
+    resolver = SmartBacktrackResolver(fps=10, config=config)
+    base = {
+        "birth_frame": 20,
+        "history": [(100.0, 100.0), (110.0, 100.0), (120.0, 100.0)],
+        "history_frames": [20, 22, 24],
+        "history_confidences": [0.9, 0.9, 0.9],
+        "fps": 10.0,
+    }
+
+    early = resolver._release_hypotheses({**base, "confirm_frame": 24})
+    late = resolver._release_hypotheses({**base, "confirm_frame": 40})
+
+    assert [item.frame_index for item in early] == [
+        item.frame_index for item in late
+    ]
+    assert [item.prior_cost for item in early] == [
+        item.prior_cost for item in late
+    ]
+    assert early[0].zero_cost_window_start_frame == 18
+    assert early[0].source_direction_uv == (-1.0, 0.0)
 
 
 def test_fast_actor_tracker_receives_real_video_fps():
@@ -370,6 +441,17 @@ def test_finalize_flushes_last_task_and_rewrites_authoritative_event(monkeypatch
         assert sidecar["assignment"]["route_id"] == rewritten["backtrack"]["route_id"]
         assert sum(route["selected"] for route in sidecar["routes"]) == 1
         assert len(sidecar["release_hypotheses"]) >= 1
+        release_diagnostic = sidecar["release_hypotheses"][0]
+        assert release_diagnostic["observation_gap_frames"] == 1
+        assert release_diagnostic["zero_cost_window_start_frame"] == 9
+        assert release_diagnostic["zero_cost_window_end_frame"] == 10
+        assert "window_prior_cost" in release_diagnostic
+        assert "direction_consistency" in release_diagnostic
+        assert release_diagnostic["search_truncated"] is True
+        assert (
+            release_diagnostic["truncation_reason"]
+            == "max_back_frames_computational_guard"
+        )
         assert set(sidecar["pair_costs"]) == {
             "BA", "BA_by_release", "AC", "BC", "BC_by_release"
         }

@@ -16,7 +16,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
 
-from pipeline.detect import _stage_render_actors, detect
+from pipeline.detect import _stage_render_actors, _stage_render_rtdetr_debug, detect
 from pipeline.litter_tracker import GlobalLitterTracker
 
 COLORS = {
@@ -35,6 +35,7 @@ GOLDEN = {
             "person_detections": 1,
             "person_frame_hits": 1,
             "raw_litter_candidates": 0,
+            "rtdetr_litter_candidates": 0,
         },
         "veh10_centroids": [[110.0, 70.0]],
         "violator_keys": [],
@@ -44,10 +45,21 @@ GOLDEN = {
         "annotated_sha": "2c52bd94e768a828123a66d9f505eb45ae06ce4eaf36d480f042a654ecf662d4",
         "annotated_shape": [120, 160, 3],
         "stats": {
+            "filtered_litter_candidate_frames": [
+                {"candidate_count": 1, "frame_index": 0}
+            ],
             "filtered_litter_candidates": 1,
+            "geometry_litter_candidate_frames": [
+                {"candidate_count": 1, "frame_index": 0}
+            ],
             "person_detections": 1,
             "person_frame_hits": 1,
             "raw_litter_candidates": 1,
+            "rtdetr_evaluated_frames": 1,
+            "rtdetr_litter_candidate_frames": [
+                {"candidate_count": 1, "frame_index": 0}
+            ],
+            "rtdetr_litter_candidates": 1,
         },
         "veh10_centroids": [[110.0, 70.0]],
         "violator_keys": [],
@@ -134,6 +146,19 @@ def test_detect_scenario_b_with_litter_candidate():
     assert _run(model_trash=_StubTrash(), trash_results=trash, with_motion=True) == GOLDEN["B"]
 
 
+def test_rtdetr_frame_is_recorded_before_geometry_rejection():
+    # 2px 寬的 bbox 是 RT-DETR litter output，但會被基本 geometry gate 淘汰。
+    trash = [_StubResult([_StubBox(0, 0.9, [40, 40, 42, 60])])]
+    result = _run(model_trash=_StubTrash(), trash_results=trash, with_motion=True)
+
+    assert result["stats"]["rtdetr_litter_candidates"] == 1
+    assert result["stats"]["rtdetr_litter_candidate_frames"] == [
+        {"frame_index": 0, "candidate_count": 1}
+    ]
+    assert result["stats"]["raw_litter_candidates"] == 0
+    assert result["stats"]["filtered_litter_candidates"] == 0
+
+
 def test_debug_render_includes_actor_track_ids(monkeypatch):
     labels = []
     monkeypatch.setenv("LITTER_DEBUG", "1")
@@ -159,3 +184,36 @@ def test_debug_render_includes_actor_track_ids(monkeypatch):
         None,
     )
     assert labels == ["person ID:7", "vehicle ID:12"]
+
+
+def test_debug_render_includes_rtdetr_box_before_geometry_rejection(monkeypatch):
+    rectangles, labels = [], []
+    monkeypatch.setenv("LITTER_DEBUG", "1")
+    monkeypatch.setattr(
+        "pipeline.detect.cv2.rectangle",
+        lambda _frame, p1, p2, color, thickness: rectangles.append(
+            (p1, p2, color, thickness)
+        ),
+    )
+    monkeypatch.setattr(
+        "pipeline.detect.cv2.putText",
+        lambda _frame, text, *_args, **_kwargs: labels.append(text),
+    )
+
+    _stage_render_rtdetr_debug(
+        np.zeros((120, 160, 3), dtype=np.uint8),
+        [[40, 40, 42, 60, 0.9]],  # 2px wide: later geometry gate rejects it.
+        None,
+    )
+
+    assert rectangles == [((40, 40), (42, 60), (255, 0, 255), 2)]
+    assert labels == ["RTDETR raw 0.90"]
+
+
+def test_rtdetr_debug_overlay_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("LITTER_DEBUG", raising=False)
+    frame = np.zeros((120, 160, 3), dtype=np.uint8)
+
+    _stage_render_rtdetr_debug(frame, [[40, 40, 60, 60, 0.9]], None)
+
+    assert not frame.any()

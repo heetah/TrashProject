@@ -22,6 +22,14 @@ class ReleaseHypothesis:
     velocity_uv: np.ndarray
     model: str
     prior_cost: float
+    observation_gap_frames: Optional[int] = None
+    zero_cost_window_start_frame: Optional[int] = None
+    zero_cost_window_end_frame: Optional[int] = None
+    window_prior_cost: float = 0.0
+    direction_consistency: Optional[float] = None
+    source_direction_uv: Optional[Tuple[float, float]] = None
+    search_truncated: bool = False
+    truncation_reason: Optional[str] = None
 
     def __post_init__(self):
         object.__setattr__(self, "mean_uv", np.asarray(self.mean_uv, dtype=float).reshape(2))
@@ -35,6 +43,104 @@ class ReleaseHypothesis:
             "velocity_uv",
             np.asarray(self.velocity_uv, dtype=float).reshape(2),
         )
+        if self.source_direction_uv is not None:
+            object.__setattr__(
+                self,
+                "source_direction_uv",
+                tuple(float(value) for value in self.source_direction_uv),
+            )
+
+
+def _ordered_unique_observations(points_uv, frame_indices):
+    """Return one mean point per frame in chronological order."""
+
+    points = np.asarray(points_uv, dtype=float)
+    frames = np.asarray(frame_indices, dtype=int)
+    if (
+        points.ndim != 2
+        or points.shape[1] != 2
+        or points.shape[0] != frames.size
+        or not np.isfinite(points).all()
+    ):
+        return np.empty((0, 2), dtype=float), np.empty(0, dtype=int)
+    unique_frames = np.unique(frames)
+    unique_points = np.asarray(
+        [np.mean(points[frames == frame], axis=0) for frame in unique_frames],
+        dtype=float,
+    )
+    return unique_points, unique_frames
+
+
+def _early_motion_diagnostics(points_uv, frame_indices, fps):
+    """Measure early motion from B0/B1/B2 without using confirm_frame."""
+
+    points, frames = _ordered_unique_observations(points_uv, frame_indices)
+    if points.shape[0] < 2 or float(fps) <= 0.0:
+        return None, None
+    dt01 = (int(frames[1]) - int(frames[0])) / float(fps)
+    if dt01 <= 0.0:
+        return None, None
+    velocity01 = (points[1] - points[0]) / dt01
+    speed01 = float(np.linalg.norm(velocity01))
+    source_direction = (
+        tuple((-velocity01 / speed01).tolist()) if speed01 > 1e-9 else None
+    )
+    if points.shape[0] < 3:
+        return source_direction, None
+    dt12 = (int(frames[2]) - int(frames[1])) / float(fps)
+    if dt12 <= 0.0:
+        return source_direction, None
+    velocity12 = (points[2] - points[1]) / dt12
+    speed12 = float(np.linalg.norm(velocity12))
+    if speed01 <= 1e-9 or speed12 <= 1e-9:
+        return source_direction, None
+    consistency = float(
+        np.clip(
+            velocity01 @ velocity12 / (speed01 * speed12),
+            -1.0,
+            1.0,
+        )
+    )
+    return source_direction, consistency
+
+
+def _observation_gap_policy(points_uv, frame_indices, birth_frame):
+    """Build I0=[B0-(B1-B0), B0] from accepted detector observations."""
+
+    _, frames = _ordered_unique_observations(points_uv, frame_indices)
+    if frames.size < 2:
+        return None, int(birth_frame), int(birth_frame)
+    gap_frames = max(int(frames[1]) - int(frames[0]), 1)
+    first_observation = int(frames[0])
+    return gap_frames, first_observation - gap_frames, first_observation
+
+
+def _window_prior(
+    frame_index,
+    window_start,
+    window_end,
+    gap_frames,
+    weight,
+    *,
+    fps,
+    forward_cost_per_second,
+):
+    if gap_frames is None or int(gap_frames) <= 0:
+        return 0.0
+    if int(frame_index) < int(window_start):
+        outside_frames = int(window_start) - int(frame_index)
+    elif int(frame_index) > int(window_end):
+        # Post-birth hypotheses lie on the observed airborne trajectory. They
+        # are not an unknown reverse gap, so retain the original seconds-based
+        # prior instead of dividing them by H0.
+        return (
+            float(forward_cost_per_second)
+            * float(int(frame_index) - int(window_end))
+            / max(float(fps), 1e-9)
+        )
+    else:
+        outside_frames = 0
+    return float(weight) * float(outside_frames) / float(gap_frames)
 
 
 @dataclass(frozen=True)
@@ -327,9 +433,9 @@ def _two_point_constant_velocity_hypotheses(
     max_back_frames: int,
     fps: float,
     sigma_floor_px: float,
-    max_back_seconds: float,
     prior_cost: float,
-    extrapolation_cost_per_second: float,
+    window_prior_weight: float,
+    forward_cost_per_second: float,
 ) -> List[ReleaseHypothesis]:
     """Build conservative reverse hypotheses from exactly two observations."""
 
@@ -358,10 +464,14 @@ def _two_point_constant_velocity_hypotheses(
         direction = np.asarray([1.0, 0.0], dtype=float)
     normal = np.asarray([-direction[1], direction[0]], dtype=float)
 
-    horizon_frames = min(
-        max(int(max_back_frames), 0),
-        max(int(round(float(max_back_seconds) * float(fps))), 0),
+    gap_frames, window_start, window_end = _observation_gap_policy(
+        points, frames, birth_frame
     )
+    source_direction, direction_consistency = _early_motion_diagnostics(
+        points, frames, fps
+    )
+    # max_back_frames is a computational guard, not a physical rejection rule.
+    horizon_frames = max(int(max_back_frames), 0)
     lower = int(birth_frame) - horizon_frames
     hypotheses = []
     for frame_index in range(lower, int(birth_frame) + 1):
@@ -382,15 +492,32 @@ def _two_point_constant_velocity_hypotheses(
             sigma_along ** 2 * np.outer(direction, direction)
             + sigma_cross ** 2 * np.outer(normal, normal)
         )
+        window_cost = _window_prior(
+            frame_index,
+            window_start,
+            window_end,
+            gap_frames,
+            window_prior_weight,
+            fps=fps,
+            forward_cost_per_second=forward_cost_per_second,
+        )
         hypotheses.append(ReleaseHypothesis(
             frame_index=int(frame_index),
             mean_uv=mean,
             covariance_uv=covariance,
             velocity_uv=velocity,
             model="constant_velocity_2point",
-            prior_cost=(
-                float(prior_cost)
-                + seconds_before_birth * float(extrapolation_cost_per_second)
+            prior_cost=float(prior_cost) + window_cost,
+            observation_gap_frames=gap_frames,
+            zero_cost_window_start_frame=window_start,
+            zero_cost_window_end_frame=window_end,
+            window_prior_cost=window_cost,
+            direction_consistency=direction_consistency,
+            source_direction_uv=source_direction,
+            search_truncated=bool(horizon_frames > 0),
+            truncation_reason=(
+                "max_back_frames_computational_guard"
+                if horizon_frames > 0 else None
             ),
         ))
     return hypotheses
@@ -410,11 +537,17 @@ def build_release_hypotheses(
     two_point_max_back_seconds: float = 0.3,
     two_point_prior_cost: float = 1.0,
     max_forward_release_seconds: float = 0.5,
+    window_prior_weight: float = 0.35,
 ) -> List[ReleaseHypothesis]:
     """Fit a trajectory and enumerate release frames from birth backwards.
 
-    A birth-only fallback is always returned when fitting is impossible, so the
-    caller can route to a dustbin instead of crashing or inventing certainty.
+    B0/B1 define a zero-cost release-time window. Frames outside that interval
+    remain candidates but receive a soft prior. ``max_back_frames`` only bounds
+    computation; it is reported as truncation rather than physical evidence.
+
+    ``two_point_max_back_seconds`` and ``extrapolation_cost_per_second`` remain
+    accepted for replay compatibility, but no longer impose a second physical
+    cutoff or penalize frames inside the B0/B1 window.
     """
 
     point_count = min(len(points_uv), len(frame_indices))
@@ -426,9 +559,9 @@ def build_release_hypotheses(
             max_back_frames=max_back_frames,
             fps=fps,
             sigma_floor_px=sigma_floor_px,
-            max_back_seconds=two_point_max_back_seconds,
             prior_cost=two_point_prior_cost,
-            extrapolation_cost_per_second=extrapolation_cost_per_second,
+            window_prior_weight=window_prior_weight,
+            forward_cost_per_second=extrapolation_cost_per_second,
         )
         if hypotheses:
             return hypotheses
@@ -452,6 +585,12 @@ def build_release_hypotheses(
             )
         ]
 
+    gap_frames, window_start, window_end = _observation_gap_policy(
+        points_uv, frame_indices, birth_frame
+    )
+    source_direction, direction_consistency = _early_motion_diagnostics(
+        points_uv, frame_indices, fps
+    )
     hypotheses = []
     lower = int(birth_frame) - max(int(max_back_frames), 0)
     upper = min(
@@ -462,7 +601,15 @@ def build_release_hypotheses(
     )
     for frame_index in range(lower, upper + 1):
         mean, covariance, velocity = model.predict(frame_index)
-        seconds_from_birth = abs(int(birth_frame) - frame_index) / float(fps)
+        window_cost = _window_prior(
+            frame_index,
+            window_start,
+            window_end,
+            gap_frames,
+            window_prior_weight,
+            fps=fps,
+            forward_cost_per_second=extrapolation_cost_per_second,
+        )
         hypotheses.append(
             ReleaseHypothesis(
                 frame_index=frame_index,
@@ -470,8 +617,18 @@ def build_release_hypotheses(
                 covariance_uv=covariance,
                 velocity_uv=velocity,
                 model="ballistic",
-                prior_cost=seconds_from_birth
-                * float(extrapolation_cost_per_second),
+                prior_cost=window_cost,
+                observation_gap_frames=gap_frames,
+                zero_cost_window_start_frame=window_start,
+                zero_cost_window_end_frame=window_end,
+                window_prior_cost=window_cost,
+                direction_consistency=direction_consistency,
+                source_direction_uv=source_direction,
+                search_truncated=bool(max(int(max_back_frames), 0) > 0),
+                truncation_reason=(
+                    "max_back_frames_computational_guard"
+                    if max(int(max_back_frames), 0) > 0 else None
+                ),
             )
         )
     return hypotheses

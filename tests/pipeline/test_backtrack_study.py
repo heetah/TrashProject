@@ -52,6 +52,21 @@ def test_study_config_can_ablate_ac_overlap_without_changing_other_weights():
     assert trial.ac_weights["overlap"] == pytest.approx(0.2)
     assert trial.ba_weights == baseline.ba_weights
     assert trial.bc_weights == baseline.bc_weights
+
+
+def test_study_config_can_ablate_bc_direction_features_in_sequence():
+    config = StudyConfig(
+        stage="full",
+        bc_exit_deficit_weight=0.2,
+        bc_relative_motion_deficit_weight=0.3,
+        bc_reverse_direction_weight=0.4,
+        bc_boundary_depth_weight=0.5,
+    ).resolver_config(fps=10).cost_config
+
+    assert config.bc_weights["exit_deficit"] == pytest.approx(0.2)
+    assert config.bc_weights["relative_motion_deficit"] == pytest.approx(0.3)
+    assert config.bc_weights["reverse_direction"] == pytest.approx(0.4)
+    assert config.bc_weights["boundary_depth"] == pytest.approx(0.5)
 from pipeline.backtrack.costs import BacktrackCostConfig, compute_c_ba
 from pipeline.backtrack.trajectory import ReleaseHypothesis
 from pipeline.backtrack.costs import ActorObservation
@@ -171,6 +186,20 @@ def test_runtime_distance_time_weights_are_explicit(monkeypatch):
         "endpoint_proximity": .75, "time": .25,
     }
     assert config.cost_config.normalize_distance_time_by_gate
+
+
+def test_runtime_boundary_depth_weight_applies_only_to_reverse_full(monkeypatch):
+    monkeypatch.setenv("SMART_BACKTRACK_BC_BOUNDARY_DEPTH_WEIGHT", "1.1")
+    monkeypatch.setenv("SMART_BACKTRACK_STUDY_STAGE", "full")
+
+    full = SmartBacktrackConfig.from_env(fps=10)
+
+    assert full.cost_config.bc_weights["boundary_depth"] == pytest.approx(1.1)
+
+    monkeypatch.setenv("SMART_BACKTRACK_STUDY_STAGE", "distance_time")
+    distance_time = SmartBacktrackConfig.from_env(fps=10)
+
+    assert "boundary_depth" not in distance_time.cost_config.bc_weights
 
 
 def test_kalman_rts_stage_keeps_only_distance_time_costs():

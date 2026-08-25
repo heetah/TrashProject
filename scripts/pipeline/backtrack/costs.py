@@ -31,7 +31,7 @@ class BacktrackCostConfig:
         # Research diagnostics. Zero keeps production ranking unchanged until
         # reviewed ablation demonstrates a stable direction across cases.
         "reverse_direction": 0.0, "exit_deficit": 0.0,
-        "relative_motion_deficit": 0.0,
+        "relative_motion_deficit": 0.0, "boundary_depth": 0.0,
     })
     ac_weights: Mapping[str, float] = field(default_factory=lambda: {
         # Wrong-depth vehicle boxes often cover a nearby person. Footpoint
@@ -563,6 +563,24 @@ def compute_c_bc(
         x1, y1, x2, y2 = vehicle.bbox
         margin_x = 0.18 * vehicle.width
         margin_y = 0.15 * vehicle.height
+        release_u, release_v = map(float, release.mean_uv)
+        if x1 <= release_u <= x2 and y1 <= release_v <= y2:
+            interior_depth = min(
+                release_u - x1,
+                x2 - release_u,
+                release_v - y1,
+                y2 - release_v,
+            )
+            # Reuse the same physical shell that expands the vehicle release
+            # zone. A point near a window/body edge costs little; a point deep
+            # inside a large overlapping bbox is suspicious under occlusion.
+            boundary_depth = min(
+                max(float(interior_depth), 0.0)
+                / max(float(margin_x), float(margin_y), 1.0),
+                1.0,
+            )
+        else:
+            boundary_depth = 0.0
         residual = _point_to_rect_vector(
             release.mean_uv,
             (x1 - margin_x, y1 - margin_y, x2 + margin_x, y2 + margin_y),
@@ -608,6 +626,7 @@ def compute_c_bc(
             ),
             "quality": quality,
             "release_prior": float(release.prior_cost),
+            "boundary_depth": boundary_depth,
         }
         if litter_last_point is not None and litter_last_frame is not None:
             try:

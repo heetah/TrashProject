@@ -265,6 +265,16 @@ class GlobalLitterTracker:
         self._smart_actor_history = deque(
             maxlen=self._smart_context_frames + BACKWARD_POST_BIRTH_FRAMES + 2
         )
+        # RT-DETR class/confidence outputs before geometry/motion/holding
+        # filters. They never enter confirmation. After an event is confirmed,
+        # a short, motion-consistent prefix may be recovered solely for release
+        # trajectory fitting.
+        self._raw_litter_history = deque(
+            maxlen=self._smart_context_frames + BACKWARD_POST_BIRTH_FRAMES + 2
+        )
+        self._raw_prefix_enabled = (
+            os.environ.get("SMART_BACKTRACK_RAW_PREFIX", "1") not in ("0", "")
+        )
         self.backward_plate_roi_items = []
         self._actor_tracklet_epochs = {}
 
@@ -314,14 +324,140 @@ class GlobalLitterTracker:
         self._fallback_frame_index = 0
         self._debug = os.environ.get("LITTER_DEBUG", "0") not in ("0", "")   # LITTER_DEBUG=1 開啟 per-frame 印出
 
+    def _record_raw_litter_frame(self, raw_detected_litters, frame_index):
+        """Keep detector outputs for confirmed-only trajectory recovery.
+
+        This buffer is observational evidence only. It is never passed into
+        the pending/confirmed state machine below.
+        """
+        boxes = []
+        for litter_box in raw_detected_litters or []:
+            try:
+                values = tuple(float(value) for value in litter_box[:5])
+            except (TypeError, ValueError):
+                continue
+            if len(values) != 5 or not np.isfinite(values).all():
+                continue
+            boxes.append(values)
+        self._raw_litter_history.append({
+            'frame_index': int(frame_index),
+            'boxes': boxes,
+        })
+
+    def _recover_raw_litter_prefix(
+        self,
+        history,
+        history_frames,
+        history_boxes,
+        history_confidences,
+    ):
+        """Prepend a motion-consistent raw prefix to a confirmed trajectory.
+
+        At least two accepted observations anchor a constant-velocity backward
+        prediction. Each earlier raw point must fall within two observed-box
+        diagonals of that prediction. The anchor is updated after every match,
+        allowing acceleration while preventing unrelated detector boxes from
+        entering merely because they are nearby. Recovery stops at the first
+        missing/rejected frame and never changes confirmation or birth_frame.
+        """
+        count = min(
+            len(history), len(history_frames), len(history_boxes),
+            len(history_confidences),
+        )
+        if count < 2:
+            return (
+                list(history), list(history_frames), list(history_boxes),
+                list(history_confidences), [],
+            )
+        rows = sorted(
+            zip(
+                history_frames[-count:], history[-count:],
+                history_boxes[-count:], history_confidences[-count:],
+            ),
+            key=lambda item: int(item[0]),
+        )
+        # One accepted observation per frame; preserve the latest copy if an
+        # upstream path duplicated a frame during confirmation.
+        by_frame = {int(row[0]): row for row in rows}
+        rows = [by_frame[frame] for frame in sorted(by_frame)]
+        if len(rows) < 2 or int(rows[1][0]) <= int(rows[0][0]):
+            return (
+                [row[1] for row in rows], [int(row[0]) for row in rows],
+                [row[2] for row in rows], [float(row[3]) for row in rows], [],
+            )
+
+        raw_by_frame = {
+            int(item['frame_index']): list(item.get('boxes', []))
+            for item in self._raw_litter_history
+        }
+        recovered_frames = []
+        while len(rows) < self.trajectory_history_len:
+            first_frame = int(rows[0][0])
+            target_frame = first_frame - 1
+            candidates = raw_by_frame.get(target_frame)
+            if not candidates:
+                break
+
+            second_frame = int(rows[1][0])
+            first_point = np.asarray(rows[0][1], dtype=float)
+            second_point = np.asarray(rows[1][1], dtype=float)
+            velocity_per_frame = (
+                (second_point - first_point)
+                / max(float(second_frame - first_frame), 1.0)
+            )
+            predicted = first_point - velocity_per_frame
+            first_box = np.asarray(rows[0][2], dtype=float)
+            first_diagonal = float(np.hypot(
+                first_box[2] - first_box[0],
+                first_box[3] - first_box[1],
+            ))
+            ranked = []
+            for candidate in candidates:
+                candidate_box = np.asarray(candidate[:4], dtype=float)
+                candidate_point = np.asarray([
+                    (candidate_box[0] + candidate_box[2]) * 0.5,
+                    (candidate_box[1] + candidate_box[3]) * 0.5,
+                ])
+                candidate_diagonal = float(np.hypot(
+                    candidate_box[2] - candidate_box[0],
+                    candidate_box[3] - candidate_box[1],
+                ))
+                scale = max(first_diagonal, candidate_diagonal, 1.0)
+                residual = float(np.linalg.norm(candidate_point - predicted))
+                if residual <= 2.0 * scale:
+                    ranked.append((residual / scale, candidate, candidate_point))
+            if not ranked:
+                break
+            _, candidate, candidate_point = min(
+                ranked, key=lambda item: (item[0], -float(item[1][4]))
+            )
+            rows.insert(0, (
+                target_frame,
+                tuple(float(value) for value in candidate_point),
+                tuple(float(value) for value in candidate[:4]),
+                float(candidate[4]),
+            ))
+            recovered_frames.append(target_frame)
+
+        recovered_frames.sort()
+        return (
+            [row[1] for row in rows],
+            [int(row[0]) for row in rows],
+            [row[2] for row in rows],
+            [float(row[3]) for row in rows],
+            recovered_frames,
+        )
+
     def update(self, detected_litters, actors, person_vehicle_map=None, frame_index=None,
-               frame=None, vehicle_history=None):
+               frame=None, vehicle_history=None, raw_detected_litters=None):
         # 主更新流程：接收本幀通過前處理的 litter，更新軌跡與違規者集合。
         if frame_index is None:
             frame_index = self._fallback_frame_index
             self._fallback_frame_index += 1
         frame_index = int(frame_index)
         self._current_frame_index = frame_index
+
+        self._record_raw_litter_frame(raw_detected_litters, frame_index)
 
         self._record_actor_frame(actors, frame_index, frame=frame)
         self._drain_backward_results(vehicle_history=vehicle_history)
@@ -1269,6 +1405,22 @@ class GlobalLitterTracker:
                 float(current_bbox[4]) if len(current_bbox) > 4 else 1.0
             )
 
+        accepted_history_frames = list(history_frames)
+        recovered_raw_frames = []
+        if self._raw_prefix_enabled:
+            (
+                history,
+                history_frames,
+                history_boxes,
+                history_confidences,
+                recovered_raw_frames,
+            ) = self._recover_raw_litter_prefix(
+                history,
+                history_frames,
+                history_boxes,
+                history_confidences,
+            )
+
         with self._actor_history_lock:
             history_source = (
                 self._smart_actor_history
@@ -1309,6 +1461,7 @@ class GlobalLitterTracker:
             return False
 
         revision = int(self._backtrack_revisions.get(int(litter_id), 0)) + 1
+        recovered_raw_frame_set = set(recovered_raw_frames)
         task = {
             'schema_version': 1,
             'litter_id': int(litter_id),
@@ -1324,6 +1477,16 @@ class GlobalLitterTracker:
             'history_frames': history_frames,
             'history_boxes': history_boxes,
             'history_confidences': history_confidences,
+            'history_sources': [
+                (
+                    'raw_rtdetr_recovered'
+                    if int(frame) in recovered_raw_frame_set
+                    else 'accepted_tracker'
+                )
+                for frame in history_frames
+            ],
+            'accepted_history_frames': accepted_history_frames,
+            'recovered_raw_history_frames': recovered_raw_frames,
             'prev_thrower_key': prev_thrower_key,
             'actor_frames': actor_frames,
             'plate_actor_frames': plate_actor_frames,

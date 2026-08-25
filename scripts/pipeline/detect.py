@@ -22,6 +22,7 @@ from pipeline.geometry import (
 # 類別顏色與名稱正規化：避免不同模型 label-space 造成 actor 解析錯誤。
 BLACK = (0, 0, 0)
 WARN = (0, 0, 255)
+RTDETR_DEBUG = (255, 0, 255)
 
 
 ACTOR_CLASSES = ('person', 'scooter', 'vehicle')
@@ -468,10 +469,25 @@ def _stage_detect_shake(prev_frame, frame, litter_tracker, frame_index, fps, sta
     return shake_active, shake_mag, shake_threshold
 
 
+def _record_litter_candidate_frame(stats, key, frame_index, candidate_count):
+    """記錄某一處理階段有 candidate 的幀；每幀只存幀號與 observation 數。"""
+    if stats is None or candidate_count <= 0:
+        return
+    stats.setdefault(key, []).append({
+        'frame_index': int(frame_index),
+        'candidate_count': int(candidate_count),
+    })
+
+
 def _stage_collect_litter_candidates(vehicle_active, model_trash, precomputed_trash_results,
                                      prev_frame, frame, trash_conf, stats, profiler,
+                                     frame_index,
                                      prepared_litter_input=None):
-    # RTDETR 全圖偵測垃圾候選;車輛閘門關閉或無模型時回空。回傳 [[x1,y1,x2,y2,conf], ...]。
+    # RTDETR 全圖偵測垃圾候選;車輛閘門關閉或無模型時回空。回傳
+    # (RTDETR confidence/class 篩選結果, 通過基本 geometry 的結果)。stats 另保留
+    # geometry 前的真正 RTDETR 輸出，才能區分
+    # 「模型未辨識」與「模型有框、但被後處理淘汰」。
+    rtdetr_frame_litters = []
     current_frame_litters = []
     if not vehicle_active or model_trash is None:
         chunk_results = []
@@ -499,6 +515,7 @@ def _stage_collect_litter_candidates(vehicle_active, model_trash, precomputed_tr
                 r_conf = float(r_box.conf[0])
                 if r_class_name == 'litter':
                     lx1, ly1, lx2, ly2 = map(int, r_box.xyxy[0])
+                    rtdetr_frame_litters.append([lx1, ly1, lx2, ly2, r_conf])
                     bbox_width = lx2 - lx1
                     bbox_height = ly2 - ly1
                     # 基礎 bbox 尺寸與長寬比過濾:去掉極端扁長或過小雜訊。
@@ -508,8 +525,25 @@ def _stage_collect_litter_candidates(vehicle_active, model_trash, precomputed_tr
                     current_frame_litters.append([lx1, ly1, lx2, ly2, r_conf])
 
     if stats is not None:
+        if vehicle_active and model_trash is not None:
+            stats['rtdetr_evaluated_frames'] = stats.get('rtdetr_evaluated_frames', 0) + 1
+        stats['rtdetr_litter_candidates'] = (
+            stats.get('rtdetr_litter_candidates', 0) + len(rtdetr_frame_litters)
+        )
         stats['raw_litter_candidates'] = stats.get('raw_litter_candidates', 0) + len(current_frame_litters)
-    return current_frame_litters
+        _record_litter_candidate_frame(
+            stats,
+            'rtdetr_litter_candidate_frames',
+            frame_index,
+            len(rtdetr_frame_litters),
+        )
+        _record_litter_candidate_frame(
+            stats,
+            'geometry_litter_candidate_frames',
+            frame_index,
+            len(current_frame_litters),
+        )
+    return rtdetr_frame_litters, current_frame_litters
 
 
 def _stage_filter_litter_candidates(current_frame_litters, shake_active, shake_mag, shake_threshold,
@@ -602,10 +636,17 @@ def _stage_filter_litter_candidates(current_frame_litters, shake_active, shake_m
             filtered_frame_litters.append(litter_box)
     if stats is not None:
         stats['filtered_litter_candidates'] = stats.get('filtered_litter_candidates', 0) + len(filtered_frame_litters)
+        _record_litter_candidate_frame(
+            stats,
+            'filtered_litter_candidate_frames',
+            frame_index,
+            len(filtered_frame_litters),
+        )
     return filtered_frame_litters
 
 
-def _stage_update_litter_tracker(litter_tracker, filtered_frame_litters, tracking_objects,
+def _stage_update_litter_tracker(litter_tracker, filtered_frame_litters, raw_frame_litters,
+                                 tracking_objects,
                                  person_vehicle_map, frame_index, frame, vehicle_history,
                                  stats, profiler):
     # 更新 GlobalLitterTracker,將 pending litter 依軌跡轉成 confirmed。
@@ -615,6 +656,7 @@ def _stage_update_litter_tracker(litter_tracker, filtered_frame_litters, trackin
             filtered_frame_litters, tracking_objects,
             person_vehicle_map=person_vehicle_map, frame_index=frame_index,
             frame=frame, vehicle_history=vehicle_history,
+            raw_detected_litters=raw_frame_litters,
         )
     if stats is not None:
         confirmed_ids = [
@@ -791,6 +833,32 @@ def _stage_render_litters(annotated_frame, tracked_litters, color_dict, box_thic
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, l_color, 2)
 
 
+def _stage_render_rtdetr_debug(annotated_frame, rtdetr_frame_litters, profiler):
+    """Debug-only overlay for litter boxes before geometry/motion/holding filters."""
+    if os.environ.get("LITTER_DEBUG", "0") in ("0", ""):
+        return
+    with profile_block(profiler, "detect.render_rtdetr_debug"):
+        for litter_box in rtdetr_frame_litters:
+            lx1, ly1, lx2, ly2 = map(int, litter_box[:4])
+            confidence = float(litter_box[4])
+            cv2.rectangle(
+                annotated_frame,
+                (lx1, ly1),
+                (lx2, ly2),
+                RTDETR_DEBUG,
+                2,
+            )
+            cv2.putText(
+                annotated_frame,
+                f"RTDETR raw {confidence:.2f}",
+                (lx1, max(15, ly1 - 5)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                RTDETR_DEBUG,
+                2,
+            )
+
+
 def detect(frame, model_bbox, model_trash,
            color_dict, fg_mask, litter_tracker, vehicle_history,
            fps=30.0,
@@ -867,9 +935,10 @@ def detect(frame, model_bbox, model_trash,
         prev_frame, frame, litter_tracker, frame_index, fps, stats, profiler
     )
 
-    current_frame_litters = _stage_collect_litter_candidates(
+    rtdetr_frame_litters, current_frame_litters = _stage_collect_litter_candidates(
         vehicle_active, model_trash, precomputed_trash_results,
         prev_frame, frame, trash_conf, stats, profiler,
+        frame_index,
         prepared_litter_input=prepared_litter_input,
     )
 
@@ -881,7 +950,8 @@ def detect(frame, model_bbox, model_trash,
     )
 
     tracked_litters, active_violators = _stage_update_litter_tracker(
-        litter_tracker, filtered_frame_litters, tracking_objects,
+        litter_tracker, filtered_frame_litters, rtdetr_frame_litters,
+        tracking_objects,
         person_vehicle_map, frame_index, frame, vehicle_history, stats, profiler,
     )
 
@@ -906,6 +976,7 @@ def detect(frame, model_bbox, model_trash,
         text_thickness, profiler,
     )
 
+    _stage_render_rtdetr_debug(annotated_frame, rtdetr_frame_litters, profiler)
     _stage_render_litters(annotated_frame, tracked_litters, color_dict, box_thickness, profiler)
 
     return annotated_frame

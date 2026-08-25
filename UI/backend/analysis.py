@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 
-SUPPORTED_SCHEMA_VERSIONS = {"2.0.0"}
+SUPPORTED_SCHEMA_VERSIONS = {"2.0.0", "2.1.0"}
 
 
 def load_analysis(path: str | Path) -> dict[str, Any]:
