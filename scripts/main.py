@@ -65,6 +65,13 @@ COLORS = {
     'scooter': (0, 255, 255) # 黃色
 }
 
+
+def _safe_float_env(name, default):
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("file", nargs="?", help="video path or file name in resources/", default="TThrow.mp4")
@@ -314,6 +321,8 @@ if __name__ == "__main__":
                 'stgcn_alerts': 0,
                 'stgcn_registered_violators': 0,
             }
+            if os.environ.get("LITTER_CANDIDATE_SIDECAR", "0") not in ("0", ""):
+                detection_stats['litter_candidate_records'] = []
             yolo_seg_cache = {}
             rtdetr_batch_context = {}
             frame_index = 0
@@ -624,6 +633,47 @@ if __name__ == "__main__":
                 print(
                     "Backtrack candidate sidecar: "
                     f"events={len(candidate_records)} -> {sidecar_path}"
+                )
+
+            # Opt-in calibration trace: one record per RT-DETR litter candidate,
+            # including the exact gate rejection reason and tracker ID when
+            # accepted. This is research evidence, not ground truth.
+            litter_candidate_records = detection_stats.get('litter_candidate_records')
+            if isinstance(litter_candidate_records, list):
+                containment_threshold = min(
+                    max(_safe_float_env("LITTER_FP_CONTAINMENT_THR", 0.999), 0.0),
+                    1.0,
+                )
+                dedup_iou_threshold = min(
+                    max(_safe_float_env("LITTER_CANDIDATE_DEDUP_IOU", 0.5), 0.0),
+                    1.0,
+                )
+                candidate_trace_path = Path(final_output).with_name(
+                    Path(final_output).stem + "_litter_candidates.jsonl"
+                )
+                candidate_trace_run = {
+                    "record_type": "run",
+                    "schema": "litter-candidate-gates/v1",
+                    "input_video": str(video_path),
+                    "output_video": str(final_output),
+                    "fps": float(fps),
+                    "frame_count": int(processed_frames),
+                    "confidence_threshold": float(cfg.trash_conf),
+                    "containment_threshold": containment_threshold,
+                    "dedup_enabled": os.environ.get(
+                        "LITTER_CANDIDATE_DEDUP", "0"
+                    ) not in ("0", ""),
+                    "dedup_iou_threshold": dedup_iou_threshold,
+                }
+                write_backtrack_jsonl(
+                    [candidate_trace_run, *litter_candidate_records],
+                    str(candidate_trace_path),
+                )
+                run_summary['litter_candidate_sidecar'] = str(candidate_trace_path)
+                run_summary['litter_candidate_records'] = len(litter_candidate_records)
+                print(
+                    "Litter candidate sidecar: "
+                    f"candidates={len(litter_candidate_records)} -> {candidate_trace_path}"
                 )
 
             # 每支影片只輸出一份前端 JSON；研究 sidecar 預設關閉，需明確啟用。

@@ -292,6 +292,10 @@ MP4 片段，並附一份列出違規、關聯車輛、車牌與審核資料的 
 | `SMART_BACKTRACK_RELEASE_WINDOW_WEIGHT` | `0.35` | 超出 B0/B1 零成本窗後，每一個 observation-gap 的軟性 prior 增量 |
 | `SMART_BACKTRACK_BC_BOUNDARY_DEPTH_WEIGHT` | `0.0` | `full/reverse` 中 release 點位於 vehicle bbox 深處的軟成本；`0` 關閉，須經 reviewed replay 後才啟用 |
 | `LITTER_DEBUG` | `0` | 設為 `1` 時輸出逐幀診斷；annotated video 顯示 actor track ID，並以洋紅框顯示 RT-DETR 通過 class/confidence、但尚未經 geometry/motion/holding/tracker 後處理的 litter bbox 與 confidence |
+| `LITTER_FP_CONTAINMENT_THR` | `0.999` | RT-DETR 候選與車輛 bbox 幾乎完全重疊時才在前處理淘汰；設 `0.85` 可重現舊版 baseline，後續仍須通過 motion/holding/tracker confirmation |
+| `LITTER_CANDIDATE_SIDECAR` | `0` | 研究用逐 candidate JSONL，記錄 gate reason、tracker ID 與可重現設定；不供前端或 ground truth 使用 |
+| `LITTER_CANDIDATE_DEDUP` | `0` | 實驗性同幀 IoU 去重；目前 replay 未採用（未增加正確 confirmed 且 safety proxy 惡化） |
+| `LITTER_CANDIDATE_DEDUP_IOU` | `0.5` | 同幀 candidate 去重 IoU 門檻；僅在 `LITTER_CANDIDATE_DEDUP=1` 時生效 |
 | `OUTPUT_ROOT` | `.` | Output directory；建議明確設為 `output` |
 
 其餘 action smoothing、video I/O、writer、Smart Backtrack 與 legacy research 開關都已列在
@@ -325,6 +329,32 @@ CUDA_VISIBLE_DEVICES=0 WORKER_INDEX=0 WORKER_COUNT=2 \
   scripts/run_backtrack_fixed_cases.sh
 ```
 
+若原始影片不在 manifest 的舊 `source_directory`，可用
+`SOURCE_DIRECTORY=/home/under115a/under115a/under115a/litter_vidshort/litter` 覆寫；
+`CASE_IDS=13,17,167` 可只重播指定案例，`SKIP_EXISTING_SUCCESS=1` 會保留已完成的
+analysis 與 candidate sidecar。RT-DETR gate 校正使用：
+
+```bash
+LITTER_CANDIDATE_SIDECAR=1 \
+  LITTER_FP_CONTAINMENT_THR=0.999 \
+  SOURCE_DIRECTORY=/home/under115a/under115a/under115a/litter_vidshort/litter \
+  OUTPUT_ROOT=output/rtdetr_postprocess_containment0999_20260826 \
+  scripts/run_backtrack_fixed_cases.sh
+
+conda run -n rtdetr python scripts/calibrate_litter_postprocess.py \
+  --sidecar-dir output/rtdetr_postprocess_containment0999_20260826 \
+  --baseline-sidecar-dir output/rtdetr_postprocess_baseline_20260826 \
+  --output artifacts/litter_postprocess_calibration/containment0999
+```
+
+校正工具以 58 個 usable、各含一個人工事件的 clip 作 event-level 配對，另以 63
+個 clip 報告 confirmed coverage。candidate、686 列或跨幀 observation 都不是獨立樣本；
+目前結果僅顯示 0.999 replay 為 13/58 vs baseline 12/58 正確 tracker ID、20/63 vs
+19/63 confirmed clip，paired gain=1/loss=0，Wilson 95% CI 分別為 13.59%--34.66%
+與 12.25%--32.77%。未驗證 confirmed track 14→14，但沒有 negative clip，故這只是
+safety proxy，不能宣稱 false-positive rate 或普適最佳門檻；event annotations 的
+`review_state` 目前仍應由人工確認（工具會在報告中標出 58 筆未 review）。
+
 `exit_code=0` 只代表 pipeline 完成。無人工 reviewed route 的案例只能比較
 candidate coverage、route 變化與 margin，不可宣稱 attribution accuracy。
 
@@ -340,6 +370,46 @@ trajectory。此工具沒有
 reviewed annotation 時只產生 candidate diagnostics，不能輸出 accuracy 結論。
 `evaluate` 另報 selected non-NULL 的錯誤率與 deterministic bootstrap 95% CI；
 它是安全風險指標，不能由 resolved/dustbin 比例取代。
+
+Ground truth 已包含 release point／interval 與人工 actor bbox 時，可使用公式驗證工具
+比較正確 actor、干擾 actor、尺度正規化和 D/T 權重。工具不會改寫標註或 production
+參數；`first_visible_litter_frame=0/1` 依標註合約視為特定 baseline 的 RT-DETR miss
+sentinel，不會納入 release 時差：
+
+```bash
+conda run -n rtdetr python scripts/validate_attribution_formula.py \
+  --ground-truth runs/grounding_truth \
+  --candidates output/backtrack_multi_actor_v1_20260825_rerun \
+  --output artifacts/attribution_formula_validation_20260826 \
+  --bootstrap 5000
+```
+
+輸出包括中英文 Markdown 報告、完整 JSON、event/actor mapping CSV、B0/B1 timing、
+同幀 distance-definition、D/T sweep CSV 與對應 PNG 圖表。人工 actor ID 只以同幀、
+同類 bbox IoU 建議對應 model tracklet；此對應與
+由 actor presence 推導的 route 會明確標記 provenance，不能靜默寫回 canonical reviewed
+annotation。報告中的 candidate AUC 使用 event-cluster bootstrap；binomial 命中率使用
+Wilson 95% CI。沒有 negative clip、reviewed NULL route 或跨攝影機 test 時，不得把同場域
+結果宣稱為 precision、NULL safety 或 universal optimum。
+
+若要將距離與時間改寫成 TrackFlow-inspired 的負對數關聯成本，可在同一份
+reviewed GT 與 frozen sidecar 上執行候選層級分析：
+
+```bash
+conda run -n rtdetr python scripts/analyze_attribution_log_likelihood.py \
+  --ground-truth runs/grounding_truth \
+  --candidates output/backtrack_multi_actor_v1_20260825_rerun \
+  --output artifacts/attribution_log_likelihood_20260826
+```
+
+工具以 `D=release point 到 actor release region 的尺度正規化距離`、
+`alpha=(B0-release_frame)/(B1-B0)`、training-fold-only 的時間中心，以及
+`A=(1-cos(theta))/2` 的 forward-direction penalty 建立
+`P(correct association)`，再評估 `-log(P)`。方向項採 von Mises 圓形統計形式，
+並提供所有 penalty 係數不得為正的物理單調約束版本。主結果使用 leave-one-event-out，
+並分開報 actor top-1、release hit 與兩者同時正確的 exact top-1。它只評估第一條
+release→actor edge；沒有 reviewed NULL／negative clip 時，risk-coverage 不可宣稱為
+正式 NULL safety 或自動開罰 threshold。
 
 純 Kalman/RTS trial 可在 JSON 另外掃描
 `kalman_process_noise_scale`、`kalman_measurement_noise_scale` 與

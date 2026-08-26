@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # 共用幾何與判斷工具：前景 motion、IoU、mask overlap、holding 判斷、物理軌跡驗證。
 import math
+import os
 import cv2
 import numpy as np
 
@@ -48,7 +49,10 @@ def estimate_global_shift(prev_frame, curr_frame, downscale=SHAKE_DOWNSCALE):
 
 # === 前處理 litter 候選 FP 篩選參數（集中在 detect 前處理，tracker 只負責追蹤）===
 # 隨車部件（車燈/後照鏡/車身）與純水平條紋（橫越畫面的車/機車被拉成條）不該進 tracker。
-LITTER_FP_CONTAINMENT_THR = 0.85       # 候選與某車輛 bbox 重疊達此值 → 隨車部件
+# Validated replay default: only boxes that are (within pixel rounding) fully
+# contained by a vehicle are rejected at this early gate.  A stricter 0.85
+# override remains available for rollback/A-B via LITTER_FP_CONTAINMENT_THR.
+LITTER_FP_CONTAINMENT_THR = 0.999      # 候選與某車輛 bbox 幾乎完全重疊 → 隨車部件
 LITTER_FP_STREAK_RATIO = 5.0           # horizontal 位移 > 此倍率 × downward → 純水平條紋（非重力下墜）
 LITTER_FP_ARC_MIN_DESCENT = 7.0        # 最高點後至少下降此像素，才視為重力下降證據
 LITTER_FP_NEAREST_VEHICLE_DIST = 40.0  # 候選距車輛 bbox 此值內才做共動判斷（像素）
@@ -109,6 +113,15 @@ VEHICLE_LOWER_EDGE_RATIO = 0.75
 VEHICLE_BOTTOM_GAP_RATIO = 0.95
 
 ALLOW_DISTANCE_HOLDING = True
+
+
+def _float_env(name, default):
+    """Read an optional numeric research override without changing defaults."""
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+
 
 def _motion_crop(fg_mask, coords, mask_scale=1.0):
     # 依 mask scale 裁出 bbox 對應區域；check_motion 與 motion_evidence 共用。
@@ -852,7 +865,11 @@ def litter_candidate_is_vehicle_fp(litter_box, actors, vehicle_history=None,
                 nearest_veh_id = None
 
     # 1) containment（per-frame，新生候選也適用）
-    if best_overlap >= LITTER_FP_CONTAINMENT_THR:
+    containment_threshold = min(
+        max(_float_env("LITTER_FP_CONTAINMENT_THR", LITTER_FP_CONTAINMENT_THR), 0.0),
+        1.0,
+    )
+    if best_overlap >= containment_threshold:
         return True, 'vehicle_contained'
 
     hist = list(prev_litter_history or [])

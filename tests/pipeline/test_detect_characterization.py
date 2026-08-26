@@ -16,7 +16,12 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
 
-from pipeline.detect import _stage_render_actors, _stage_render_rtdetr_debug, detect
+from pipeline.detect import (
+    _deduplicate_litter_candidates,
+    _stage_render_actors,
+    _stage_render_rtdetr_debug,
+    detect,
+)
 from pipeline.litter_tracker import GlobalLitterTracker
 
 COLORS = {
@@ -217,3 +222,33 @@ def test_rtdetr_debug_overlay_is_disabled_by_default(monkeypatch):
     _stage_render_rtdetr_debug(frame, [[40, 40, 60, 60, 0.9]], None)
 
     assert not frame.any()
+
+
+def test_candidate_dedup_keeps_highest_confidence_and_detector_order():
+    first = [10, 10, 30, 30, 0.70]
+    distinct = [80, 80, 100, 100, 0.60]
+    duplicate = [11, 11, 31, 31, 0.90]
+
+    kept, suppressed = _deduplicate_litter_candidates(
+        [first, distinct, duplicate], iou_threshold=0.5
+    )
+
+    assert kept == [distinct, duplicate]
+    assert suppressed == [first]
+
+
+def test_containment_threshold_override_preserves_default(monkeypatch):
+    from pipeline.geometry import litter_candidate_is_vehicle_fp
+
+    near_contained_litter = [10, 10, 30, 30, 0.9]
+    near_contained_actor = [{"cls": "vehicle", "track_id": 3, "box": [0, 0, 40, 28]}]
+    fully_contained_litter = [10, 10, 30, 30, 0.9]
+    fully_contained_actor = [{"cls": "vehicle", "track_id": 3, "box": [0, 0, 40, 40]}]
+    monkeypatch.delenv("LITTER_FP_CONTAINMENT_THR", raising=False)
+    assert litter_candidate_is_vehicle_fp(near_contained_litter, near_contained_actor)[0] is False
+    assert litter_candidate_is_vehicle_fp(fully_contained_litter, fully_contained_actor)[0] is True
+
+    # Rollback to 0.85 reproduces the previous early rejection; subsequent
+    # motion/holding/tracker confirmation remains mandatory either way.
+    monkeypatch.setenv("LITTER_FP_CONTAINMENT_THR", "0.85")
+    assert litter_candidate_is_vehicle_fp(near_contained_litter, near_contained_actor)[0] is True
