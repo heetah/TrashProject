@@ -52,6 +52,25 @@ def _get_only_litter(active):
     return l_id, active[l_id]
 
 
+def test_horizontal_confirmation_threshold_can_be_overridden(monkeypatch):
+    """The replay knob is explicit and keeps the production default intact."""
+    from litterTracker import GlobalLitterTracker, MIN_CONFIRM_HORIZONTAL_DISPLACEMENT
+
+    monkeypatch.setenv("LITTER_MIN_CONFIRM_HORIZONTAL_DISPLACEMENT", "1.25")
+    tracker = GlobalLitterTracker()
+    try:
+        assert tracker.min_confirm_horizontal_displacement == pytest.approx(1.25)
+    finally:
+        tracker.close()
+
+    monkeypatch.delenv("LITTER_MIN_CONFIRM_HORIZONTAL_DISPLACEMENT", raising=False)
+    tracker = GlobalLitterTracker()
+    try:
+        assert tracker.min_confirm_horizontal_displacement == MIN_CONFIRM_HORIZONTAL_DISPLACEMENT
+    finally:
+        tracker.close()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tests: thrown litter should confirm
 # ─────────────────────────────────────────────────────────────────────────────

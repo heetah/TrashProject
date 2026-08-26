@@ -19,6 +19,20 @@ from pipeline.litter.trajfit import (
     _trajfit_point_at,
 )
 
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+
 # === fps 正規化基準 ===
 # 所有「像素」閾值（位移、span、相對分離…）是與取樣率無關的物理事實，維持不變。
 # 只有「幀窗 / age / 每幀速度上限」這些與 fps 相關的參數需要隨 fps 縮放：
@@ -133,7 +147,20 @@ class GlobalLitterTracker:
         self.stationary_lock_span = STATIONARY_LOCK_SPAN
         self.thrower_fallback_score_limit = THROWER_FALLBACK_SCORE_LIMIT
         self.min_confirm_downward_displacement = MIN_CONFIRM_DOWNWARD_DISPLACEMENT
-        self.min_confirm_downward_displacement_vehicle = MIN_CONFIRM_DOWNWARD_DISPLACEMENT_VEHICLE
+        self.min_confirm_horizontal_displacement = max(
+            0.0,
+            _env_float(
+                "LITTER_MIN_CONFIRM_HORIZONTAL_DISPLACEMENT",
+                MIN_CONFIRM_HORIZONTAL_DISPLACEMENT,
+            ),
+        )
+        self.min_confirm_downward_displacement_vehicle = max(
+            0.0,
+            _env_float(
+                "LITTER_MIN_CONFIRM_DOWNWARD_VEHICLE",
+                MIN_CONFIRM_DOWNWARD_DISPLACEMENT_VEHICLE,
+            ),
+        )
 
         # --- 持續性 / 幀窗參數：隨 fps 放長 ---
         # 高 fps（且小物件偵測稀疏，detection gap 大）時，唯有放長軌跡記憶與容錯幀數，
@@ -147,11 +174,36 @@ class GlobalLitterTracker:
         # 把 age 門檻隨 fps 放大會讓 confirm 變得不可達（實測 case 13 即因此漏判）。
         # 真正的證據強度由像素位移 + 軌跡物理 + 每幀速度檢查把關，age 維持基準值即可。
         self.min_confirm_age = MIN_CONFIRM_AGE
-        self.min_confirm_age_vehicle = MIN_CONFIRM_AGE_VEHICLE
+        self.min_confirm_age_vehicle = max(
+            2,
+            _env_int("LITTER_MIN_CONFIRM_AGE_VEHICLE", MIN_CONFIRM_AGE_VEHICLE),
+        )
         self.static_candidate_min_age = STATIC_CANDIDATE_MIN_AGE
         self.stationary_lock_age = STATIONARY_LOCK_AGE
         self.fall_stable_min_age = FALL_STABLE_MIN_AGE
         self.fall_stable_tail_window = FALL_STABLE_TAIL_WINDOW
+
+        # Confirmation recovery A/B: a track can be associated with its actor
+        # after the first accepted litter observation (e.g. actor detector
+        # cadence or occlusion), but the default still requires birth-time
+        # actor support.  This switch never bypasses motion/trajectory gates.
+        self.require_birth_thrower_for_confirmation = (
+            _env_int("LITTER_CONFIRM_REQUIRE_BIRTH_ACTOR", 1) != 0
+        )
+        self.max_horiz_to_down_ratio_vehicle = max(
+            0.0,
+            _env_float(
+                "LITTER_MAX_HORIZ_TO_DOWN_RATIO_VEHICLE",
+                MAX_HORIZ_TO_DOWN_RATIO_VEHICLE,
+            ),
+        )
+        self.min_vehicle_relative_separation = max(
+            0.0,
+            _env_float(
+                "LITTER_MIN_VEHICLE_RELATIVE_SEPARATION",
+                MIN_VEHICLE_RELATIVE_SEPARATION,
+            ),
+        )
 
         # --- 每幀像素速度上限：隨 fps 反向縮放 ---
         self.max_vehicle_thrower_step_px = _scale_down_px_per_frame(MAX_VEHICLE_THROWER_STEP_PX)
@@ -580,7 +632,9 @@ class GlobalLitterTracker:
                     downward_disp = float(centroid[1] - start_centroid[1])
                     is_downward_enough = downward_disp >= MIN_CONFIRM_DOWNWARD_DISPLACEMENT
                     horizontal_disp = abs(float(centroid[0] - start_centroid[0]))
-                    is_horizontal_enough = horizontal_disp >= MIN_CONFIRM_HORIZONTAL_DISPLACEMENT
+                    is_horizontal_enough = (
+                        horizontal_disp >= self.min_confirm_horizontal_displacement
+                    )
 
                     # 2. 使用軌跡物理特徵檢查（至少要有足夠歷史幀）
                     is_physics_valid = False
@@ -665,14 +719,17 @@ class GlobalLitterTracker:
                     # A passer-by acquired only after birth must not turn noise
                     # into a confirmed litter event.
                     release_actor_supported = (
-                        birth_thrower_key is not None and
-                        thrower_key is not None
+                        thrower_key is not None and
+                        (
+                            not self.require_birth_thrower_for_confirmation or
+                            birth_thrower_key is not None
+                        )
                     )
                     # 若 thrower 為車輛，且水平位移遠大於向下位移（純水平滑動），則不 confirm。
                     is_horiz_ratio_ok = True
                     if is_vehicle_thrower and downward_disp > 0:
                         horiz_ratio = horizontal_disp / max(downward_disp, 1e-6)
-                        if horiz_ratio > MAX_HORIZ_TO_DOWN_RATIO_VEHICLE:
+                        if horiz_ratio > self.max_horiz_to_down_ratio_vehicle:
                             is_horiz_ratio_ok = False
 
                     # 車輛 thrower：軌跡任意相鄰幀最大位移過大 → 車輛本體移動誤觸發，拒絕 confirm。
@@ -718,7 +775,7 @@ class GlobalLitterTracker:
                         )
                         if (
                             vehicle_rel_sep is not None and
-                            vehicle_rel_sep < MIN_VEHICLE_RELATIVE_SEPARATION
+                            vehicle_rel_sep < self.min_vehicle_relative_separation
                         ):
                             vehicle_relative_ok = False
 

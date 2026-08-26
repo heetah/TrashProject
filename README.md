@@ -296,6 +296,14 @@ MP4 片段，並附一份列出違規、關聯車輛、車牌與審核資料的 
 | `LITTER_CANDIDATE_SIDECAR` | `0` | 研究用逐 candidate JSONL，記錄 gate reason、tracker ID 與可重現設定；不供前端或 ground truth 使用 |
 | `LITTER_CANDIDATE_DEDUP` | `0` | 實驗性同幀 IoU 去重；目前 replay 未採用（未增加正確 confirmed 且 safety proxy 惡化） |
 | `LITTER_CANDIDATE_DEDUP_IOU` | `0.5` | 同幀 candidate 去重 IoU 門檻；僅在 `LITTER_CANDIDATE_DEDUP=1` 時生效 |
+| `LITTER_CONFIRM_REQUIRE_BIRTH_ACTOR` | `1` | Confirm 是否要求垃圾出生幀已有 thrower；研究 replay 可設 `0`，但仍必須通過運動、軌跡與 actor 關聯 gates |
+| `LITTER_MIN_CONFIRM_AGE_VEHICLE` | `3` | vehicle/scooter thrower 的最少 observation 次數；研究 replay 的 2 需以 reviewed clip-level 結果解讀 |
+| `LITTER_MIN_CONFIRM_DOWNWARD_VEHICLE` | `12` | vehicle/scooter thrower 的向下位移門檻（px）；僅供可重現 A/B replay |
+| `LITTER_MIN_CONFIRM_HORIZONTAL_DISPLACEMENT` | `5` | confirm 所需水平位移門檻（px）；降低會放行近垂直落下案例，必須同步檢查 FP proxy |
+| `LITTER_MAX_HORIZ_TO_DOWN_RATIO_VEHICLE` | `3.5` | vehicle thrower 水平/向下位移最大比例；過大會放行純水平滑動 |
+| `LITTER_MIN_VEHICLE_RELATIVE_SEPARATION` | `60` | 垃圾相對載體車輛的最小分離（px）；0 會關閉此 FP 抑制 gate |
+| `LITTER_FP_STREAK_RATIO` | `5` | 前處理水平 streak 與向下位移比例門檻 |
+| `LITTER_ALLOW_SHAKE_CANDIDATES` | `0` | 是否在 camera-shake frame 繼續提交 candidate；僅用於研究 replay |
 | `OUTPUT_ROOT` | `.` | Output directory；建議明確設為 `output` |
 
 其餘 action smoothing、video I/O、writer、Smart Backtrack 與 legacy research 開關都已列在
@@ -357,6 +365,14 @@ safety proxy，不能宣稱 false-positive rate 或普適最佳門檻；event an
 
 `exit_code=0` 只代表 pipeline 完成。無人工 reviewed route 的案例只能比較
 candidate coverage、route 變化與 margin，不可宣稱 attribution accuracy。
+
+2026-08-26 的研究 recovery replay（完整 63 部）使用 sidecar 記錄的暫時性放寬門檻，
+得到 41/63 confirmed clips（usable 41/58，Wilson 95% CI 52.75%--75.67%），達到
+「超過 40 部」的短期 coverage 目標；但未驗證 confirmed-track proxy 同時由 14 增至
+33，且 58 筆 event annotation 仍未人工 reviewed，因此不得把此結果解讀為 accuracy
+或可直接部署的參數。完整命令、paired CI 與回滾方式記於
+`versions/2026-08-26_codex_confirmation_recovery_replay.md`；機器可讀結果位於
+`artifacts/litter_postprocess_calibration/recovery_horiz1_full_20260826/`。
 
 `stage` 可為 `distance_time`、`kalman_rts`、`confidence`、`uncertainty`、
 `reverse` 或 `full`。其中 distance/time 以 birth anchor 與原始 actor

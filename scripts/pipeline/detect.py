@@ -660,7 +660,10 @@ def _stage_filter_litter_candidates(current_frame_litters, shake_active, shake_m
                 record['tracker_outcome'] = 'not_submitted'
     with profile_block(profiler, "detect.motion_holding_filter"):
         # 晃動冷卻區間內:整幀都在位移,litter 偵測不可靠 → 全數丟棄,不餵 tracker。
-        shake_skip = shake_active
+        shake_skip = (
+            shake_active and
+            os.environ.get("LITTER_ALLOW_SHAKE_CANDIDATES", "0") in ("0", "")
+        )
         if shake_skip and getattr(litter_tracker, '_debug', False):
             print(f"  [SHAKE_SKIP fi={frame_index} mag={shake_mag:.1f}px thr={shake_threshold:.1f} drop={len(current_frame_litters)}]")
         if shake_skip:

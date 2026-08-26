@@ -664,6 +664,33 @@ if __name__ == "__main__":
                         "LITTER_CANDIDATE_DEDUP", "0"
                     ) not in ("0", ""),
                     "dedup_iou_threshold": dedup_iou_threshold,
+                    # Tracker confirmation knobs are recorded alongside the
+                    # candidate trace so an A/B replay is reproducible from
+                    # its output directory rather than from shell history.
+                    "confirm_require_birth_actor": os.environ.get(
+                        "LITTER_CONFIRM_REQUIRE_BIRTH_ACTOR", "1"
+                    ) not in ("0", ""),
+                    "min_confirm_age_vehicle": _safe_float_env(
+                        "LITTER_MIN_CONFIRM_AGE_VEHICLE", 3
+                    ),
+                    "min_confirm_downward_vehicle": _safe_float_env(
+                        "LITTER_MIN_CONFIRM_DOWNWARD_VEHICLE", 12
+                    ),
+                    "min_confirm_horizontal_displacement": _safe_float_env(
+                        "LITTER_MIN_CONFIRM_HORIZONTAL_DISPLACEMENT", 5
+                    ),
+                    "max_horiz_to_down_ratio_vehicle": _safe_float_env(
+                        "LITTER_MAX_HORIZ_TO_DOWN_RATIO_VEHICLE", 3.5
+                    ),
+                    "min_vehicle_relative_separation": _safe_float_env(
+                        "LITTER_MIN_VEHICLE_RELATIVE_SEPARATION", 60
+                    ),
+                    "fp_streak_ratio": _safe_float_env(
+                        "LITTER_FP_STREAK_RATIO", 5
+                    ),
+                    "allow_shake_candidates": os.environ.get(
+                        "LITTER_ALLOW_SHAKE_CANDIDATES", "0"
+                    ) not in ("0", ""),
                 }
                 write_backtrack_jsonl(
                     [candidate_trace_run, *litter_candidate_records],

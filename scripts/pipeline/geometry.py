@@ -873,6 +873,9 @@ def litter_candidate_is_vehicle_fp(litter_box, actors, vehicle_history=None,
         return True, 'vehicle_contained'
 
     hist = list(prev_litter_history or [])
+    streak_ratio = max(
+        _float_env("LITTER_FP_STREAK_RATIO", LITTER_FP_STREAK_RATIO), 0.0
+    )
 
     # 2) horizontal streak（需軌跡）
     if hist:
@@ -894,10 +897,10 @@ def litter_candidate_is_vehicle_fp(litter_box, actors, vehicle_history=None,
         has_gravity_descent = (
             apex_index < len(arc_points) - 1 and
             descent_from_apex >= LITTER_FP_ARC_MIN_DESCENT and
-            descent_horiz <= LITTER_FP_STREAK_RATIO * descent_from_apex
+            descent_horiz <= streak_ratio * descent_from_apex
         )
         if (
-            horiz > LITTER_FP_STREAK_RATIO * max(down, 1e-6)
+            horiz > streak_ratio * max(down, 1e-6)
             and not has_gravity_descent
         ):
             # 真正從車窗/車斗邊緣拋出的輕物，一開始可能幾乎水平飛行。
