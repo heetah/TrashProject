@@ -374,6 +374,18 @@ candidate coverage、route 變化與 margin，不可宣稱 attribution accuracy�
 `versions/2026-08-26_codex_confirmation_recovery_replay.md`；機器可讀結果位於
 `artifacts/litter_postprocess_calibration/recovery_horiz1_full_20260826/`。
 
+將人工 actor ID 表與 recovery sidecar 對齊，可使用：
+
+```bash
+conda run -n rtdetr python scripts/summarize_actor_ground_truth_metrics.py \
+  --sidecar-dir output/rtdetr_recovery_horiz1_full_20260826 \
+  --output artifacts/actor_ground_truth_metrics/recovery_horiz1_full_20260826
+```
+
+輸出 `actor_clip_metrics.csv`（以影片為獨立單位）與
+`actor_event_metrics.csv`（含 release/birth 座標、距離、時間、margin 與 D/T/A
+components）；`UNUSED` 與 `?` 不會被放入 accuracy 分母。
+
 `stage` 可為 `distance_time`、`kalman_rts`、`confidence`、`uncertainty`、
 `reverse` 或 `full`。其中 distance/time 以 birth anchor 與原始 actor
 observation 為基準；
