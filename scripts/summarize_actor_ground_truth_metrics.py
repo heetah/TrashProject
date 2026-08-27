@@ -34,6 +34,13 @@ VEHICLE_GT: dict[int, int | str | None] = {
 
 PERSON_GT: dict[int, int] = {92: 2, 141: 3, 156: 1, 161: 1}
 
+# The reviewed table leaves the vehicle ID unknown for these two usable clips,
+# but the user has explicitly adjudicated both routes as correct by eye.  Keep
+# this separate from VEHICLE_GT: an unknown ID must never be converted into a
+# fabricated numeric identity.  The override is used only for the explicitly
+# reported, adjudicated route metric.
+HUMAN_VERIFIED_CORRECT: frozenset[int] = frozenset({74, 174})
+
 
 def _case_id(filename: str | Path) -> int:
     match = re.search(r"litter_case_(\d+)", Path(filename).name)
@@ -114,7 +121,12 @@ def _event_row(cid: int, index: int, record: dict[str, Any], gt_event: dict[str,
     allowed_vehicle = _allowed_ids(gt_vehicle)
     vehicle_match = None if unused or allowed_vehicle is None else pred_vehicle in allowed_vehicle
     person_match = None if unused or gt_person is None else pred_person == gt_person
-    if unused or (allowed_vehicle is None and gt_person is None):
+    human_verified_correct = (cid in HUMAN_VERIFIED_CORRECT) and not unused
+    if human_verified_correct:
+        # This is a manual adjudication, not an inferred vehicle-ID match.
+        # Preserve the unknown ID and expose the override explicitly.
+        route_match = True
+    elif unused or (allowed_vehicle is None and gt_person is None):
         route_match = None
     elif gt_person is not None and allowed_vehicle is not None:
         route_match = pred_person == gt_person and pred_vehicle in allowed_vehicle
@@ -153,6 +165,7 @@ def _event_row(cid: int, index: int, record: dict[str, Any], gt_event: dict[str,
         "predicted_person_id": pred_person,
         "gt_vehicle_id": gt_vehicle,
         "gt_person_id": gt_person,
+        "human_verified_correct": human_verified_correct,
         "vehicle_match": vehicle_match,
         "person_match": person_match,
         "route_match": route_match,
@@ -218,19 +231,21 @@ def build_report(sidecar_dir: Path, ground_truth_path: Path, clip_path: Path) ->
         route_matches = [row["route_match"] for row in rows if row["route_match"] is not None]
         vehicle_matches = [row["vehicle_match"] for row in rows if row["vehicle_match"] is not None]
         person_matches = [row["person_match"] for row in rows if row["person_match"] is not None]
+        human_verified_correct = (cid in HUMAN_VERIFIED_CORRECT) and usable
         clip_rows.append({
             "litter_case": cid,
             "video_usable": usable,
             "label_status": "UNUSED" if not usable else ("KNOWN" if known_label else ("UNKNOWN" if gt_vehicle == "?" else "MISSING")),
             "gt_vehicle_id": gt_vehicle,
             "gt_person_id": gt_person,
+            "human_verified_correct": human_verified_correct,
             "confirmed_event_count": _confirmed_count(sidecar_dir, cid),
             "predicted_vehicle_ids": sorted({row["predicted_vehicle_id"] for row in rows if row["predicted_vehicle_id"] is not None}),
             "predicted_person_ids": sorted({row["predicted_person_id"] for row in rows if row["predicted_person_id"] is not None}),
             "route_prediction_count": len(rows),
             "vehicle_match_any": any(vehicle_matches) if vehicle_matches else (False if known_label and allowed_vehicle is not None and usable else None),
             "person_match_any": any(person_matches) if person_matches else (False if gt_person is not None and usable else None),
-            "route_match_any": any(route_matches) if route_matches else (False if known_label and usable else None),
+            "route_match_any": (True if human_verified_correct else (any(route_matches) if route_matches else (False if known_label and usable else None))),
             "margin_median": median([row["margin_to_second"] for row in rows if isinstance(row.get("margin_to_second"), (int, float))]) if rows else None,
             "release_birth_distance_median_px": median([row["release_birth_distance_px"] for row in rows if isinstance(row.get("release_birth_distance_px"), (int, float))]) if rows else None,
             "release_birth_delta_median_frames": median([row["release_to_birth_delta_frames"] for row in rows if isinstance(row.get("release_to_birth_delta_frames"), (int, float))]) if rows else None,
@@ -238,6 +253,10 @@ def build_report(sidecar_dir: Path, ground_truth_path: Path, clip_path: Path) ->
 
     usable_rows = [row for row in clip_rows if row["video_usable"]]
     known_rows = [row for row in usable_rows if row["label_status"] == "KNOWN"]
+    adjudicated_rows = [
+        row for row in usable_rows
+        if row["label_status"] == "KNOWN" or row["human_verified_correct"]
+    ]
     vehicle_rows = [row for row in known_rows if _allowed_ids(row["gt_vehicle_id"]) is not None]
     person_rows = [row for row in known_rows if row["gt_person_id"] is not None]
     confirmed_usable = sum(row["confirmed_event_count"] > 0 for row in usable_rows)
@@ -262,6 +281,12 @@ def build_report(sidecar_dir: Path, ground_truth_path: Path, clip_path: Path) ->
         "strict_route_accuracy": {
             "correct_clip_count": sum(bool(row["route_match_any"]) for row in known_rows),
             "denominator": len(known_rows),
+        },
+        "adjudicated_route_accuracy": {
+            "correct_clip_count": sum(bool(row["route_match_any"]) for row in adjudicated_rows),
+            "denominator": len(adjudicated_rows),
+            "human_verified_correct_cases": sorted(HUMAN_VERIFIED_CORRECT),
+            "note": "Adds explicit visual adjudications for unknown vehicle IDs; this does not establish a numeric vehicle-ID match or detector confirmation.",
         },
         "event_level_route_accuracy": {
             "correct_event_count": sum(bool(row["route_match"]) for row in known_event_rows),
@@ -296,6 +321,7 @@ def build_report(sidecar_dir: Path, ground_truth_path: Path, clip_path: Path) ->
             "UNUSED clips are excluded from accuracy denominators.",
             "A route_match is based on the user-supplied actor IDs, not on detector confidence.",
             "Unknown '?' actor IDs are reported but excluded from accuracy denominators.",
+            "Cases 74 and 174 are included only in adjudicated_route_accuracy because the user marked them visually correct while leaving vehicle ID unknown.",
         ],
     }
     return event_rows, clip_rows, summary

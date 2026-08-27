@@ -37,3 +37,24 @@ def test_event_row_computes_route_and_release_birth_metrics():
 def test_summary_stats_empty_and_numeric():
     assert _summary_stats([], "x")["n"] == 0
     assert _summary_stats([{"x": 1}, {"x": 3}], "x")["median"] == 2
+
+
+def test_unknown_vehicle_cases_keep_id_unknown_but_are_human_adjudicated():
+    record = {
+        "record_type": "candidate",
+        "assignment": {
+            "route_type": "direct_vehicle",
+            "vehicle_key": ["vehicle", 1],
+            "person_key": None,
+            "release_frame": 8,
+            "release_point": [3.0, 4.0],
+        },
+        "event": {"litter_id": 0},
+        "resolver_input": {"birth_frame": 8, "birth_centroid": [3.0, 4.0], "fps": 10.0},
+    }
+    row = _event_row(174, 0, record, {}, False)
+    assert row["gt_vehicle_id"] == "?"
+    assert row["predicted_vehicle_id"] == 1
+    assert row["human_verified_correct"] is True
+    assert row["route_match"] is True
+    assert row["vehicle_match"] is None
