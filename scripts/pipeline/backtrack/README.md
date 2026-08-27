@@ -140,15 +140,22 @@ All route types and the full NULL route remain present in every stage.
 hypothesis records `search_truncated` and its reason, so research reports do not
 misstate this engineering guard as a physical release-time gate.
 
-Research replay can override the physical gates through `StudyConfig` without
-changing production defaults: `normalized_distance_gate_vehicle`,
-`normalized_distance_gate_person`, `max_observation_gap_seconds`, and the
-optional `max_observation_gap_frames`. When both time fields are set, a
-candidate must satisfy both limits; seconds preserve physical meaning across
-FPS, while the frame cap limits detector-miss tolerance. Internally this is
-equivalent to `gap_frames <= min(round(fps * seconds), frame_cap)` (and the
-frame gap is also checked in seconds), so `3 frames + 0.25 seconds` is an
-AND constraint, not an additive 0.55-second allowance.
+Production direct litter→vehicle association uses the original, unexpanded
+vehicle bbox. For release point `p` and vehicle bbox `B` with width `w` and
+height `h`, the physical distance is
+`D=dist(p,B)/sqrt(w^2+h^2)` and the hard gate is `D<=0.30`. Production actor
+timing must satisfy both `gap_frames<=3` and `gap_frames/FPS<=0.25 s`.
+Internally the seconds limit is converted with `floor(FPS*0.25)` before taking
+the minimum with 3; flooring prevents a rounded frame count from exceeding
+the requested physical duration. Thus `3 frames + 0.25 seconds` is an AND
+constraint, not an additive 0.55-second allowance.
+
+Research replay can override these fields through `StudyConfig`, including
+`vehicle_bbox_expand_x_ratio` and `vehicle_bbox_expand_y_ratio`. The legacy
+control is reproducible with expansion `0.18/0.15`, vehicle distance gate
+`0.8`, and `max_observation_gap_frames=None`; these are no longer production
+defaults. Seconds preserve physical meaning across FPS, while the frame cap
+limits detector-miss tolerance.
 
 `kalman_rts` trial configs may additionally set
 `kalman_process_noise_scale`, `kalman_measurement_noise_scale`, and

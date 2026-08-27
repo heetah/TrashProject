@@ -1,6 +1,7 @@
 """Explicit cost cells for litter-person-vehicle backtracking."""
 
 from dataclasses import dataclass, field
+import math
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -287,6 +288,26 @@ def _nearest_observation(
     return observation
 
 
+def _physical_gap_limit_frames(
+    seconds: float,
+    fps: float,
+    frame_cap: Optional[int],
+) -> int:
+    """Convert the seconds gate to frames, then apply an optional AND cap.
+
+    ``floor`` is intentional: rounding upward could admit an observation whose
+    real elapsed time is greater than the configured seconds limit.
+    """
+
+    seconds_limit = max(
+        int(math.floor(max(float(seconds), 0.0) * max(float(fps), 0.0) + 1e-9)),
+        0,
+    )
+    if frame_cap is None:
+        return seconds_limit
+    return min(seconds_limit, max(int(frame_cap), 0))
+
+
 def _point_to_rect_vector(point: np.ndarray, rect) -> np.ndarray:
     x1, y1, x2, y2 = map(float, rect)
     nearest = np.asarray(
@@ -357,7 +378,7 @@ def compute_c_ba(
     person_observations: Sequence[ActorObservation],
     fps: float,
     max_observation_gap_seconds: float = 0.25,
-    max_observation_gap_frames: Optional[int] = None,
+    max_observation_gap_frames: Optional[int] = 3,
     max_uncertainty_height_ratio: float = 1.5,
     normalized_distance_gate: float = 0.85,
     cost_config: Optional[BacktrackCostConfig] = None,
@@ -373,9 +394,9 @@ def compute_c_ba(
         return CostCell.rejected("no_person_observation")
     if not releases:
         return CostCell.rejected("no_release_hypothesis")
-    max_gap = max(int(round(float(max_observation_gap_seconds) * float(fps))), 0)
-    if max_observation_gap_frames is not None:
-        max_gap = min(max_gap, max(int(max_observation_gap_frames), 0))
+    max_gap = _physical_gap_limit_frames(
+        max_observation_gap_seconds, fps, max_observation_gap_frames
+    )
 
     candidates = []
     rejected_uncertainty = False
@@ -519,12 +540,14 @@ def compute_c_bc(
     vehicle_observations: Sequence[ActorObservation],
     fps: float,
     max_observation_gap_seconds: float = 0.25,
-    max_observation_gap_frames: Optional[int] = None,
+    max_observation_gap_frames: Optional[int] = 3,
     max_uncertainty_height_ratio: float = 1.5,
-    normalized_distance_gate: float = 0.8,
+    normalized_distance_gate: float = 0.3,
     cost_config: Optional[BacktrackCostConfig] = None,
     litter_last_point: Optional[Sequence[float]] = None,
     litter_last_frame: Optional[int] = None,
+    vehicle_bbox_expand_x_ratio: float = 0.0,
+    vehicle_bbox_expand_y_ratio: float = 0.0,
 ) -> CostCell:
     """Direct litter-vehicle route with a hard physical release gate."""
 
@@ -537,9 +560,9 @@ def compute_c_bc(
         return CostCell.rejected("no_vehicle_observation")
     if not releases:
         return CostCell.rejected("no_release_hypothesis")
-    max_gap = max(int(round(float(max_observation_gap_seconds) * float(fps))), 0)
-    if max_observation_gap_frames is not None:
-        max_gap = min(max_gap, max(int(max_observation_gap_frames), 0))
+    max_gap = _physical_gap_limit_frames(
+        max_observation_gap_seconds, fps, max_observation_gap_frames
+    )
 
     candidates = []
     rejected_uncertainty = False
@@ -564,11 +587,11 @@ def compute_c_bc(
             rejected_uncertainty = True
             continue
 
-        # A modest expansion permits a window/door release, but a far vehicle
-        # can never become valid merely through a low additive cost.
+        # Production measures distance from the observed vehicle bbox itself.
+        # Expansion remains an explicit research override for legacy replay.
         x1, y1, x2, y2 = vehicle.bbox
-        margin_x = 0.18 * vehicle.width
-        margin_y = 0.15 * vehicle.height
+        margin_x = max(float(vehicle_bbox_expand_x_ratio), 0.0) * vehicle.width
+        margin_y = max(float(vehicle_bbox_expand_y_ratio), 0.0) * vehicle.height
         release_u, release_v = map(float, release.mean_uv)
         if x1 <= release_u <= x2 and y1 <= release_v <= y2:
             interior_depth = min(
@@ -577,12 +600,14 @@ def compute_c_bc(
                 release_v - y1,
                 y2 - release_v,
             )
-            # Reuse the same physical shell that expands the vehicle release
-            # zone. A point near a window/body edge costs little; a point deep
-            # inside a large overlapping bbox is suspicious under occlusion.
+            # Boundary depth is a soft diagnostic inside the original bbox,
+            # independent of whether the hard-gate rectangle is expanded.
+            boundary_scale = max(
+                0.18 * vehicle.width, 0.15 * vehicle.height, 1.0
+            )
             boundary_depth = min(
                 max(float(interior_depth), 0.0)
-                / max(float(margin_x), float(margin_y), 1.0),
+                / boundary_scale,
                 1.0,
             )
         else:
@@ -751,7 +776,7 @@ def compute_c_ac(
     vehicle_observations: Sequence[ActorObservation],
     fps: float,
     max_pair_gap_seconds: float = 0.25,
-    max_observation_gap_frames: Optional[int] = None,
+    max_observation_gap_frames: Optional[int] = 3,
     proximity_gate: float = 1.2,
     max_uncertainty_height_ratio: float = 1.5,
     min_dwell_seconds: float = 0.15,
@@ -785,9 +810,9 @@ def compute_c_ac(
     )
     if not people or not vehicles:
         return CostCell.rejected("missing_person_or_vehicle")
-    max_gap = max(int(round(float(max_pair_gap_seconds) * float(fps))), 0)
-    if max_observation_gap_frames is not None:
-        max_gap = min(max_gap, max(int(max_observation_gap_frames), 0))
+    max_gap = _physical_gap_limit_frames(
+        max_pair_gap_seconds, fps, max_observation_gap_frames
+    )
 
     pairs = []
     vehicle_index = 0

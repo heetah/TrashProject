@@ -59,12 +59,15 @@ class SmartBacktrackConfig:
     two_point_prior_cost: float = 1.0
     max_forward_release_seconds: float = 0.5
     release_window_prior_weight: float = 0.35
-    # Physical association gates. Defaults preserve production behavior;
-    # research replays may override them explicitly.
+    # Production physical gates: elapsed evidence must satisfy both the
+    # seconds limit and frame cap; direct-vehicle distance uses the unexpanded
+    # bbox. Research replays may override every value explicitly.
     max_observation_gap_seconds: float = 0.25
-    max_observation_gap_frames: Optional[int] = None
+    max_observation_gap_frames: Optional[int] = 3
     normalized_distance_gate_person: float = 0.85
-    normalized_distance_gate_vehicle: float = 0.8
+    normalized_distance_gate_vehicle: float = 0.3
+    vehicle_bbox_expand_x_ratio: float = 0.0
+    vehicle_bbox_expand_y_ratio: float = 0.0
     cost_config: BacktrackCostConfig = field(default_factory=BacktrackCostConfig)
     # Research switches default to the current production behavior.  They are
     # intentionally constructor-only; production never reads them from env.
@@ -703,6 +706,8 @@ class SmartBacktrackResolver:
             max_observation_gap_seconds=self.config.max_observation_gap_seconds,
             max_observation_gap_frames=self.config.max_observation_gap_frames,
             normalized_distance_gate=self.config.normalized_distance_gate_vehicle,
+            vehicle_bbox_expand_x_ratio=self.config.vehicle_bbox_expand_x_ratio,
+            vehicle_bbox_expand_y_ratio=self.config.vehicle_bbox_expand_y_ratio,
             **bc_context,
         )
         ac_costs = build_ac_costs(
@@ -737,6 +742,8 @@ class SmartBacktrackResolver:
                 max_observation_gap_seconds=self.config.max_observation_gap_seconds,
                 max_observation_gap_frames=self.config.max_observation_gap_frames,
                 normalized_distance_gate=self.config.normalized_distance_gate_vehicle,
+                vehicle_bbox_expand_x_ratio=self.config.vehicle_bbox_expand_x_ratio,
+                vehicle_bbox_expand_y_ratio=self.config.vehicle_bbox_expand_y_ratio,
                 **bc_context,
             )
             for vehicle_key, observations in vehicle_tracks.items()

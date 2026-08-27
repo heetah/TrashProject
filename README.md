@@ -153,6 +153,13 @@ release hypotheses + actor tracklets
 
 Hungarian 只維護同一物件跨幀 identity，不做 person↔vehicle 或 litter attribution。Person/vehicle capacity 允許同車多人與同人多事件；每個事件都有 `NULL` route，避免證據不足時強制歸因。
 
+Production 的 direct litter→vehicle hard gate 使用未擴張的 vehicle bbox。令 release
+point 為 `p`、vehicle bbox 為 `B`、bbox 寬高為 `w,h`，距離定義為
+`D = dist(p, B) / sqrt(w²+h²)`，要求 `D <= 0.30`。Actor evidence 與 release
+的時間差同時要求 `Δframe <= 3` 及 `Δframe/FPS <= 0.25 s`；兩者是 AND，
+不是相加成 0.55 秒。固定秒數保留跨 FPS 的物理意義，3-frame cap 則限制逐幀
+detector 可漏失的 observation 數。
+
 Backtrack sidecar 用於標註、成本校正與 gate 分析。沒有人工 reviewed ground truth 時，只能報告 candidate coverage/resolved/dustbin，不能宣稱歸因準確率。
 
 ### Plate OCR

@@ -82,6 +82,32 @@ def test_study_config_exposes_research_distance_and_hybrid_time_gates():
     assert config.normalized_distance_gate_person == pytest.approx(0.85)
     assert config.max_observation_gap_seconds == pytest.approx(0.25)
     assert config.max_observation_gap_frames == 3
+
+
+def test_production_defaults_are_no_expansion_d03_and_hybrid_time_gate():
+    config = SmartBacktrackConfig()
+    study_config = StudyConfig().resolver_config(fps=30)
+
+    for actual in (config, study_config):
+        assert actual.normalized_distance_gate_vehicle == pytest.approx(0.3)
+        assert actual.max_observation_gap_seconds == pytest.approx(0.25)
+        assert actual.max_observation_gap_frames == 3
+        assert actual.vehicle_bbox_expand_x_ratio == pytest.approx(0.0)
+        assert actual.vehicle_bbox_expand_y_ratio == pytest.approx(0.0)
+
+
+def test_study_can_replay_legacy_vehicle_gate():
+    config = StudyConfig(
+        normalized_distance_gate_vehicle=0.8,
+        max_observation_gap_frames=None,
+        vehicle_bbox_expand_x_ratio=0.18,
+        vehicle_bbox_expand_y_ratio=0.15,
+    ).resolver_config(fps=10)
+
+    assert config.normalized_distance_gate_vehicle == pytest.approx(0.8)
+    assert config.max_observation_gap_frames is None
+    assert config.vehicle_bbox_expand_x_ratio == pytest.approx(0.18)
+    assert config.vehicle_bbox_expand_y_ratio == pytest.approx(0.15)
 from pipeline.backtrack.costs import BacktrackCostConfig, compute_c_ba
 from pipeline.backtrack.trajectory import ReleaseHypothesis
 from pipeline.backtrack.costs import ActorObservation

@@ -273,6 +273,76 @@ def test_c_bc_boundary_depth_penalizes_deep_bbox_containment_only_when_enabled()
     assert weighted_edge.total == pytest.approx(baseline_edge.total)
 
 
+def test_c_bc_production_gate_uses_unexpanded_bbox_and_diagonal_scale():
+    vehicle = [ActorObservation(
+        cls_name="vehicle",
+        track_id=2,
+        frame_index=10,
+        bbox=(0.0, 0.0, 80.0, 60.0),  # diagonal = 100 px
+    )]
+
+    at_029 = compute_c_bc([_release(10, (109.0, 30.0))], vehicle, fps=10)
+    at_031 = compute_c_bc([_release(10, (111.0, 30.0))], vehicle, fps=10)
+
+    assert at_029.valid
+    assert at_029.raw_features["direct_distance"] == pytest.approx(0.29)
+    assert not at_031.valid
+    assert at_031.components["minimum_normalized_distance"] == pytest.approx(0.31)
+
+
+def test_c_bc_legacy_bbox_expansion_is_an_explicit_research_override():
+    vehicle = [ActorObservation(
+        cls_name="vehicle",
+        track_id=2,
+        frame_index=10,
+        bbox=(0.0, 0.0, 80.0, 60.0),
+    )]
+    release = _release(10, (95.0, 30.0))
+
+    production = compute_c_bc(
+        [release], vehicle, fps=10, normalized_distance_gate=0.10
+    )
+    legacy = compute_c_bc(
+        [release],
+        vehicle,
+        fps=10,
+        normalized_distance_gate=0.10,
+        vehicle_bbox_expand_x_ratio=0.18,
+        vehicle_bbox_expand_y_ratio=0.15,
+    )
+
+    assert not production.valid
+    assert legacy.valid
+    assert legacy.raw_features["direct_distance"] == pytest.approx(0.006)
+
+
+def test_observation_time_gate_requires_three_frames_and_quarter_second():
+    vehicle = [ActorObservation(
+        cls_name="vehicle",
+        track_id=2,
+        frame_index=14,
+        bbox=(0.0, 0.0, 80.0, 60.0),
+    )]
+    release = _release(10, (40.0, 30.0))
+
+    hybrid = compute_c_bc([release], vehicle, fps=30)
+    seconds_only = compute_c_bc(
+        [release], vehicle, fps=30, max_observation_gap_frames=None
+    )
+
+    assert not hybrid.valid  # 4 frames is only 0.133 s, but exceeds 3 frames.
+    assert seconds_only.valid
+
+    low_fps_vehicle = [ActorObservation(
+        cls_name="vehicle",
+        track_id=2,
+        frame_index=13,
+        bbox=(0.0, 0.0, 80.0, 60.0),
+    )]
+    low_fps = compute_c_bc([release], low_fps_vehicle, fps=10)
+    assert not low_fps.valid  # 3 frames meets the frame cap but is 0.30 s.
+
+
 def test_c_ba_uses_upper_body_release_zone_not_person_footpoint():
     # Release is near the hand/torso and 110 px away from the footpoint.
     person = ActorObservation(

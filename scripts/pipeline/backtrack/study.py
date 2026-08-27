@@ -60,12 +60,14 @@ class StudyConfig:
     two_point_prior_cost: float = 1.0
     max_forward_release_seconds: float = 0.5
     release_window_prior_weight: float = 0.35
-    # Optional physical-gate overrides for research replay. ``None`` keeps the
-    # production observation-gap frame behavior derived from seconds.
+    # Physical gates default to production; explicit values reproduce legacy
+    # or sensitivity trials without changing process-wide environment state.
     max_observation_gap_seconds: float = 0.25
-    max_observation_gap_frames: Optional[int] = None
+    max_observation_gap_frames: Optional[int] = 3
     normalized_distance_gate_person: float = 0.85
-    normalized_distance_gate_vehicle: float = 0.8
+    normalized_distance_gate_vehicle: float = 0.3
+    vehicle_bbox_expand_x_ratio: float = 0.0
+    vehicle_bbox_expand_y_ratio: float = 0.0
     distance_weight: float = 1.0
     time_weight: float = 1.0
     kalman_process_noise_scale: float = 1.0
@@ -104,6 +106,10 @@ class StudyConfig:
             raise ValueError("normalized_distance_gate_person must be positive")
         if self.normalized_distance_gate_vehicle <= 0.0:
             raise ValueError("normalized_distance_gate_vehicle must be positive")
+        if self.vehicle_bbox_expand_x_ratio < 0.0:
+            raise ValueError("vehicle_bbox_expand_x_ratio must be non-negative")
+        if self.vehicle_bbox_expand_y_ratio < 0.0:
+            raise ValueError("vehicle_bbox_expand_y_ratio must be non-negative")
         if self.distance_weight < 0.0 or self.time_weight < 0.0:
             raise ValueError("distance/time weights must be non-negative")
         if self.distance_weight + self.time_weight <= 0.0:
@@ -212,6 +218,12 @@ class StudyConfig:
             ),
             normalized_distance_gate_vehicle=float(
                 self.normalized_distance_gate_vehicle
+            ),
+            vehicle_bbox_expand_x_ratio=float(
+                self.vehicle_bbox_expand_x_ratio
+            ),
+            vehicle_bbox_expand_y_ratio=float(
+                self.vehicle_bbox_expand_y_ratio
             ),
             cost_config=cost_config,
             use_kalman_rts=use_kalman_rts,
