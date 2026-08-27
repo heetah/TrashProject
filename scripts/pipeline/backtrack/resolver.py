@@ -59,6 +59,12 @@ class SmartBacktrackConfig:
     two_point_prior_cost: float = 1.0
     max_forward_release_seconds: float = 0.5
     release_window_prior_weight: float = 0.35
+    # Physical association gates. Defaults preserve production behavior;
+    # research replays may override them explicitly.
+    max_observation_gap_seconds: float = 0.25
+    max_observation_gap_frames: Optional[int] = None
+    normalized_distance_gate_person: float = 0.85
+    normalized_distance_gate_vehicle: float = 0.8
     cost_config: BacktrackCostConfig = field(default_factory=BacktrackCostConfig)
     # Research switches default to the current production behavior.  They are
     # intentionally constructor-only; production never reads them from env.
@@ -686,17 +692,25 @@ class SmartBacktrackResolver:
             releases, person_tracks, fps,
             cost_config=self.config.cost_config,
             max_uncertainty_height_ratio=max_uncertainty_ratio,
+            max_observation_gap_seconds=self.config.max_observation_gap_seconds,
+            max_observation_gap_frames=self.config.max_observation_gap_frames,
+            normalized_distance_gate=self.config.normalized_distance_gate_person,
         )
         bc_costs = build_bc_costs(
             releases, vehicle_tracks, fps,
             cost_config=self.config.cost_config,
             max_uncertainty_height_ratio=max_uncertainty_ratio,
+            max_observation_gap_seconds=self.config.max_observation_gap_seconds,
+            max_observation_gap_frames=self.config.max_observation_gap_frames,
+            normalized_distance_gate=self.config.normalized_distance_gate_vehicle,
             **bc_context,
         )
         ac_costs = build_ac_costs(
             person_tracks, vehicle_tracks, fps,
             cost_config=self.config.cost_config,
             max_uncertainty_height_ratio=max_uncertainty_ratio,
+            max_pair_gap_seconds=self.config.max_observation_gap_seconds,
+            max_observation_gap_frames=self.config.max_observation_gap_frames,
         )
         # Keep pre-collapse per-release cells for the research sidecar.  A
         # collapsed pair cost alone cannot tell whether the GT release was
@@ -706,6 +720,9 @@ class SmartBacktrackResolver:
                 [release], observations, fps,
                 cost_config=self.config.cost_config,
                 max_uncertainty_height_ratio=max_uncertainty_ratio,
+                max_observation_gap_seconds=self.config.max_observation_gap_seconds,
+                max_observation_gap_frames=self.config.max_observation_gap_frames,
+                normalized_distance_gate=self.config.normalized_distance_gate_person,
             )
             for person_key, observations in person_tracks.items()
             for release in releases
@@ -717,6 +734,9 @@ class SmartBacktrackResolver:
                 [release], observations, fps,
                 cost_config=self.config.cost_config,
                 max_uncertainty_height_ratio=max_uncertainty_ratio,
+                max_observation_gap_seconds=self.config.max_observation_gap_seconds,
+                max_observation_gap_frames=self.config.max_observation_gap_frames,
+                normalized_distance_gate=self.config.normalized_distance_gate_vehicle,
                 **bc_context,
             )
             for vehicle_key, observations in vehicle_tracks.items()

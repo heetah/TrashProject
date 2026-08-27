@@ -140,6 +140,16 @@ All route types and the full NULL route remain present in every stage.
 hypothesis records `search_truncated` and its reason, so research reports do not
 misstate this engineering guard as a physical release-time gate.
 
+Research replay can override the physical gates through `StudyConfig` without
+changing production defaults: `normalized_distance_gate_vehicle`,
+`normalized_distance_gate_person`, `max_observation_gap_seconds`, and the
+optional `max_observation_gap_frames`. When both time fields are set, a
+candidate must satisfy both limits; seconds preserve physical meaning across
+FPS, while the frame cap limits detector-miss tolerance. Internally this is
+equivalent to `gap_frames <= min(round(fps * seconds), frame_cap)` (and the
+frame gap is also checked in seconds), so `3 frames + 0.25 seconds` is an
+AND constraint, not an additive 0.55-second allowance.
+
 `kalman_rts` trial configs may additionally set
 `kalman_process_noise_scale`, `kalman_measurement_noise_scale`, and
 `kalman_max_extrapolation_seconds`. These affect actor smoothing/interpolation

@@ -60,6 +60,12 @@ class StudyConfig:
     two_point_prior_cost: float = 1.0
     max_forward_release_seconds: float = 0.5
     release_window_prior_weight: float = 0.35
+    # Optional physical-gate overrides for research replay. ``None`` keeps the
+    # production observation-gap frame behavior derived from seconds.
+    max_observation_gap_seconds: float = 0.25
+    max_observation_gap_frames: Optional[int] = None
+    normalized_distance_gate_person: float = 0.85
+    normalized_distance_gate_vehicle: float = 0.8
     distance_weight: float = 1.0
     time_weight: float = 1.0
     kalman_process_noise_scale: float = 1.0
@@ -90,6 +96,14 @@ class StudyConfig:
             raise ValueError("max_forward_release_seconds must be non-negative")
         if self.release_window_prior_weight < 0.0:
             raise ValueError("release_window_prior_weight must be non-negative")
+        if self.max_observation_gap_seconds < 0.0:
+            raise ValueError("max_observation_gap_seconds must be non-negative")
+        if self.max_observation_gap_frames is not None and self.max_observation_gap_frames < 0:
+            raise ValueError("max_observation_gap_frames must be non-negative")
+        if self.normalized_distance_gate_person <= 0.0:
+            raise ValueError("normalized_distance_gate_person must be positive")
+        if self.normalized_distance_gate_vehicle <= 0.0:
+            raise ValueError("normalized_distance_gate_vehicle must be positive")
         if self.distance_weight < 0.0 or self.time_weight < 0.0:
             raise ValueError("distance/time weights must be non-negative")
         if self.distance_weight + self.time_weight <= 0.0:
@@ -185,6 +199,19 @@ class StudyConfig:
             ),
             release_window_prior_weight=float(
                 self.release_window_prior_weight
+            ),
+            max_observation_gap_seconds=float(
+                self.max_observation_gap_seconds
+            ),
+            max_observation_gap_frames=(
+                int(self.max_observation_gap_frames)
+                if self.max_observation_gap_frames is not None else None
+            ),
+            normalized_distance_gate_person=float(
+                self.normalized_distance_gate_person
+            ),
+            normalized_distance_gate_vehicle=float(
+                self.normalized_distance_gate_vehicle
             ),
             cost_config=cost_config,
             use_kalman_rts=use_kalman_rts,

@@ -67,6 +67,21 @@ def test_study_config_can_ablate_bc_direction_features_in_sequence():
     assert config.bc_weights["relative_motion_deficit"] == pytest.approx(0.3)
     assert config.bc_weights["reverse_direction"] == pytest.approx(0.4)
     assert config.bc_weights["boundary_depth"] == pytest.approx(0.5)
+
+
+def test_study_config_exposes_research_distance_and_hybrid_time_gates():
+    config = StudyConfig(
+        stage="full",
+        normalized_distance_gate_vehicle=0.3,
+        normalized_distance_gate_person=0.85,
+        max_observation_gap_seconds=0.25,
+        max_observation_gap_frames=3,
+    ).resolver_config(fps=10)
+
+    assert config.normalized_distance_gate_vehicle == pytest.approx(0.3)
+    assert config.normalized_distance_gate_person == pytest.approx(0.85)
+    assert config.max_observation_gap_seconds == pytest.approx(0.25)
+    assert config.max_observation_gap_frames == 3
 from pipeline.backtrack.costs import BacktrackCostConfig, compute_c_ba
 from pipeline.backtrack.trajectory import ReleaseHypothesis
 from pipeline.backtrack.costs import ActorObservation

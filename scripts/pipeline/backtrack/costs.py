@@ -357,6 +357,7 @@ def compute_c_ba(
     person_observations: Sequence[ActorObservation],
     fps: float,
     max_observation_gap_seconds: float = 0.25,
+    max_observation_gap_frames: Optional[int] = None,
     max_uncertainty_height_ratio: float = 1.5,
     normalized_distance_gate: float = 0.85,
     cost_config: Optional[BacktrackCostConfig] = None,
@@ -373,6 +374,8 @@ def compute_c_ba(
     if not releases:
         return CostCell.rejected("no_release_hypothesis")
     max_gap = max(int(round(float(max_observation_gap_seconds) * float(fps))), 0)
+    if max_observation_gap_frames is not None:
+        max_gap = min(max_gap, max(int(max_observation_gap_frames), 0))
 
     candidates = []
     rejected_uncertainty = False
@@ -516,6 +519,7 @@ def compute_c_bc(
     vehicle_observations: Sequence[ActorObservation],
     fps: float,
     max_observation_gap_seconds: float = 0.25,
+    max_observation_gap_frames: Optional[int] = None,
     max_uncertainty_height_ratio: float = 1.5,
     normalized_distance_gate: float = 0.8,
     cost_config: Optional[BacktrackCostConfig] = None,
@@ -534,6 +538,8 @@ def compute_c_bc(
     if not releases:
         return CostCell.rejected("no_release_hypothesis")
     max_gap = max(int(round(float(max_observation_gap_seconds) * float(fps))), 0)
+    if max_observation_gap_frames is not None:
+        max_gap = min(max_gap, max(int(max_observation_gap_frames), 0))
 
     candidates = []
     rejected_uncertainty = False
@@ -745,6 +751,7 @@ def compute_c_ac(
     vehicle_observations: Sequence[ActorObservation],
     fps: float,
     max_pair_gap_seconds: float = 0.25,
+    max_observation_gap_frames: Optional[int] = None,
     proximity_gate: float = 1.2,
     max_uncertainty_height_ratio: float = 1.5,
     min_dwell_seconds: float = 0.15,
@@ -779,6 +786,8 @@ def compute_c_ac(
     if not people or not vehicles:
         return CostCell.rejected("missing_person_or_vehicle")
     max_gap = max(int(round(float(max_pair_gap_seconds) * float(fps))), 0)
+    if max_observation_gap_frames is not None:
+        max_gap = min(max_gap, max(int(max_observation_gap_frames), 0))
 
     pairs = []
     vehicle_index = 0
