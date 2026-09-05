@@ -44,6 +44,7 @@ class BacktrackCostConfig:
     # stages express distance and time as fractions of their hard gates so
     # weights compare dimensionless quantities with the same 0..1 meaning.
     normalize_distance_time_by_gate: bool = False
+    normalize_bc_distance_time_by_gate: bool = False
 
     @classmethod
     def for_stage(
@@ -639,6 +640,7 @@ def compute_c_bc(
         resolved_cost_config = cost_config or BacktrackCostConfig()
         normalize_dt = bool(
             resolved_cost_config.normalize_distance_time_by_gate
+            or resolved_cost_config.normalize_bc_distance_time_by_gate
         )
         raw_features = {
             "direct_distance": _gate_fraction(

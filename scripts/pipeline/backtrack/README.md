@@ -173,6 +173,51 @@ by the replay CLI rather than silently re-running a different pipeline.
 expanding NumPy crops into JSON would make sidecars several GB. Actor geometry,
 track IDs, confidence, observation flags and litter history remain replayable.
 
+
+### Release time / vehicle cost proposal (2026-09-05)
+
+An explicit research configuration now supports `normalize_bc_distance_time_by_gate=true`
+with `normalized_distance_gate_vehicle=0.4`. In the full stage this changes only
+the BC distance/time terms to `w_D * D/0.4 + w_T * T_E/0.25`; it retains other
+BC terms and leaves BA/AC weights unchanged. The actor evidence gate remains
+`gap_frames <= 3 AND gap_frames/FPS <= 0.25 s`, independent of cost weights.
+
+Set `max_release_back_seconds=1.0`, `release_soft_seconds=0.25` and
+`release_time_weight=1.0` to replace the backward B0/B1 window prior with:
+
+```text
+T_RB = max(0, (resolver_birth_frame - release_frame) / FPS)
+R = 0                                 for T_RB <= 0.25
+R = ((T_RB - 0.25) / 0.75)^2           for 0.25 < T_RB <= 1.0
+reject hypothesis                     for T_RB > 1.0
+```
+
+The reference is the frozen resolver's birth frame, not GT release or
+confirm frame. The physical limit is applied before hypothesis enumeration,
+using `floor(FPS * max_release_back_seconds)`. Video-start bounds prevent
+negative release frames. A tighter computational limit still sets
+`search_truncated`; reaching the physical boundary alone does not. One-point
+fallback and two-point model priors remain intact. Post-birth hypotheses are
+still bounded by the observed airborne path and retain their existing forward
+penalty. Every event retains its full NULL route.
+
+These fields are constructor/StudyConfig options, not new production environment
+switches. Production defaults remain D=0.3 and the observation-gap prior. Run
+the four controlled proposals against the same frozen confirmed detections:
+
+```bash
+OPENBLAS_NUM_THREADS=1 conda run -n rtdetr python scripts/replay_release_policy.py \
+  --candidates output/rtdetr_recovery_horiz1_full_20260826 \
+  --output artifacts/release_policy_new_run
+```
+
+The output directory must be new. It contains exact trial configurations,
+resolved per-FPS configurations, input hashes, event selections, clip-level
+vehicle accuracy, Wilson intervals and paired correctness changes. The legacy
+manual +2 adjustment for cases 74/174 is separately labeled and is not new
+validation of those cases. Missing confirmed clips stay in the denominator.
+This is exploratory development replay, not a held-out evaluation.
+
 ## Candidate/component sidecar
 
 Research runs with `SMART_BACKTRACK_SIDECAR=1` additionally include:

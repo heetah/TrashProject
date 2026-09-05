@@ -6,7 +6,8 @@ fixed, calibrated homography may transform all input points before using this
 module.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import math
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -30,6 +31,9 @@ class ReleaseHypothesis:
     source_direction_uv: Optional[Tuple[float, float]] = None
     search_truncated: bool = False
     truncation_reason: Optional[str] = None
+    time_prior_policy: str = "observation_gap"
+    release_back_seconds: Optional[float] = None
+    max_release_back_seconds: Optional[float] = None
 
     def __post_init__(self):
         object.__setattr__(self, "mean_uv", np.asarray(self.mean_uv, dtype=float).reshape(2))
@@ -523,7 +527,7 @@ def _two_point_constant_velocity_hypotheses(
     return hypotheses
 
 
-def build_release_hypotheses(
+def _build_release_hypotheses(
     points_uv: Sequence[Sequence[float]],
     frame_indices: Sequence[int],
     birth_frame: int,
@@ -632,6 +636,80 @@ def build_release_hypotheses(
             )
         )
     return hypotheses
+
+
+def validate_release_time_policy(max_seconds, soft_seconds, weight):
+    if max_seconds is None:
+        return
+    if not all(math.isfinite(float(v)) for v in (max_seconds, soft_seconds, weight)):
+        raise ValueError("release time policy values must be finite")
+    if not 0 <= soft_seconds < max_seconds or weight < 0:
+        raise ValueError("require 0 <= release soft seconds < max seconds and weight >= 0")
+
+
+def build_release_hypotheses(
+    points_uv, frame_indices, birth_frame, max_back_frames, fps,
+    sigma_floor_px=2.0, min_points=3, extrapolation_cost_per_second=0.35,
+    confidences=None, fallback_prior_cost=6.0,
+    two_point_max_back_seconds=0.3, two_point_prior_cost=1.0,
+    max_forward_release_seconds=0.5, window_prior_weight=0.35,
+    max_release_back_seconds=None, release_soft_seconds=0.25,
+    release_time_weight=1.0,
+) -> List[ReleaseHypothesis]:
+    """Enumerate legacy releases or an explicit seconds-based quadratic prior.
+
+    The new policy replaces only the backward window cost. Model fallback and
+    two-point priors, and the existing post-birth airborne penalty, survive.
+    It is opt-in until reviewed replay supports production promotion.
+    """
+    validate_release_time_policy(
+        max_release_back_seconds, release_soft_seconds, release_time_weight
+    )
+    horizon = max_back_frames
+    if max_release_back_seconds is not None:
+        if not math.isfinite(float(fps)) or fps <= 0:
+            raise ValueError("fps must be finite and positive")
+        physical_frames = max(0, int(math.floor(max_release_back_seconds * fps)))
+        available_frames = min(physical_frames, max(0, int(birth_frame)))
+        horizon = min(max(0, int(max_back_frames)), available_frames)
+    hypotheses = _build_release_hypotheses(
+        points_uv, frame_indices, birth_frame, horizon, fps,
+        sigma_floor_px, min_points, extrapolation_cost_per_second,
+        confidences, fallback_prior_cost, two_point_max_back_seconds,
+        two_point_prior_cost, max_forward_release_seconds, window_prior_weight,
+    )
+    if max_release_back_seconds is None:
+        return hypotheses
+    result = []
+    for item in hypotheses:
+        if item.frame_index < 0:
+            continue
+        backward_seconds = max(0.0, (birth_frame - item.frame_index) / fps)
+        if backward_seconds > max_release_back_seconds:
+            continue
+        # Forward hypotheses retain their explicit existing penalty.
+        window_cost = item.window_prior_cost
+        if item.frame_index <= birth_frame:
+            fraction = max(0.0, backward_seconds - release_soft_seconds) / (
+                max_release_back_seconds - release_soft_seconds
+            )
+            window_cost = release_time_weight * fraction ** 2
+        truncated = horizon < available_frames
+        result.append(replace(
+            item,
+            prior_cost=item.prior_cost - item.window_prior_cost + window_cost,
+            window_prior_cost=window_cost,
+            zero_cost_window_start_frame=max(
+                0, birth_frame - int(math.floor(release_soft_seconds * fps))
+            ),
+            zero_cost_window_end_frame=birth_frame,
+            time_prior_policy="seconds_quadratic",
+            release_back_seconds=backward_seconds,
+            max_release_back_seconds=max_release_back_seconds,
+            search_truncated=truncated,
+            truncation_reason=("max_back_frames_computational_guard" if truncated else None),
+        ))
+    return result
 
 
 # Short aliases used by integration code and research notebooks.

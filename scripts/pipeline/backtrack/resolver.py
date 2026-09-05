@@ -59,6 +59,9 @@ class SmartBacktrackConfig:
     two_point_prior_cost: float = 1.0
     max_forward_release_seconds: float = 0.5
     release_window_prior_weight: float = 0.35
+    max_release_back_seconds: Optional[float] = None
+    release_soft_seconds: float = 0.25
+    release_time_weight: float = 1.0
     # Production physical gates: elapsed evidence must satisfy both the
     # seconds limit and frame cap; direct-vehicle distance uses the unexpanded
     # bbox. Research replays may override every value explicitly.
@@ -346,6 +349,9 @@ def _release_hypothesis_payload(release):
         "zero_cost_window_start_frame": release.zero_cost_window_start_frame,
         "zero_cost_window_end_frame": release.zero_cost_window_end_frame,
         "window_prior_cost": float(release.window_prior_cost),
+        "time_prior_policy": release.time_prior_policy,
+        "release_back_seconds": release.release_back_seconds,
+        "max_release_back_seconds": release.max_release_back_seconds,
         "direction_consistency": release.direction_consistency,
         "source_direction_uv": (
             list(release.source_direction_uv)
@@ -461,6 +467,9 @@ class SmartBacktrackResolver:
             two_point_prior_cost=self.config.two_point_prior_cost,
             max_forward_release_seconds=self.config.max_forward_release_seconds,
             window_prior_weight=self.config.release_window_prior_weight,
+            max_release_back_seconds=self.config.max_release_back_seconds,
+            release_soft_seconds=self.config.release_soft_seconds,
+            release_time_weight=self.config.release_time_weight,
         )
 
     def _build_actor_tracks(self, task):
@@ -951,7 +960,17 @@ class SmartBacktrackResolver:
                 "release_window_prior_weight": float(
                     self.config.release_window_prior_weight
                 ),
-                "release_window_semantics": "B0_B1_observation_gap_soft_prior",
+                "release_window_semantics": (
+                    "seconds_quadratic" if self.config.max_release_back_seconds is not None
+                    else "B0_B1_observation_gap_soft_prior"
+                ),
+                "max_release_back_seconds": self.config.max_release_back_seconds,
+                "release_soft_seconds": self.config.release_soft_seconds,
+                "release_time_weight": self.config.release_time_weight,
+                "normalize_bc_distance_time_by_gate": self.config.cost_config.normalize_bc_distance_time_by_gate,
+                "normalized_distance_gate_vehicle": self.config.normalized_distance_gate_vehicle,
+                "max_observation_gap_seconds": self.config.max_observation_gap_seconds,
+                "max_observation_gap_frames": self.config.max_observation_gap_frames,
                 "max_back_semantics": "computational_guard_not_physical_gate",
                 "use_kalman_rts": bool(self.config.use_kalman_rts),
                 "confidence_aware_kalman": bool(

@@ -27,6 +27,7 @@ from .annotations import (
     _run_id,
 )
 from .costs import BacktrackCostConfig
+from .trajectory import validate_release_time_policy
 from .resolver import SmartBacktrackConfig, SmartBacktrackResolver
 from .sidecar import build_candidate_record, build_run_record, write_jsonl
 
@@ -60,6 +61,9 @@ class StudyConfig:
     two_point_prior_cost: float = 1.0
     max_forward_release_seconds: float = 0.5
     release_window_prior_weight: float = 0.35
+    max_release_back_seconds: Optional[float] = None
+    release_soft_seconds: float = 0.25
+    release_time_weight: float = 1.0
     # Physical gates default to production; explicit values reproduce legacy
     # or sensitivity trials without changing process-wide environment state.
     max_observation_gap_seconds: float = 0.25
@@ -68,6 +72,7 @@ class StudyConfig:
     normalized_distance_gate_vehicle: float = 0.3
     vehicle_bbox_expand_x_ratio: float = 0.0
     vehicle_bbox_expand_y_ratio: float = 0.0
+    normalize_bc_distance_time_by_gate: bool = False
     distance_weight: float = 1.0
     time_weight: float = 1.0
     kalman_process_noise_scale: float = 1.0
@@ -81,6 +86,10 @@ class StudyConfig:
     bc_boundary_depth_weight: float = 0.0
 
     def __post_init__(self):
+        validate_release_time_policy(
+            self.max_release_back_seconds, self.release_soft_seconds,
+            self.release_time_weight,
+        )
         if self.stage not in {
             "distance_time", "kalman_rts", "confidence", "uncertainty",
             "reverse", "full"
@@ -151,6 +160,16 @@ class StudyConfig:
             distance_weight=float(self.distance_weight),
             time_weight=float(self.time_weight),
         )
+        if self.normalize_bc_distance_time_by_gate:
+            cost_config = replace(
+                cost_config,
+                normalize_bc_distance_time_by_gate=True,
+                bc_weights={
+                    **cost_config.bc_weights,
+                    "direct_distance": float(self.distance_weight),
+                    "time": float(self.time_weight),
+                },
+            )
         if self.ac_overlap_weight is not None:
             cost_config = replace(
                 cost_config,
@@ -206,6 +225,9 @@ class StudyConfig:
             release_window_prior_weight=float(
                 self.release_window_prior_weight
             ),
+            max_release_back_seconds=self.max_release_back_seconds,
+            release_soft_seconds=self.release_soft_seconds,
+            release_time_weight=self.release_time_weight,
             max_observation_gap_seconds=float(
                 self.max_observation_gap_seconds
             ),

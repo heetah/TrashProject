@@ -467,6 +467,16 @@ frame，`H0 = T_B1 - T_B0`，零成本可疑窗為
 建立人工盲標 queue 時使用 `scripts/backtrack_annotations.py init`；輸出的
 annotation schema 不複製 selected route、cost、rank 或 release prediction。
 
+### Release 時間與距離成本優化研究
+
+可透過 `StudyConfig` 啟用車輛 `C_BC` 的 `D/0.4`、`T_E/0.25` 成本，以及
+release 回推的分段平方 prior（0.25 秒內不加罰，最多 1 秒）。新時間 prior
+取代原本的 backward window 成本，保留短軌跡 prior、forward penalty 與 NULL。
+Production 預設仍維持 D=0.3 與 observation-gap prior；新的組合先作明確的
+研究設定。`scripts/replay_release_policy.py` 可重播四組控制實驗，逐影片比較最後
+vehicle 是否正確，並分開列出數值 ID 正確率與歷史人工加分。
+完整設定與重現命令見 [`backtrack README`](scripts/pipeline/backtrack/README.md)。
+
 ### Smart Backtrack 版本比較簡報
 
 簡報由 live backtrack contract 產生，文字、方塊與數學式均為可編輯物件；可重建
