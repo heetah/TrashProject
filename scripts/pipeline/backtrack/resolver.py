@@ -20,6 +20,11 @@ from .costs import (
 )
 from .flow import COST_SCALE, Assignment, RouteCandidate, solve_event_routes
 from .kalman import KalmanConfig, TrackMeasurement, smooth_tracklet
+from .spatial import (
+    EventSpatialTransform,
+    image_space_metadata,
+    pseudo_ground_metadata,
+)
 from .trajectory import (
     ReleaseHypothesis,
     airborne_prefix,
@@ -62,13 +67,13 @@ class SmartBacktrackConfig:
     max_release_back_seconds: Optional[float] = None
     release_soft_seconds: float = 0.25
     release_time_weight: float = 1.0
-    # Production physical gates: elapsed evidence must satisfy both the
-    # seconds limit and frame cap; direct-vehicle distance uses the unexpanded
-    # bbox. Research replays may override every value explicitly.
+    # Production time scales: 0.25 seconds and 3 frames are the bend points of
+    # the hybrid soft penalty. Direct-vehicle distance remains a physical hard
+    # gate on the unexpanded bbox. Research replays may override every value.
     max_observation_gap_seconds: float = 0.25
     max_observation_gap_frames: Optional[int] = 3
     normalized_distance_gate_person: float = 0.85
-    normalized_distance_gate_vehicle: float = 0.3
+    normalized_distance_gate_vehicle: float = 0.4
     vehicle_bbox_expand_x_ratio: float = 0.0
     vehicle_bbox_expand_y_ratio: float = 0.0
     cost_config: BacktrackCostConfig = field(default_factory=BacktrackCostConfig)
@@ -80,8 +85,16 @@ class SmartBacktrackConfig:
     kalman_process_noise_scale: float = 1.0
     kalman_measurement_noise_scale: float = 1.0
     kalman_max_extrapolation_seconds: Optional[float] = None
+    # Research-only geometry ablation: keep an exact queued detector bbox at
+    # observed frames, while still using Kalman/RTS for missing frames.
+    preserve_observed_actor_boxes: bool = False
     use_reverse_trajectory: bool = True
     confidence_weighted_trajectory: bool = True
+    # Opt-in until a reviewed real-video comparison proves that the calibrated
+    # pseudo-ground plane improves attribution.  Every event either freezes one
+    # eligible transform or records an explicit image-space fallback.
+    use_event_homography: bool = False
+    event_homography_min_confidence: float = 0.65
 
     @classmethod
     def from_env(cls, fps=10.0):
@@ -108,6 +121,19 @@ class SmartBacktrackConfig:
             study_stage,
             distance_weight=distance_weight,
             time_weight=time_weight,
+        )
+        observation_time_cost_mode = str(
+            os.environ.get("SMART_BACKTRACK_TIME_COST_MODE", "soft")
+        ).strip().lower()
+        if observation_time_cost_mode not in {"hard", "soft"}:
+            observation_time_cost_mode = "soft"
+        cost_config = replace(
+            cost_config,
+            observation_time_cost_mode=observation_time_cost_mode,
+            observation_time_soft_kappa=max(
+                0.0,
+                _float_env("SMART_BACKTRACK_TIME_SOFT_KAPPA", 4.0),
+            ),
         )
         boundary_depth_weight = max(
             0.0,
@@ -168,6 +194,15 @@ class SmartBacktrackConfig:
             },
             use_reverse_trajectory=study_stage in {"reverse", "full"},
             confidence_weighted_trajectory=study_stage == "full",
+            use_event_homography=(
+                os.environ.get("SMART_BACKTRACK_DYNAMIC_HOMOGRAPHY", "0")
+                not in ("0", "")
+            ),
+            event_homography_min_confidence=float(np.clip(
+                _float_env("SMART_BACKTRACK_HOMOGRAPHY_MIN_CONFIDENCE", 0.65),
+                0.0,
+                1.0,
+            )),
         )
 
 
@@ -622,8 +657,15 @@ class SmartBacktrackResolver:
                     state = smoothed.state_at(frame_index)
                 except ValueError:
                     continue
-                bbox = state.bbox_xyxy
                 source_snapshot = observed_by_frame.get(frame_index)
+                bbox = (
+                    tuple(source_snapshot["box"])
+                    if (
+                        source_snapshot is not None
+                        and self.config.preserve_observed_actor_boxes
+                    )
+                    else state.bbox_xyxy
+                )
                 confidence = (
                     float(
                         source_snapshot.get(
@@ -679,6 +721,18 @@ class SmartBacktrackResolver:
             self._kalman_max_extrapolation_frames(fps)
         )
         releases = self._release_hypotheses(task)
+        spatial_transform = None
+        spatial_reason = "feature_disabled"
+        if self.config.use_event_homography:
+            spatial_transform, spatial_reason = EventSpatialTransform.from_payload(
+                task.get("homography_snapshot"),
+                minimum_confidence=self.config.event_homography_min_confidence,
+            )
+        spatial_metadata = (
+            pseudo_ground_metadata(spatial_transform)
+            if spatial_transform is not None
+            else image_space_metadata(spatial_reason)
+        )
         actor_tracks = self._build_actor_tracks(task)
         person_tracks = {
             key: values for key, values in actor_tracks.items()
@@ -707,6 +761,7 @@ class SmartBacktrackResolver:
             max_observation_gap_seconds=self.config.max_observation_gap_seconds,
             max_observation_gap_frames=self.config.max_observation_gap_frames,
             normalized_distance_gate=self.config.normalized_distance_gate_person,
+            spatial_transform=spatial_transform,
         )
         bc_costs = build_bc_costs(
             releases, vehicle_tracks, fps,
@@ -717,6 +772,7 @@ class SmartBacktrackResolver:
             normalized_distance_gate=self.config.normalized_distance_gate_vehicle,
             vehicle_bbox_expand_x_ratio=self.config.vehicle_bbox_expand_x_ratio,
             vehicle_bbox_expand_y_ratio=self.config.vehicle_bbox_expand_y_ratio,
+            spatial_transform=spatial_transform,
             **bc_context,
         )
         ac_costs = build_ac_costs(
@@ -725,6 +781,7 @@ class SmartBacktrackResolver:
             max_uncertainty_height_ratio=max_uncertainty_ratio,
             max_pair_gap_seconds=self.config.max_observation_gap_seconds,
             max_observation_gap_frames=self.config.max_observation_gap_frames,
+            spatial_transform=spatial_transform,
         )
         # Keep pre-collapse per-release cells for the research sidecar.  A
         # collapsed pair cost alone cannot tell whether the GT release was
@@ -737,6 +794,7 @@ class SmartBacktrackResolver:
                 max_observation_gap_seconds=self.config.max_observation_gap_seconds,
                 max_observation_gap_frames=self.config.max_observation_gap_frames,
                 normalized_distance_gate=self.config.normalized_distance_gate_person,
+                spatial_transform=spatial_transform,
             )
             for person_key, observations in person_tracks.items()
             for release in releases
@@ -753,6 +811,7 @@ class SmartBacktrackResolver:
                 normalized_distance_gate=self.config.normalized_distance_gate_vehicle,
                 vehicle_bbox_expand_x_ratio=self.config.vehicle_bbox_expand_x_ratio,
                 vehicle_bbox_expand_y_ratio=self.config.vehicle_bbox_expand_y_ratio,
+                spatial_transform=spatial_transform,
                 **bc_context,
             )
             for vehicle_key, observations in vehicle_tracks.items()
@@ -971,6 +1030,8 @@ class SmartBacktrackResolver:
                 "normalized_distance_gate_vehicle": self.config.normalized_distance_gate_vehicle,
                 "max_observation_gap_seconds": self.config.max_observation_gap_seconds,
                 "max_observation_gap_frames": self.config.max_observation_gap_frames,
+                "observation_time_cost_mode": self.config.cost_config.observation_time_cost_mode,
+                "observation_time_soft_kappa": self.config.cost_config.observation_time_soft_kappa,
                 "max_back_semantics": "computational_guard_not_physical_gate",
                 "use_kalman_rts": bool(self.config.use_kalman_rts),
                 "confidence_aware_kalman": bool(
@@ -1001,7 +1062,14 @@ class SmartBacktrackResolver:
                 "use_reverse_trajectory": bool(
                     self.config.use_reverse_trajectory
                 ),
+                "use_event_homography": bool(
+                    self.config.use_event_homography
+                ),
+                "event_homography_min_confidence": float(
+                    self.config.event_homography_min_confidence
+                ),
             },
+            "spatial_calibration": spatial_metadata,
             "release_hypotheses": [
                 _release_hypothesis_payload(release) for release in releases
             ],

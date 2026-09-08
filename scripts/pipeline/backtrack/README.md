@@ -55,8 +55,10 @@ Semantics:
   path retain `lambda_f*(T_r-T_B0)/FPS`. Candidates remain available. Early source
   direction is opposite `B0->B1`, while `B2` supplies a velocity-cosine
   consistency diagnostic. `confirm_frame` participates in neither calculation.
-- Litter confirmation requires an actor already supported at the release/birth
-  observation; a later passer-by cannot retroactively confirm detector noise.
+- The 8/27 production recovery profile permits actor support to appear after
+  the first litter observation, accommodating detector cadence and occlusion.
+  Confirmation still requires an actor plus motion, trajectory/displacement
+  and non-stationary evidence; attribution remains a separate later stage.
 - Rise-then-fall tracks use descent from their internal apex, so a real arc may
   return near its release height without being rejected as a horizontal streak.
 - Full-stage `C_BC` sidecars also expose `reverse_direction`, `exit_deficit`
@@ -93,7 +95,19 @@ SMART_BACKTRACK_SIDECAR=0
 SMART_BACKTRACK_STUDY_STAGE=full  # full | distance_time | kalman_rts | confidence | uncertainty | reverse
 SMART_BACKTRACK_DT_DISTANCE_WEIGHT=1.0
 SMART_BACKTRACK_DT_TIME_WEIGHT=1.0
+SMART_BACKTRACK_TIME_COST_MODE=soft  # soft | hard (legacy replay)
+SMART_BACKTRACK_TIME_SOFT_KAPPA=4.0
+SMART_BACKTRACK_DYNAMIC_HOMOGRAPHY=0
+SMART_BACKTRACK_HOMOGRAPHY_MIN_CONFIDENCE=0.65
 ```
+
+The Homography switch is an opt-in production code path, not a promotion of the
+current calibration constants. Each confirmed event records one snapshot
+decision. Only a numerically valid `LOCKED` runtime H at or above the confidence
+threshold is used for `C_BA`, `C_BC` and `C_AC` spatial features. Missing,
+unlocked, low-confidence or invalid snapshots keep the complete image-space
+cost path and NULL route, with the fallback reason in candidate diagnostics.
+Kalman/RTS state estimation and temporal evidence remain in image coordinates.
 
 Confirmed litter 送入 resolver 前，tracker 可從尚未經 geometry/motion/
 holding 後處理的 RT-DETR bbox，向前恢復連續的 raw trajectory prefix。
@@ -101,6 +115,16 @@ Raw bbox 只補 release trajectory；不能建立、延長或確認 litter event
 `C_BC` 的 `boundary_depth` 是 release 點到原始 vehicle bbox 最近邊界的
 正規化深度。它用來降低巨大遮擋 bbox 把鄰車 release 點吃進車體深處的
 優勢，仍是 soft cost，不會放寬任何 physical hard gate。
+
+Actor geometry is already retained in bounded queues before a litter event is
+confirmed. The OCR-capable queue keeps 120 frames; the lightweight Smart
+Backtrack queue keeps 10 seconds by default plus the post-birth allowance and
+omits image crops. Exact detector boxes, frame indices, confidence, observed
+flags and tracklet epochs are copied into the immutable resolver task. Kalman/
+RTS therefore does not replace history storage: it fills missing frames,
+smooths detector jitter and supplies covariance. Production currently uses the
+smoothed state even at observed frames while retaining the nearest real
+detector frame as evidence for the freshness gate.
 
 `SMART_BACKTRACK=0` keeps the legacy resolver available as a rollback path.
 When smart mode is enabled, the legacy heuristic is used only if the smart
@@ -126,11 +150,13 @@ distance_time -> confidence ---------> uncertainty -> reverse -> full
 ```
 
 `distance_time` uses only distance/time cost components, original observed
-actor boxes, and the litter birth anchor. Distance and time are divided by
-their corresponding hard gates before weighting, so both features are
-dimensionless fractions in the range 0--1. The DT environment weights affect
-all three matrices; hard gates remain independent and cannot be relaxed by a
-weight. `kalman_rts` enables actor position smoothing/interpolation while
+actor boxes, and the litter birth anchor. Distance is divided by its hard gate
+before weighting, so its accepted feature is a dimensionless fraction in the
+range 0--1. Time is also dimensionless, but in production soft mode it may
+exceed 1 and receives the continuous excess penalty defined below. The DT
+environment weights affect all three matrices; remaining hard gates stay
+independent and cannot be relaxed by a weight. `kalman_rts` enables actor
+position smoothing/interpolation while
 keeping uniform Kalman measurement confidence and disabling covariance gates,
 covariance/Mahalanobis costs, and reverse release fitting. `uncertainty` adds
 confidence and covariance evidence; `reverse` enables ballistic release hypotheses with uniform litter
@@ -143,12 +169,21 @@ misstate this engineering guard as a physical release-time gate.
 Production direct litter→vehicle association uses the original, unexpanded
 vehicle bbox. For release point `p` and vehicle bbox `B` with width `w` and
 height `h`, the physical distance is
-`D=dist(p,B)/sqrt(w^2+h^2)` and the hard gate is `D<=0.30`. Production actor
-timing must satisfy both `gap_frames<=3` and `gap_frames/FPS<=0.25 s`.
-Internally the seconds limit is converted with `floor(FPS*0.25)` before taking
-the minimum with 3; flooring prevents a rounded frame count from exceeding
-the requested physical duration. Thus `3 frames + 0.25 seconds` is an AND
-constraint, not an additive 0.55-second allowance.
+`D=dist(p,B)/sqrt(w^2+h^2)` and the hard gate is `D<=0.40`. Actor observation
+freshness is a hybrid soft penalty rather than a physical cutoff. Let
+`z_s=(gap_frames/FPS)/0.25`, `z_f=gap_frames/3`, and `z=max(z_s,z_f)`; production
+uses `rho(z)=z+kappa*max(0,z-1)^2` with `kappa=4`. The former `0.25 s` and
+`3 frames` thresholds are therefore dimensionless bend points. `max` preserves
+the stricter side of the former AND rule without adding two perfectly dependent
+measurements. Bounded actor history/Kalman extrapolation, spatial/uncertainty
+hard gates and the full NULL route remain the outer safety mechanisms.
+
+`SMART_BACKTRACK_TIME_COST_MODE=hard` exactly restores the former temporal AND
+gate for replay: internally the seconds limit is converted with
+`floor(FPS*0.25)` and then minimized with the 3-frame cap. The soft curvature
+is exposed as `SMART_BACKTRACK_TIME_SOFT_KAPPA`; `4.0` is the declared production
+baseline requested for this iteration, not a statistically proven universal
+constant. Tune it only with event-grouped validation.
 
 Research replay can override these fields through `StudyConfig`, including
 `vehicle_bbox_expand_x_ratio` and `vehicle_bbox_expand_y_ratio`. The legacy
@@ -165,6 +200,12 @@ Kalman states supply geometry only. Their D+T time feature remains the gap to
 the nearest real detector frame, so interpolation cannot silently rewrite
 missing actor evidence as a zero synchronization gap.
 
+For the narrower queued-bbox ablation, set
+`preserve_observed_actor_boxes=true`. An exact detector bbox from the actor
+history ring is then used unchanged at observed frames; Kalman/RTS geometry is
+used only at missing frames. This switch is constructor/StudyConfig-only and
+does not alter production defaults.
+
 New candidate rows contain `resolver_input`, the JSON-safe immutable worker
 task required for replay. Rows without it are diagnostic-only and are rejected
 by the replay CLI rather than silently re-running a different pipeline.
@@ -176,11 +217,12 @@ track IDs, confidence, observation flags and litter history remain replayable.
 
 ### Release time / vehicle cost proposal (2026-09-05)
 
-An explicit research configuration now supports `normalize_bc_distance_time_by_gate=true`
-with `normalized_distance_gate_vehicle=0.4`. In the full stage this changes only
-the BC distance/time terms to `w_D * D/0.4 + w_T * T_E/0.25`; it retains other
-BC terms and leaves BA/AC weights unchanged. The actor evidence gate remains
-`gap_frames <= 3 AND gap_frames/FPS <= 0.25 s`, independent of cost weights.
+An explicit research configuration supports `normalize_bc_distance_time_by_gate=true`
+with `normalized_distance_gate_vehicle=0.4`. In the full stage this normalizes
+the BC distance term to `w_D * D/0.4`; its time term follows the selected
+observation-time mode. Production soft mode uses `w_T*rho(max(z_s,z_f))`, while
+`observation_time_cost_mode=hard` reproduces the former `T_E/0.25` feature and
+AND gate. Other BC terms and BA/AC weights remain unchanged.
 
 Set `max_release_back_seconds=1.0`, `release_soft_seconds=0.25` and
 `release_time_weight=1.0` to replace the backward B0/B1 window prior with:
@@ -202,7 +244,7 @@ still bounded by the observed airborne path and retain their existing forward
 penalty. Every event retains its full NULL route.
 
 These fields are constructor/StudyConfig options, not new production environment
-switches. Production defaults remain D=0.3 and the observation-gap prior. Run
+switches. Production defaults use D=0.4 and the observation-gap prior. Run
 the four controlled proposals against the same frozen confirmed detections:
 
 ```bash
@@ -212,11 +254,13 @@ OPENBLAS_NUM_THREADS=1 conda run -n rtdetr python scripts/replay_release_policy.
 ```
 
 The output directory must be new. It contains exact trial configurations,
-resolved per-FPS configurations, input hashes, event selections, clip-level
-vehicle accuracy, Wilson intervals and paired correctness changes. The legacy
-manual +2 adjustment for cases 74/174 is separately labeled and is not new
-validation of those cases. Missing confirmed clips stay in the denominator.
-This is exploratory development replay, not a held-out evaluation.
+resolved per-FPS configurations, input hashes and event selections. Its numeric
+tracker-ID score is a legacy same-run diagnostic only: IDs cannot be compared
+across inference runs and the score is not product-readiness eligible. The
+legacy manual +2 adjustment for cases 74/174 is separately labeled and is not
+new validation of those cases. Missing confirmed clips stay in the denominator.
+Use `scripts/evaluate_reviewed_readiness.py` for same-run bbox mapping. This is
+exploratory development replay, not a held-out evaluation.
 
 ## Candidate/component sidecar
 

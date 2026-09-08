@@ -7,6 +7,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from .trajectory import ReleaseHypothesis
+from .spatial import EventSpatialTransform
 
 
 ActorKey = Tuple[str, int]
@@ -18,7 +19,9 @@ class BacktrackCostConfig:
 
     Defaults exactly reproduce the production component weights.  Research
     callers select a named ablation instead of altering process-wide env vars.
-    Physical hard gates intentionally stay outside these weights.
+    Spatial/uncertainty hard gates intentionally stay outside these weights.
+    Actor observation time uses a configurable hard legacy mode or the
+    production soft penalty described by ``observation_time_cost_mode``.
     """
 
     ba_weights: Mapping[str, float] = field(default_factory=lambda: {
@@ -45,6 +48,21 @@ class BacktrackCostConfig:
     # weights compare dimensionless quantities with the same 0..1 meaning.
     normalize_distance_time_by_gate: bool = False
     normalize_bc_distance_time_by_gate: bool = False
+    # ``soft`` keeps every actor state available inside the bounded tracklet
+    # horizon.  The old thresholds become dimensionless bend points:
+    # z=max(dt/tau_seconds, df/tau_frames),
+    # rho(z)=z+kappa*max(0,z-1)^2. ``hard`` reproduces the legacy AND gate.
+    observation_time_cost_mode: str = "soft"
+    observation_time_soft_kappa: float = 4.0
+
+    def __post_init__(self):
+        if self.observation_time_cost_mode not in {"hard", "soft"}:
+            raise ValueError("observation_time_cost_mode must be hard or soft")
+        if (
+            not math.isfinite(float(self.observation_time_soft_kappa))
+            or float(self.observation_time_soft_kappa) < 0.0
+        ):
+            raise ValueError("observation_time_soft_kappa must be non-negative")
 
     @classmethod
     def for_stage(
@@ -273,10 +291,37 @@ def _gate_fraction(value, gate, enabled):
     return min(value / max(float(gate), 1e-9), 1.0)
 
 
+def _hybrid_time_soft_penalty(
+    gap_frames: int,
+    fps: float,
+    seconds_scale: float,
+    frame_scale: Optional[int],
+    kappa: float,
+) -> float:
+    """Return a continuous seconds/frames observation-freshness penalty.
+
+    Seconds and frames measure the same gap, so ``max`` represents the former
+    AND constraint without double-counting it.  The old thresholds are bend
+    points rather than cutoffs.  Cost is linear through the supported region
+    and gains a C1-continuous squared excess penalty outside it.
+    """
+
+    gap_frames = max(int(gap_frames), 0)
+    safe_fps = max(float(fps), 1e-9)
+    z_seconds = (gap_frames / safe_fps) / max(float(seconds_scale), 1e-9)
+    z_frames = (
+        gap_frames / max(float(frame_scale), 1e-9)
+        if frame_scale is not None else 0.0
+    )
+    z_time = max(z_seconds, z_frames)
+    excess = max(z_time - 1.0, 0.0)
+    return float(z_time + max(float(kappa), 0.0) * excess * excess)
+
+
 def _nearest_observation(
     observations: Sequence[ActorObservation],
     frame_index: int,
-    max_gap_frames: int,
+    max_gap_frames: Optional[int],
 ) -> Optional[ActorObservation]:
     if not observations:
         return None
@@ -284,7 +329,11 @@ def _nearest_observation(
         observations,
         key=lambda item: abs(int(item.frame_index) - int(frame_index)),
     )
-    if abs(int(observation.frame_index) - int(frame_index)) > int(max_gap_frames):
+    if (
+        max_gap_frames is not None
+        and abs(int(observation.frame_index) - int(frame_index))
+        > int(max_gap_frames)
+    ):
         return None
     return observation
 
@@ -383,6 +432,7 @@ def compute_c_ba(
     max_uncertainty_height_ratio: float = 1.5,
     normalized_distance_gate: float = 0.85,
     cost_config: Optional[BacktrackCostConfig] = None,
+    spatial_transform: Optional[EventSpatialTransform] = None,
 ) -> CostCell:
     """Litter-person cost using a person's upper-body release zone.
 
@@ -395,8 +445,12 @@ def compute_c_ba(
         return CostCell.rejected("no_person_observation")
     if not releases:
         return CostCell.rejected("no_release_hypothesis")
-    max_gap = _physical_gap_limit_frames(
-        max_observation_gap_seconds, fps, max_observation_gap_frames
+    resolved_cost_config = cost_config or BacktrackCostConfig()
+    soft_time = resolved_cost_config.observation_time_cost_mode == "soft"
+    max_gap = (
+        None if soft_time else _physical_gap_limit_frames(
+            max_observation_gap_seconds, fps, max_observation_gap_frames
+        )
     )
 
     candidates = []
@@ -425,9 +479,18 @@ def compute_c_ba(
         x1, y1, x2, y2 = person.bbox
         release_zone = (x1, y1, x2, y1 + 0.72 * person.height)
         residual = _point_to_rect_vector(release.mean_uv, release_zone)
-        normalized_distance = float(np.linalg.norm(residual)) / max(
-            person.height, 1.0
-        )
+        if spatial_transform is not None:
+            normalized_distance = spatial_transform.normalized_point_to_rect(
+                release.mean_uv,
+                release_zone,
+                scale="height",
+            )
+            if normalized_distance is None:
+                continue
+        else:
+            normalized_distance = float(np.linalg.norm(residual)) / max(
+                person.height, 1.0
+            )
         minimum_distance = min(minimum_distance, normalized_distance)
         # Uncertainty must never turn a physically distant release into a
         # plausible hand/torso release.
@@ -437,12 +500,29 @@ def compute_c_ba(
             [(x1 + x2) * 0.5, y1 + 0.36 * person.height], dtype=float
         )
         displacement = release.mean_uv - person_upper_center
+        release_velocity = release.velocity_uv
+        direction_scale = person.height
+        if spatial_transform is not None:
+            projected_pair = spatial_transform.project(
+                (release.mean_uv, person_upper_center)
+            )
+            projected_velocity = spatial_transform.vector_at(
+                release.mean_uv, release.velocity_uv
+            )
+            if projected_pair is None or projected_velocity is None:
+                continue
+            displacement = projected_pair[0] - projected_pair[1]
+            release_velocity = projected_velocity
+            projected_height = spatial_transform.rect_height_scale(person.bbox)
+            if projected_height is None:
+                continue
+            direction_scale = projected_height
         displacement_norm = float(np.linalg.norm(displacement))
-        velocity_norm = float(np.linalg.norm(release.velocity_uv))
+        velocity_norm = float(np.linalg.norm(release_velocity))
         direction_cost = 0.0
-        if displacement_norm > 0.12 * person.height and velocity_norm > 1e-6:
+        if displacement_norm > 0.12 * direction_scale and velocity_norm > 1e-6:
             cosine = float(
-                displacement @ release.velocity_uv
+                displacement @ release_velocity
                 / (displacement_norm * velocity_norm)
             )
             direction_cost = 0.35 * max(0.0, -cosine)
@@ -450,7 +530,7 @@ def compute_c_ba(
         evidence_gap_frames = abs(
             person.evidence_frame_index - release.frame_index
         )
-        if evidence_gap_frames > max_gap:
+        if not soft_time and evidence_gap_frames > int(max_gap):
             continue
         time_gap = evidence_gap_frames / max(
             float(fps), 1e-6
@@ -461,18 +541,27 @@ def compute_c_ba(
         )
         _, logdet = np.linalg.slogdet(np.eye(2) + normalized_covariance)
         uncertainty_cost = 0.5 * max(float(logdet), 0.0)
-        resolved_cost_config = cost_config or BacktrackCostConfig()
         normalize_dt = bool(
             resolved_cost_config.normalize_distance_time_by_gate
+        )
+        time_feature = (
+            _hybrid_time_soft_penalty(
+                evidence_gap_frames,
+                fps,
+                max_observation_gap_seconds,
+                max_observation_gap_frames,
+                resolved_cost_config.observation_time_soft_kappa,
+            )
+            if soft_time else _gate_fraction(
+                time_gap, max_observation_gap_seconds, normalize_dt
+            )
         )
         raw_features = {
             "release_distance": _gate_fraction(
                 normalized_distance, normalized_distance_gate, normalize_dt
             ),
             "uncertainty": max(float(logdet), 0.0),
-            "time": _gate_fraction(
-                time_gap, max_observation_gap_seconds, normalize_dt
-            ),
+            "time": time_feature,
             "quality": quality,
             "direction": (
                 direction_cost / 0.35 if direction_cost > 0.0 else 0.0
@@ -543,12 +632,13 @@ def compute_c_bc(
     max_observation_gap_seconds: float = 0.25,
     max_observation_gap_frames: Optional[int] = 3,
     max_uncertainty_height_ratio: float = 1.5,
-    normalized_distance_gate: float = 0.3,
+    normalized_distance_gate: float = 0.4,
     cost_config: Optional[BacktrackCostConfig] = None,
     litter_last_point: Optional[Sequence[float]] = None,
     litter_last_frame: Optional[int] = None,
     vehicle_bbox_expand_x_ratio: float = 0.0,
     vehicle_bbox_expand_y_ratio: float = 0.0,
+    spatial_transform: Optional[EventSpatialTransform] = None,
 ) -> CostCell:
     """Direct litter-vehicle route with a hard physical release gate."""
 
@@ -561,8 +651,12 @@ def compute_c_bc(
         return CostCell.rejected("no_vehicle_observation")
     if not releases:
         return CostCell.rejected("no_release_hypothesis")
-    max_gap = _physical_gap_limit_frames(
-        max_observation_gap_seconds, fps, max_observation_gap_frames
+    resolved_cost_config = cost_config or BacktrackCostConfig()
+    soft_time = resolved_cost_config.observation_time_cost_mode == "soft"
+    max_gap = (
+        None if soft_time else _physical_gap_limit_frames(
+            max_observation_gap_seconds, fps, max_observation_gap_frames
+        )
     )
 
     candidates = []
@@ -617,9 +711,24 @@ def compute_c_bc(
             release.mean_uv,
             (x1 - margin_x, y1 - margin_y, x2 + margin_x, y2 + margin_y),
         )
-        normalized_distance = float(np.linalg.norm(residual)) / max(
-            np.hypot(vehicle.width, vehicle.height), 1.0
+        distance_rect = (
+            x1 - margin_x,
+            y1 - margin_y,
+            x2 + margin_x,
+            y2 + margin_y,
         )
+        if spatial_transform is not None:
+            normalized_distance = spatial_transform.normalized_point_to_rect(
+                release.mean_uv,
+                distance_rect,
+                scale="diagonal",
+            )
+            if normalized_distance is None:
+                continue
+        else:
+            normalized_distance = float(np.linalg.norm(residual)) / max(
+                np.hypot(vehicle.width, vehicle.height), 1.0
+            )
         minimum_distance = min(minimum_distance, normalized_distance)
         if normalized_distance > float(normalized_distance_gate):
             continue
@@ -632,15 +741,26 @@ def compute_c_bc(
         evidence_gap_frames = abs(
             vehicle.evidence_frame_index - release.frame_index
         )
-        if evidence_gap_frames > max_gap:
+        if not soft_time and evidence_gap_frames > int(max_gap):
             continue
         time_gap = evidence_gap_frames / max(
             float(fps), 1e-6
         )
-        resolved_cost_config = cost_config or BacktrackCostConfig()
         normalize_dt = bool(
             resolved_cost_config.normalize_distance_time_by_gate
             or resolved_cost_config.normalize_bc_distance_time_by_gate
+        )
+        time_feature = (
+            _hybrid_time_soft_penalty(
+                evidence_gap_frames,
+                fps,
+                max_observation_gap_seconds,
+                max_observation_gap_frames,
+                resolved_cost_config.observation_time_soft_kappa,
+            )
+            if soft_time else _gate_fraction(
+                time_gap, max_observation_gap_seconds, normalize_dt
+            )
         )
         raw_features = {
             "direct_distance": _gate_fraction(
@@ -654,9 +774,7 @@ def compute_c_bc(
                 )
                 / max(vehicle.height * vehicle.height, 1.0)
             ),
-            "time": _gate_fraction(
-                time_gap, max_observation_gap_seconds, normalize_dt
-            ),
+            "time": time_feature,
             "quality": quality,
             "release_prior": float(release.prior_cost),
             "boundary_depth": boundary_depth,
@@ -672,31 +790,72 @@ def compute_c_bc(
                     ),
                 )
                 outward = release.mean_uv - vehicle.center
-                velocity_norm = float(np.linalg.norm(release.velocity_uv))
+                release_velocity = release.velocity_uv
+                if spatial_transform is not None:
+                    projected_pair = spatial_transform.project(
+                        (release.mean_uv, vehicle.center)
+                    )
+                    projected_velocity = spatial_transform.vector_at(
+                        release.mean_uv, release.velocity_uv
+                    )
+                    if projected_pair is None or projected_velocity is None:
+                        raise ValueError("unsafe pseudo-ground direction projection")
+                    outward = projected_pair[0] - projected_pair[1]
+                    release_velocity = projected_velocity
+                velocity_norm = float(np.linalg.norm(release_velocity))
                 outward_norm = float(np.linalg.norm(outward))
                 outward_cosine = float(
-                    release.velocity_uv @ outward
+                    release_velocity @ outward
                     / max(velocity_norm * outward_norm, 1e-6)
                 )
-                scale = max(np.hypot(vehicle.width, vehicle.height), 1.0)
-                release_box_distance = float(np.linalg.norm(
-                    _point_to_rect_vector(release.mean_uv, vehicle.bbox)
-                ))
-                later_box_distance = float(np.linalg.norm(
-                    _point_to_rect_vector(last_point, later_vehicle.bbox)
-                ))
+                if spatial_transform is not None:
+                    scale = spatial_transform.rect_diagonal_scale(vehicle.bbox)
+                    release_box_distance = spatial_transform.point_to_rect_distance(
+                        release.mean_uv, vehicle.bbox
+                    )
+                    later_box_distance = spatial_transform.point_to_rect_distance(
+                        last_point, later_vehicle.bbox
+                    )
+                    release_center_pair = spatial_transform.project(
+                        (release.mean_uv, vehicle.center)
+                    )
+                    later_center_pair = spatial_transform.project(
+                        (last_point, later_vehicle.center)
+                    )
+                    if (
+                        scale is None
+                        or release_box_distance is None
+                        or later_box_distance is None
+                        or release_center_pair is None
+                        or later_center_pair is None
+                    ):
+                        raise ValueError("unsafe pseudo-ground BC diagnostic projection")
+                    release_center_distance = float(np.linalg.norm(
+                        release_center_pair[0] - release_center_pair[1]
+                    ))
+                    later_center_distance = float(np.linalg.norm(
+                        later_center_pair[0] - later_center_pair[1]
+                    ))
+                else:
+                    scale = max(np.hypot(vehicle.width, vehicle.height), 1.0)
+                    release_box_distance = float(np.linalg.norm(
+                        _point_to_rect_vector(release.mean_uv, vehicle.bbox)
+                    ))
+                    later_box_distance = float(np.linalg.norm(
+                        _point_to_rect_vector(last_point, later_vehicle.bbox)
+                    ))
+                    release_center_distance = float(
+                        np.linalg.norm(release.mean_uv - vehicle.center)
+                    )
+                    later_center_distance = float(
+                        np.linalg.norm(last_point - later_vehicle.center)
+                    )
                 exit_gain = (
                     later_box_distance - release_box_distance
-                ) / scale
-                release_center_distance = float(
-                    np.linalg.norm(release.mean_uv - vehicle.center)
-                )
-                later_center_distance = float(
-                    np.linalg.norm(last_point - later_vehicle.center)
-                )
+                ) / max(float(scale), 1e-12)
                 relative_gain = (
                     later_center_distance - release_center_distance
-                ) / scale
+                ) / max(float(scale), 1e-12)
                 raw_features.update({
                     "reverse_direction": (1.0 - np.clip(
                         outward_cosine, -1.0, 1.0
@@ -784,6 +943,7 @@ def compute_c_ac(
     min_dwell_seconds: float = 0.15,
     max_support_gap_seconds: float = 0.50,
     cost_config: Optional[BacktrackCostConfig] = None,
+    spatial_transform: Optional[EventSpatialTransform] = None,
 ) -> CostCell:
     """Person-vehicle cost from their own endpoints and overlap only.
 
@@ -812,8 +972,12 @@ def compute_c_ac(
     )
     if not people or not vehicles:
         return CostCell.rejected("missing_person_or_vehicle")
-    max_gap = _physical_gap_limit_frames(
-        max_pair_gap_seconds, fps, max_observation_gap_frames
+    resolved_cost_config = cost_config or BacktrackCostConfig()
+    soft_time = resolved_cost_config.observation_time_cost_mode == "soft"
+    max_gap = (
+        None if soft_time else _physical_gap_limit_frames(
+            max_pair_gap_seconds, fps, max_observation_gap_frames
+        )
     )
 
     pairs = []
@@ -835,23 +999,36 @@ def compute_c_ac(
             vehicle_index += 1
         vehicle = vehicles[vehicle_index]
         if (
+            max_gap is not None
+            and
             abs(int(vehicle.frame_index) - int(person.frame_index))
             > max_gap
         ):
             continue
-        foot_distance = float(np.linalg.norm(person.footpoint - vehicle.footpoint))
-        vehicle_scale = max(np.hypot(vehicle.width, vehicle.height), 1.0)
+        if spatial_transform is not None:
+            proximity = spatial_transform.normalized_point_distance(
+                person.footpoint,
+                vehicle.footpoint,
+                vehicle.bbox,
+            )
+            if proximity is None:
+                continue
+        else:
+            foot_distance = float(np.linalg.norm(
+                person.footpoint - vehicle.footpoint
+            ))
+            vehicle_scale = max(np.hypot(vehicle.width, vehicle.height), 1.0)
+            proximity = foot_distance / vehicle_scale
         pair_covariance = person.covariance_uv + vehicle.covariance_uv
         if _uncertainty_ratio(
             pair_covariance, max(person.height, vehicle.height)
         ) > float(max_uncertainty_height_ratio):
             continue
-        proximity = foot_distance / vehicle_scale
         iom = _intersection_over_minimum(person.bbox, vehicle.bbox)
         evidence_gap_frames = abs(
             person.evidence_frame_index - vehicle.evidence_frame_index
         )
-        if evidence_gap_frames > max_gap:
+        if max_gap is not None and evidence_gap_frames > max_gap:
             continue
         pair_gap = evidence_gap_frames / max(
             float(fps), 1e-6
@@ -864,7 +1041,10 @@ def compute_c_ac(
             / max(max(person.height, vehicle.height) ** 2, 1.0)
         )
         pairs.append(
-            (person, vehicle, proximity, iom, pair_gap, quality, uncertainty)
+            (
+                person, vehicle, proximity, iom, evidence_gap_frames,
+                pair_gap, quality, uncertainty,
+            )
         )
 
     if not pairs:
@@ -962,7 +1142,6 @@ def compute_c_ac(
     support_frames = selected_run[1] if sustained else [
         int(item[0].frame_index) for item in strong_endpoint
     ]
-    resolved_cost_config = cost_config or BacktrackCostConfig()
     normalize_dt = bool(
         resolved_cost_config.normalize_distance_time_by_gate
     )
@@ -976,7 +1155,22 @@ def compute_c_ac(
     }
 
     def _pair_raw_features(item):
-        _, _, pair_proximity, pair_iom, pair_gap, pair_quality, pair_uncertainty = item
+        (
+            _, _, pair_proximity, pair_iom, pair_gap_frames, pair_gap,
+            pair_quality, pair_uncertainty,
+        ) = item
+        time_feature = (
+            _hybrid_time_soft_penalty(
+                pair_gap_frames,
+                fps,
+                max_pair_gap_seconds,
+                max_observation_gap_frames,
+                resolved_cost_config.observation_time_soft_kappa,
+            )
+            if soft_time else _gate_fraction(
+                pair_gap, max_pair_gap_seconds, normalize_dt
+            )
+        )
         return {
             "endpoint_proximity": _gate_fraction(
                 min(pair_proximity, float(proximity_gate)),
@@ -984,9 +1178,7 @@ def compute_c_ac(
                 normalize_dt,
             ),
             "overlap": 1.0 - pair_iom,
-            "time": _gate_fraction(
-                pair_gap, max_pair_gap_seconds, normalize_dt
-            ),
+            "time": time_feature,
             "quality": pair_quality,
             "uncertainty": (
                 float(pair_uncertainty) / 0.15
@@ -1006,7 +1198,10 @@ def compute_c_ac(
             _weighted_components(_pair_raw_features(item), weights).values()
         ),
     )
-    person, vehicle, proximity, iom, pair_gap, quality, uncertainty = best
+    (
+        person, vehicle, proximity, iom, _pair_gap_frames, pair_gap,
+        quality, uncertainty,
+    ) = best
     if proximity > float(proximity_gate) and iom < 0.05:
         return CostCell.rejected(
             "person_vehicle_gate_failed", proximity=proximity, overlap=iom

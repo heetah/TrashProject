@@ -4,7 +4,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "scripts"))
 
-from summarize_actor_ground_truth_metrics import _event_row, _summary_stats
+from summarize_actor_ground_truth_metrics import (
+    _confirmed_count,
+    _event_row,
+    _sidecar_events,
+    _summary_stats,
+)
 
 
 def test_event_row_computes_route_and_release_birth_metrics():
@@ -58,3 +63,20 @@ def test_unknown_vehicle_cases_keep_id_unknown_but_are_human_adjudicated():
     assert row["human_verified_correct"] is True
     assert row["route_match"] is True
     assert row["vehicle_match"] is None
+
+
+def test_batch_case_subdirectories_are_discovered(tmp_path: Path):
+    case_dir = tmp_path / "case_7"
+    case_dir.mkdir()
+    (case_dir / "litter_case_7_annotated_backtrack_candidates.jsonl").write_text(
+        json.dumps({"record_type": "candidate", "event": {"litter_id": 1}})
+        + "\n",
+        encoding="utf-8",
+    )
+    (case_dir / "litter_case_7_annotated_analysis.json").write_text(
+        json.dumps({"litter_detection": {"confirmed_event_count": 1}}),
+        encoding="utf-8",
+    )
+
+    assert len(_sidecar_events(tmp_path)[7]) == 1
+    assert _confirmed_count(tmp_path, 7) == 1

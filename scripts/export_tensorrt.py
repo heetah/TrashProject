@@ -6,8 +6,11 @@ from pathlib import Path
 
 from pipeline.config import PipelineConfig, PROJECT_ROOT, load_project_env
 
-# 與 production entrypoint 共用 root .env；須早於 Torch/Ultralytics import。
-load_project_env()
+# 與 production entrypoint 共用 root .env；真正執行匯出工具時須早於
+# Torch/Ultralytics import。作為 helper module 匯入時不得污染 process env，否則
+# 測試與其他長生命週期 caller 會意外繼承本機 .env。
+if __name__ == "__main__":
+    load_project_env()
 
 import cv2
 import torch

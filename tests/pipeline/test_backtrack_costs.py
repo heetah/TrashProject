@@ -281,13 +281,13 @@ def test_c_bc_production_gate_uses_unexpanded_bbox_and_diagonal_scale():
         bbox=(0.0, 0.0, 80.0, 60.0),  # diagonal = 100 px
     )]
 
-    at_029 = compute_c_bc([_release(10, (109.0, 30.0))], vehicle, fps=10)
-    at_031 = compute_c_bc([_release(10, (111.0, 30.0))], vehicle, fps=10)
+    at_039 = compute_c_bc([_release(10, (119.0, 30.0))], vehicle, fps=10)
+    at_041 = compute_c_bc([_release(10, (121.0, 30.0))], vehicle, fps=10)
 
-    assert at_029.valid
-    assert at_029.raw_features["direct_distance"] == pytest.approx(0.29)
-    assert not at_031.valid
-    assert at_031.components["minimum_normalized_distance"] == pytest.approx(0.31)
+    assert at_039.valid
+    assert at_039.raw_features["direct_distance"] == pytest.approx(0.39)
+    assert not at_041.valid
+    assert at_041.components["minimum_normalized_distance"] == pytest.approx(0.41)
 
 
 def test_c_bc_legacy_bbox_expansion_is_an_explicit_research_override():
@@ -316,7 +316,7 @@ def test_c_bc_legacy_bbox_expansion_is_an_explicit_research_override():
     assert legacy.raw_features["direct_distance"] == pytest.approx(0.006)
 
 
-def test_observation_time_gate_requires_three_frames_and_quarter_second():
+def test_observation_time_soft_penalty_uses_stricter_seconds_or_frames_scale():
     vehicle = [ActorObservation(
         cls_name="vehicle",
         track_id=2,
@@ -330,8 +330,14 @@ def test_observation_time_gate_requires_three_frames_and_quarter_second():
         [release], vehicle, fps=30, max_observation_gap_frames=None
     )
 
-    assert not hybrid.valid  # 4 frames is only 0.133 s, but exceeds 3 frames.
+    assert hybrid.valid
     assert seconds_only.valid
+    # At 30 FPS, 4 frames is 0.133 s: seconds fraction=.533, frame
+    # fraction=1.333. max() chooses frames, then kappa=4 penalizes excess.
+    assert hybrid.raw_features["time"] == pytest.approx(
+        4 / 3 + 4 * (1 / 3) ** 2
+    )
+    assert seconds_only.raw_features["time"] == pytest.approx((4 / 30) / .25)
 
     low_fps_vehicle = [ActorObservation(
         cls_name="vehicle",
@@ -340,7 +346,25 @@ def test_observation_time_gate_requires_three_frames_and_quarter_second():
         bbox=(0.0, 0.0, 80.0, 60.0),
     )]
     low_fps = compute_c_bc([release], low_fps_vehicle, fps=10)
-    assert not low_fps.valid  # 3 frames meets the frame cap but is 0.30 s.
+    assert low_fps.valid
+    # At 10 FPS, seconds is stricter: z=max(.30/.25, 3/3)=1.2.
+    assert low_fps.raw_features["time"] == pytest.approx(1.2 + 4 * .2 ** 2)
+
+
+def test_legacy_observation_time_hard_gate_remains_replayable():
+    vehicle = [ActorObservation(
+        cls_name="vehicle",
+        track_id=2,
+        frame_index=14,
+        bbox=(0.0, 0.0, 80.0, 60.0),
+    )]
+    release = _release(10, (40.0, 30.0))
+    legacy = BacktrackCostConfig(observation_time_cost_mode="hard")
+
+    hybrid = compute_c_bc([release], vehicle, fps=30, cost_config=legacy)
+
+    assert not hybrid.valid
+    assert hybrid.reject_reason == "direct_vehicle_gate_failed"
 
 
 def test_c_ba_uses_upper_body_release_zone_not_person_footpoint():

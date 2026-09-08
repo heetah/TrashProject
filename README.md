@@ -17,6 +17,7 @@ trashProject/
 │   │   ├── plate.py             # 車牌 detection + PaddleOCR
 │   │   ├── events.py            # 精簡 analysis JSON schema
 │   │   ├── config.py            # 集中執行參數
+│   │   ├── calibration/         # Online pseudo-homography calibration
 │   │   ├── infra/               # model、motion、video I/O、worker
 │   │   ├── litter/              # litter trajectory helpers
 │   │   └── backtrack/           # Kalman/RTS/cost/flow/sidecar
@@ -119,7 +120,7 @@ batch、batch repair 與 TensorRT smoke test 共用同一個 input builder。
 1. Bbox size/aspect-ratio filter。
 2. 全框 motion evidence。
 3. 中心區 core-motion evidence。
-4. Camera-shake cooldown。
+4. Camera-shake evidence；8/27 recovery profile 允許候選繼續進入下游 gates。
 5. Actor polygon/relative-motion holding gate。
 6. `GlobalLitterTracker` trajectory、displacement、temporal confirmation。
 
@@ -155,12 +156,110 @@ Hungarian 只維護同一物件跨幀 identity，不做 person↔vehicle 或 lit
 
 Production 的 direct litter→vehicle hard gate 使用未擴張的 vehicle bbox。令 release
 point 為 `p`、vehicle bbox 為 `B`、bbox 寬高為 `w,h`，距離定義為
-`D = dist(p, B) / sqrt(w²+h²)`，要求 `D <= 0.30`。Actor evidence 與 release
-的時間差同時要求 `Δframe <= 3` 及 `Δframe/FPS <= 0.25 s`；兩者是 AND，
-不是相加成 0.55 秒。固定秒數保留跨 FPS 的物理意義，3-frame cap 則限制逐幀
-detector 可漏失的 observation 數。
+`D = dist(p, B) / sqrt(w²+h²)`，要求 `D <= 0.40`。Actor evidence 與 release
+的時間差使用 hybrid soft penalty：令
+`z = max((Δframe/FPS)/0.25, Δframe/3)`，再計算
+`ρ(z) = z + κ max(0,z-1)²`，production 預設 `κ=4`。`0.25 s` 與 `3 frames`
+是 soft boundary，不再直接刪除超界候選；固定秒數保留跨 FPS 的物理意義，
+frame尺度限制逐幀 detector observation 的陳舊程度。距離／不確定性 hard gate、
+有界 Kalman horizon 及完整 `NULL` route 仍保留，避免 forced match。
 
 Backtrack sidecar 用於標註、成本校正與 gate 分析。沒有人工 reviewed ground truth 時，只能報告 candidate coverage/resolved/dustbin，不能宣稱歸因準確率。
+
+### Online pseudo-homography calibration
+
+`scripts/pipeline/calibration/` 依序建立可跨攝影機部署的自我校正資料流。Phase 1
+目前只收集 YOLO-Seg 真實觀測：從 vehicle/scooter segmentation mask 的底部
+98-percentile band 取中位數接地點，經面積、邊界、confidence、track continuity 與
+teleport quality filter 後，寫入限時、限量的輕量 trajectory buffer，再保留彎道所需的
+local tangent observations。跳幀 cache (`observed=false`) 不會重複成為 calibration evidence，
+也不保存 frame 或完整 mask。
+
+Phase 2 將 local observations 放入 configurable image grid，以 circular medoid、
+angular-residual trimming、weighted median speed 建立 robust traffic motion field；接著用
+正規化位置、局部方向及同一 track 的 segment continuity 執行 grid-indexed lightweight
+DBSCAN。它不會只因兩段軌跡方向相同就跨越不同道路區域合併，也不會把反向車流平均掉。
+Debug API 可在 frame copy 上畫 local segments、cell dominant arrows 與 flow clusters，
+不進入 production renderer。
+
+Phase 3 提供 deterministic initial transform：`H0=diag(1/width,1/height,1)`，將
+image rectangle 映射到相對 `[0,1]×[0,1]` pseudo-ground。這只是安全且非隨機的
+relative-scale baseline，不是透視校正完成或真實公尺。`image_to_ground()` 對分母接近0、
+NaN/Inf 及輸出爆炸的 row 回傳 NaN；matrix validator 另檢查 determinant、condition
+number、完整 image grid 的 denominator variation/sign、corner orientation、projected area
+與 bounds。Analysis snapshot 保存 H、版本0、confidence 0、validation report，且仍標示
+`affects_attribution=false`。
+
+Phase 4 對任一通過 Phase 3 safety validation 的候選 H 計算四個 robust diagnostics：
+相鄰 ground-plane velocity 的相對變化、相鄰 speed ratio 的 log 變化、連續 turning
+angle 的差（curvature discontinuity），以及同一 traffic-flow cluster 經局部 Jacobian
+近似投影後的方向離散。前三者按 observation quality 加權，所有 residual 經 Huber
+penalty；速度以每條 track 的 median projected speed 正規化，direction 只比較角度，
+因此候選 H 不能只靠縮小輸出座標降低 loss。合法轉彎或平順加減速不被強迫為零。
+Analysis snapshot 會輸出各 component loss、sample count 與 active-weight normalized total；
+這些是候選矩陣的相對 objective，不是 accuracy、probability 或已完成的 calibration。
+
+Phase 5 再加入 cross-vehicle lane/flow consistency。每個 observation 只使用同一 flow
+cluster、局部影像鄰域中「其他 track」的點，以 quality-weighted moving median 建立
+leave-one-track-out 局部 centerline，並以其他車輛的 robust local tangent 計算垂直距離。
+因此不需要不同車輛在同一時間或同一 longitudinal position 對齊，也不會把整條彎道擬合成
+直線。距離除以投影 image footprint 面積平方根，使 uniform coordinate scaling 不會降低
+成本；鄰居以固定 image-space grid 尋找，典型複雜度接近 `O(N·k)`。Lane loss 仍只是
+flow-cluster 內的幾何診斷；沒有 lane label 時不可把它單獨解讀成真實車道寬或 calibration
+accuracy，Phase 6 也必須與 perspective constraint 和其他 loss 共同評估。
+
+Phase 6 提供 opt-in bounded candidate search。它不直接自由調整 H 的 9 個元素，而把
+候選寫成 `H_candidate=P(theta)H_previous`；`theta` 只包含 log-anisotropy、兩個 shear
+與兩個 perspective coefficient。搜尋採 deterministic coordinate perturbation、逐輪縮小
+step，所有候選都必須通過 Phase 3 hard validation。Objective 為 data loss、local-Jacobian
+anisotropy/area-variation perspective regularization，以及新舊 H 在固定 image grid 上投影
+位移的 temporal prior 加權平均。
+
+Confidence 明確拆成 track count、independent flow count、spatial coverage、trajectory
+duration、ground-point quality、motion-field stability、residual、lane evidence、candidate
+improvement 與 historical stability 十項 `[0,1]` 分數。即使平均 confidence 足夠，只要
+valid tracks、flow、coverage、duration、relative improvement 任一 hard evidence gate 不足，
+仍輸出 freeze。通過時 `alpha=max_alpha×confidence×improvement_score`，在 theta 空間做
+small-step proposal，然後重新做 geometric validation 與 objective improvement 檢查。
+目前 `DYNAMIC_HOMOGRAPHY_OPTIMIZE=0`，安全預設只輸出
+`applied_to_production=false` 的建議。若另外明確啟用 optimizer 與
+`SMART_BACKTRACK_DYNAMIC_HOMOGRAPHY=1`，Smart Backtrack 只會接受事件確認當下
+`LOCKED`、達最低信心且再次通過矩陣驗證的 frozen H；其他事件保留 image-space 成本。
+
+Phase 7 由 `DynamicHomographyCalibrator` 持有每支攝影機各自的 H、version、confidence、
+rolling evidence、rollback history 與 calibration-window metrics，狀態依序為
+`UNCALIBRATED → COLLECTING → ESTIMATING → WARMING_UP → LOCKED`；證據不足則進入
+`LOW_CONFIDENCE` 並凍結 H，累積更多觀測後再估計。只有 optimizer proposal 通過時
+才增加 version；收斂後必須再連續出現足夠 stable windows 才 LOCKED。LOCKED 不再持續
+調 H，只監看 traffic residual、normalized motion centroid/spread、direction tensor，以及
+可選的 static-background motion signal。
+
+單一異常 window 不會觸發重校正；連續達 `DRIFT_WINDOWS` 才轉成
+`DRIFT_DETECTED → RECALIBRATING`。資料不足、optimizer disabled、candidate invalid 或
+coverage 不足都保留舊 H。每次成功更新前保存 rollback snapshot。若 frame resolution/crop
+尺寸改變，舊 H 與舊 buffer 不會混用，狀態會停在 `DRIFT_DETECTED` 並要求明確 `reset()`
+後以新影像尺寸重新蒐證。這個 state 仍完全隔離於事件歸因。
+
+Phase 8 提供預設關閉的 `StaticBackgroundStabilizer`。呼叫端必須提供涵蓋已知
+vehicle/person/litter 的 exclusion mask；否則不估計。模組只在剩餘 static background
+上抽 ORB features，以 ratio test + RANSAC 求 `G_current_to_reference`，並限制 inlier
+ratio、translation、rotation、scale 與 orientation。每支攝影機只保留一組 reference
+keypoints/descriptors 和最後有效 G，不保存 frame history；新估計失敗時保留最後有效 G。
+Runtime transform 定義為 `H_runtime=H_calibration@G_current_to_reference`。
+
+`capture_event_snapshot()` 可建立唯讀的 H version、confidence、calibration H、G 與
+runtime H 快照，確保事件反追蹤不會混用不同座標版本。其 consumer 由
+`SMART_BACKTRACK_DYNAMIC_HOMOGRAPHY` 獨立控制，未達條件會留下原因並安全 fallback。
+`render_calibration_debug()` 在 frame copy 上同時顯示 image-space
+tracks、local motion/flow clusters、pseudo-ground inset 與 calibration statistics，完全不
+進入正常 renderer。
+
+`DYNAMIC_HOMOGRAPHY=0` 與 `SMART_BACKTRACK_DYNAMIC_HOMOGRAPHY=0` 均為安全預設。
+Phase 1–8 的診斷本身不會覆蓋 backtrack H；只有通過事件級安全閘門的 opt-in consumer
+才改用 relative pseudo-ground spatial features，且不修改垃圾確認或 OCR。完整架構、公式、
+狀態、效能與驗收對照見
+[`scripts/pipeline/calibration/FLOW.md`](scripts/pipeline/calibration/FLOW.md)。只有 reviewed
+continuous multi-camera replay 通過後，才能考慮預設啟用。
 
 ### Plate OCR
 
@@ -292,7 +391,56 @@ MP4 片段，並附一份列出違規、關聯車輛、車牌與審核資料的 
 | `SMART_BACKTRACK_STUDY_STAGE` | `full` | Research ablation stage；production 預設不變 |
 | `SMART_BACKTRACK_RAW_PREFIX` | `1` | confirmed event 才能使用 pre-postprocessing RT-DETR bbox 補 release trajectory；不參與 event confirmation |
 | `SMART_BACKTRACK_DT_DISTANCE_WEIGHT` | `1.0` | D+T stage 的 gate-normalized distance weight |
-| `SMART_BACKTRACK_DT_TIME_WEIGHT` | `1.0` | D+T stage 的 gate-normalized time weight |
+| `SMART_BACKTRACK_DT_TIME_WEIGHT` | `1.0` | D+T stage 的 hybrid observation-time weight |
+| `SMART_BACKTRACK_TIME_COST_MODE` | `soft` | `soft` 使用連續超界懲罰；`hard` 僅供重播舊 AND gate |
+| `SMART_BACKTRACK_TIME_SOFT_KAPPA` | `4.0` | `z>1` 後的平方超界曲率；須以 event-grouped validation 校正 |
+| `SMART_BACKTRACK_DYNAMIC_HOMOGRAPHY` | `0` | opt-in 使用事件級 frozen H；未 LOCKED、低信心或無效 H 逐事件退回 image-space |
+| `SMART_BACKTRACK_HOMOGRAPHY_MIN_CONFIDENCE` | `0.65` | 事件可使用 dynamic H 的最低 state confidence；不是 accuracy probability |
+| `DYNAMIC_HOMOGRAPHY` | `0` | 啟用 Phase 1 mask 接地點／軌跡／local-motion 蒐集；目前不影響歸因 |
+| `DYNAMIC_HOMOGRAPHY_WINDOW_SEC` | `100` | 每支攝影機的輕量 rolling trajectory window |
+| `DYNAMIC_HOMOGRAPHY_BOTTOM_PERCENTILE` | `98` | vehicle mask 底部接地帶 percentile |
+| `DYNAMIC_HOMOGRAPHY_MIN_MASK_AREA` | `64` | calibration mask 最小像素面積 |
+| `DYNAMIC_HOMOGRAPHY_MIN_CONF` | `0.45` | calibration vehicle observation 最低信心 |
+| `DYNAMIC_HOMOGRAPHY_QUALITY_THRESHOLD` | `0.60` | 綜合 observation quality 下限 |
+| `DYNAMIC_HOMOGRAPHY_GRID_ROWS` / `GRID_COLS` | `12` / `20` | Phase 2 spatial motion field 網格 |
+| `DYNAMIC_HOMOGRAPHY_DIRECTION_TRIM_FRAC` | `0.15` | cell circular residual 的 robust trimming 比例 |
+| `DYNAMIC_HOMOGRAPHY_FLOW_POSITION_RADIUS` | `0.10` | flow clustering 的影像尺寸正規化空間半徑 |
+| `DYNAMIC_HOMOGRAPHY_FLOW_ANGLE_DEG` | `30` | 不同 track local segments 的最大方向差 |
+| `DYNAMIC_HOMOGRAPHY_FLOW_MIN_TRACKS` | `2` | flow cluster 最少獨立 vehicle tracks |
+| `DYNAMIC_HOMOGRAPHY_MAX_CONDITION` | `1000000` | Phase 3 H condition-number 上限 |
+| `DYNAMIC_HOMOGRAPHY_MIN_DENOMINATOR` | `1e-6` | homogeneous projection 安全分母下限 |
+| `DYNAMIC_HOMOGRAPHY_MAX_DENOM_RATIO` | `100` | image ROI 內最大／最小投影分母比例 |
+| `DYNAMIC_HOMOGRAPHY_REQUIRE_ORIENTATION` | `1` | 拒絕鏡射 pseudo-ground coordinate system |
+| `DYNAMIC_HOMOGRAPHY_*_WEIGHT` | `1.0` | Phase 4 motion/speed/curvature/direction loss 權重；相等值只是中性起點，須用獨立 replay 校正 |
+| `DYNAMIC_HOMOGRAPHY_MOTION_HUBER_DELTA` | `0.50` | 相鄰 velocity change／track median speed 的 Huber 轉折點 |
+| `DYNAMIC_HOMOGRAPHY_SPEED_HUBER_DELTA` | `0.35` | `abs(log(v_i/v_{i-1}))` 的 Huber 轉折點 |
+| `DYNAMIC_HOMOGRAPHY_CURVATURE_HUBER_DELTA` / `DIRECTION_HUBER_DELTA` | `0.261799` | 角度 residual 的 15° robust 轉折點；為初始 prior，非 accuracy 證明 |
+| `DYNAMIC_HOMOGRAPHY_DIRECTION_PROBE_FRAC` | `0.01` | 用影像對角線 1% 的局部 probe 近似 H 在 observation 周圍的方向映射 |
+| `DYNAMIC_HOMOGRAPHY_LANE_WEIGHT` | `1.0` | Phase 5 cross-vehicle local centerline loss 權重；中性起點，非已驗證常數 |
+| `DYNAMIC_HOMOGRAPHY_LANE_HUBER_DELTA` | `0.03` | 以 projected footprint scale 正規化後的 lane residual Huber 轉折點 |
+| `DYNAMIC_HOMOGRAPHY_LANE_NEIGHBORHOOD_FRAC` | `0.10` | 以影像對角線比例定義的固定局部 peer 搜尋半徑 |
+| `DYNAMIC_HOMOGRAPHY_LANE_MIN_PEER_OBS` / `LANE_MIN_PEER_TRACKS` | `2` / `1` | 每個 leave-one-track-out centerline 的最低其他車輛證據 |
+| `DYNAMIC_HOMOGRAPHY_OPTIMIZE` | `0` | 執行 Phase 6 bounded candidate search；只產生建議，不套用 production H |
+| `DYNAMIC_HOMOGRAPHY_OPT_*_STEP` | `0.08` / `0.04` / `0.08` | anisotropy、shear、perspective 的初始 dimensionless search step |
+| `DYNAMIC_HOMOGRAPHY_OPT_ITERATIONS` / `STEP_DECAY` | `3` / `0.5` | coordinate search 輪數與每輪 step 衰減 |
+| `DYNAMIC_HOMOGRAPHY_OPT_DATA_WEIGHT` | `1.0` | Phase 4/5 traffic-data loss 在 optimizer objective 的權重 |
+| `DYNAMIC_HOMOGRAPHY_OPT_PERSPECTIVE_WEIGHT` / `TEMPORAL_WEIGHT` | `0.25` / `0.25` | 局部投影正則化與 previous-H temporal prior 權重；皆為待 replay 校正的初始 prior |
+| `DYNAMIC_HOMOGRAPHY_OPT_MIN_VALID_TRACKS` / `MIN_FLOW_CLUSTERS` | `4` / `1` | safe-update 最低跨車輛與獨立 flow 證據 |
+| `DYNAMIC_HOMOGRAPHY_OPT_MIN_SPATIAL_COVERAGE` / `MIN_DURATION_SEC` | `0.01` / `10` | safe-update 最低 motion-grid 覆蓋與觀察時間 |
+| `DYNAMIC_HOMOGRAPHY_OPT_MIN_REL_IMPROVEMENT` | `0.01` | candidate objective 至少相對改善 1%，否則 freeze |
+| `DYNAMIC_HOMOGRAPHY_OPT_FREEZE_CONFIDENCE` / `MAX_UPDATE_ALPHA` | `0.55` / `0.20` | confidence freeze threshold 與單次 theta-space update 上限 |
+| `DYNAMIC_HOMOGRAPHY_EVAL_INTERVAL_SEC` | `30` | Phase 7 calibration evaluation 間隔；逐幀只收集輕量 observation |
+| `DYNAMIC_HOMOGRAPHY_LOCK_MIN_UPDATES` / `LOCK_STABLE_WINDOWS` | `2` / `2` | 進入 LOCKED 前的最低成功更新與連續穩定 window |
+| `DYNAMIC_HOMOGRAPHY_DRIFT_WINDOWS` | `3` | LOCKED 後必須連續出現 drift signal 的 window 數 |
+| `DYNAMIC_HOMOGRAPHY_DRIFT_RESIDUAL_RATIO` / `DRIFT_ABS_INCREASE` | `2.0` / `0.05` | 相對及絕對 residual drift 門檻，取較嚴格者 |
+| `DYNAMIC_HOMOGRAPHY_DRIFT_CENTROID_FRAC` / `DRIFT_SPREAD_FRAC` | `0.08` / `0.08` | normalized traffic geometry 中心與分布改變門檻 |
+| `DYNAMIC_HOMOGRAPHY_DRIFT_DIRECTION_TENSOR` | `0.25` | 車流方向二階矩陣的 Frobenius drift 門檻 |
+| `DYNAMIC_HOMOGRAPHY_ROLLBACK_HISTORY` / `METRICS_HISTORY` | `8` / `100` | 每攝影機保留的 H rollback 與 calibration-window 紀錄上限 |
+| `DYNAMIC_HOMOGRAPHY_CONFIDENCE_ALPHA` / `DRIFT_CONFIDENCE_DECAY` | `0.25` / `0.80` | persistent confidence EMA 與 drift-window 衰減 |
+| `DYNAMIC_HOMOGRAPHY_STABILIZE` | `0` | Phase 8 static-background ORB stabilization；caller 必須提供完整 dynamic exclusion mask |
+| `DYNAMIC_HOMOGRAPHY_STAB_MIN_MATCHES` / `MIN_INLIER_RATIO` | `20` / `0.50` | RANSAC 前最低 static matches 與接受 G 的最低 inlier 比例 |
+| `DYNAMIC_HOMOGRAPHY_STAB_MAX_TRANSLATION_FRAC` | `0.08` | G translation 相對影像對角線的安全上限 |
+| `DYNAMIC_HOMOGRAPHY_STAB_MAX_ROTATION_DEG` / `MAX_SCALE_CHANGE` | `5.0` / `0.08` | 單次 background transform 的旋轉與尺度安全上限 |
 | `SMART_BACKTRACK_TWO_POINT_MAX_BACK_SEC` | `0.4` | 舊 replay 相容欄位；新版不再作為兩點軌跡的物理截止 |
 | `SMART_BACKTRACK_TWO_POINT_PRIOR_COST` | `1.0` | 兩點常速 release hypothesis 基礎 prior cost |
 | `SMART_BACKTRACK_MAX_FORWARD_RELEASE_SEC` | `0.5` | ballistic release window 可晚於 detector birth 的上限；仍受已觀測 airborne 軌跡限制 |
@@ -303,14 +451,14 @@ MP4 片段，並附一份列出違規、關聯車輛、車牌與審核資料的 
 | `LITTER_CANDIDATE_SIDECAR` | `0` | 研究用逐 candidate JSONL，記錄 gate reason、tracker ID 與可重現設定；不供前端或 ground truth 使用 |
 | `LITTER_CANDIDATE_DEDUP` | `0` | 實驗性同幀 IoU 去重；目前 replay 未採用（未增加正確 confirmed 且 safety proxy 惡化） |
 | `LITTER_CANDIDATE_DEDUP_IOU` | `0.5` | 同幀 candidate 去重 IoU 門檻；僅在 `LITTER_CANDIDATE_DEDUP=1` 時生效 |
-| `LITTER_CONFIRM_REQUIRE_BIRTH_ACTOR` | `1` | Confirm 是否要求垃圾出生幀已有 thrower；研究 replay 可設 `0`，但仍必須通過運動、軌跡與 actor 關聯 gates |
-| `LITTER_MIN_CONFIRM_AGE_VEHICLE` | `3` | vehicle/scooter thrower 的最少 observation 次數；研究 replay 的 2 需以 reviewed clip-level 結果解讀 |
-| `LITTER_MIN_CONFIRM_DOWNWARD_VEHICLE` | `12` | vehicle/scooter thrower 的向下位移門檻（px）；僅供可重現 A/B replay |
-| `LITTER_MIN_CONFIRM_HORIZONTAL_DISPLACEMENT` | `5` | confirm 所需水平位移門檻（px）；降低會放行近垂直落下案例，必須同步檢查 FP proxy |
-| `LITTER_MAX_HORIZ_TO_DOWN_RATIO_VEHICLE` | `3.5` | vehicle thrower 水平/向下位移最大比例；過大會放行純水平滑動 |
-| `LITTER_MIN_VEHICLE_RELATIVE_SEPARATION` | `60` | 垃圾相對載體車輛的最小分離（px）；0 會關閉此 FP 抑制 gate |
-| `LITTER_FP_STREAK_RATIO` | `5` | 前處理水平 streak 與向下位移比例門檻 |
-| `LITTER_ALLOW_SHAKE_CANDIDATES` | `0` | 是否在 camera-shake frame 繼續提交 candidate；僅用於研究 replay |
+| `LITTER_CONFIRM_REQUIRE_BIRTH_ACTOR` | `0` | 8/27 recovery profile 允許 actor 在垃圾首個 observation 後才被偵測到；confirm 當下仍須有 actor 且通過其餘證據 gates |
+| `LITTER_MIN_CONFIRM_AGE_VEHICLE` | `2` | vehicle/scooter thrower 的最少 observation 次數；短軌跡須通過尺寸正規化絕對位移或「起點近 actor、終點已脫離」證據，兩點 fast-drop 另須 ≥35 px downward |
+| `LITTER_MIN_CONFIRM_DOWNWARD_VEHICLE` | `7` | vehicle/scooter thrower 的最小向下位移（px） |
+| `LITTER_MIN_CONFIRM_HORIZONTAL_DISPLACEMENT` | `1` | confirm 所需最小水平位移（px），允許近垂直落下案例 |
+| `LITTER_MAX_HORIZ_TO_DOWN_RATIO_VEHICLE` | `10` | vehicle thrower 水平／向下位移最大比例，保留極端水平滑動抑制 |
+| `LITTER_MIN_VEHICLE_RELATIVE_SEPARATION` | `0` | 關閉載體車輛相對分離 hard gate；相對分離仍可保留為診斷資料 |
+| `LITTER_FP_STREAK_RATIO` | `10` | 前處理水平 streak 與向下位移比例門檻 |
+| `LITTER_ALLOW_SHAKE_CANDIDATES` | `1` | camera-shake frame 的 candidate 仍提交給下游 motion/holding/tracker gates |
 | `OUTPUT_ROOT` | `.` | Output directory；建議明確設為 `output` |
 
 其餘 action smoothing、video I/O、writer、Smart Backtrack 與 legacy research 開關都已列在
@@ -373,11 +521,12 @@ safety proxy，不能宣稱 false-positive rate 或普適最佳門檻；event an
 `exit_code=0` 只代表 pipeline 完成。無人工 reviewed route 的案例只能比較
 candidate coverage、route 變化與 margin，不可宣稱 attribution accuracy。
 
-2026-08-26 的研究 recovery replay（完整 63 部）使用 sidecar 記錄的暫時性放寬門檻，
+2026-08-26 的研究 recovery replay（完整 63 部）使用 sidecar 記錄的放寬門檻，
 得到 41/63 confirmed clips（usable 41/58，Wilson 95% CI 52.75%--75.67%），達到
-「超過 40 部」的短期 coverage 目標；但未驗證 confirmed-track proxy 同時由 14 增至
-33，且 58 筆 event annotation 仍未人工 reviewed，因此不得把此結果解讀為 accuracy
-或可直接部署的參數。完整命令、paired CI 與回滾方式記於
+「超過 40 部」的短期 coverage 目標。該批輸出後續經專案人員人工檢查，於
+2026-09-07 提升為 production confirmation profile；這項決策提高 coverage，但因仍缺少
+足夠 negative/background clips，不得把 coverage 解讀為 precision、普適 accuracy 或
+自動開罰安全性。完整命令、paired CI 與原始回滾方式記於
 `versions/2026-08-26_codex_confirmation_recovery_replay.md`；機器可讀結果位於
 `artifacts/litter_postprocess_calibration/recovery_horiz1_full_20260826/`。
 
@@ -386,12 +535,48 @@ candidate coverage、route 變化與 margin，不可宣稱 attribution accuracy�
 ```bash
 conda run -n rtdetr python scripts/summarize_actor_ground_truth_metrics.py \
   --sidecar-dir output/rtdetr_recovery_horiz1_full_20260826 \
+  --acknowledge-run-local-ids \
   --output artifacts/actor_ground_truth_metrics/recovery_horiz1_full_20260826
 ```
 
 輸出 `actor_clip_metrics.csv`（以影片為獨立單位）與
 `actor_event_metrics.csv`（含 release/birth 座標、距離、時間、margin 與 D/T/A
-components）；`UNUSED` 與 `?` 不會被放入 accuracy 分母。
+components）；`UNUSED` 與 `?` 不會被放入 accuracy 分母。此工具只供重現當初抄錄
+numeric tracker ID 的同一輪歷史輸出；tracker ID 每輪皆可能改變，禁止把這份 ID 表
+套到新推論輸出或用於產品 readiness。
+
+新推論輸出必須以同輪 actor bbox→tracklet IoU 對映、固定正樣本分母與 fail-closed
+事件配對重新評估：
+
+```bash
+conda run -n rtdetr env PYTHONPATH=scripts python \
+  scripts/evaluate_reviewed_readiness.py \
+  --ground-truth runs/grounding_truth \
+  --candidates output/groundtruth_batch_dynamic_h_20260907 \
+  --output artifacts/product_readiness_same_run_20260907 \
+  --target 0.85
+```
+
+工具只接受 strict/moderate 時空 event match；miss、exploratory、actor mapping 失敗、
+NULL 與錯誤 route 全部留在分母。輸出 Wilson 95% CI、標註 review state、輸入 hash 與
+release gate。沒有 reviewed event labels、reviewed negative set 或獨立攝影機 holdout 時，
+`ready_for_enforcement` 必為 false；沒有 reviewed plate/OCR truth 時，可開罰案件正確率
+也一律標為未評估。研究用 release-window replay可加
+`--replay-max-release-back-seconds 1.0`，但不會改動 production 預設。
+
+2026-09-07 對 dynamic-H 58 案輸出套用此協定後，strict/moderate event sensitivity
+為 32/58（55.17%，Wilson 95% CI 42.45%--67.25%），暫定端到端 exact route 為
+23/58（39.66%，Wilson 95% CI 28.09%--52.51%）。1.0 秒 release replay 為
+25/58，但 paired gain/loss=3/1、exact p=0.625，且 event match 有退化；0.5 秒為
+23/58、gain/loss=2/2。兩者均未通過 promotion gate，production 參數未變。
+此外 58 筆 event annotation 仍是 `unreviewed`，並缺 reviewed negatives 與跨攝影機
+holdout，因此上述數值只能作 provisional development evidence，不能作 85% 上線聲明。
+
+車輛短軌跡 safety guard 的最終 58 案重跑維持 32/58 accepted events 與 23/58
+exact routes，paired gain/loss 皆為 0/0；case 42 的一筆 exploratory confirmation 被移除，
+且沒有新增 exploratory confirmation。這通過 development safety-change gate，但不是
+accuracy 改善或 reviewed false-positive reduction。完整紀錄位於
+`artifacts/groundtruth_batch_vehicle_evidence_final_20260908/REPORT.md`。
 
 `stage` 可為 `distance_time`、`kalman_rts`、`confidence`、`uncertainty`、
 `reverse` 或 `full`。其中 distance/time 以 birth anchor 與原始 actor
@@ -472,7 +657,7 @@ annotation schema 不複製 selected route、cost、rank 或 release prediction�
 可透過 `StudyConfig` 啟用車輛 `C_BC` 的 `D/0.4`、`T_E/0.25` 成本，以及
 release 回推的分段平方 prior（0.25 秒內不加罰，最多 1 秒）。新時間 prior
 取代原本的 backward window 成本，保留短軌跡 prior、forward penalty 與 NULL。
-Production 預設仍維持 D=0.3 與 observation-gap prior；新的組合先作明確的
+Production 預設使用 D=0.4 與 observation-gap prior；新的 release-time 組合先作明確的
 研究設定。`scripts/replay_release_policy.py` 可重播四組控制實驗，逐影片比較最後
 vehicle 是否正確，並分開列出數值 ID 正確率與歷史人工加分。
 完整設定與重現命令見 [`backtrack README`](scripts/pipeline/backtrack/README.md)。

@@ -53,7 +53,7 @@ def estimate_global_shift(prev_frame, curr_frame, downscale=SHAKE_DOWNSCALE):
 # contained by a vehicle are rejected at this early gate.  A stricter 0.85
 # override remains available for rollback/A-B via LITTER_FP_CONTAINMENT_THR.
 LITTER_FP_CONTAINMENT_THR = 0.999      # 候選與某車輛 bbox 幾乎完全重疊 → 隨車部件
-LITTER_FP_STREAK_RATIO = 5.0           # horizontal 位移 > 此倍率 × downward → 純水平條紋（非重力下墜）
+LITTER_FP_STREAK_RATIO = 10.0          # 8/27 recovery profile；仍排除極端純水平條紋
 LITTER_FP_ARC_MIN_DESCENT = 7.0        # 最高點後至少下降此像素，才視為重力下降證據
 LITTER_FP_NEAREST_VEHICLE_DIST = 40.0  # 候選距車輛 bbox 此值內才做共動判斷（像素）
 LITTER_FP_COMOTION_MIN_VEH_STEP = 4.0  # 該步車輛位移 ≥ 此值才足以判斷共動（px/frame）

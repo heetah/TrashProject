@@ -59,7 +59,7 @@ def test_invalid_policy_is_rejected(maximum, soft, weight):
                     release_time_weight=weight)
 
 
-def test_normalized_bc_cost_and_hard_gates_are_independent_of_weight():
+def test_normalized_bc_distance_gate_and_soft_time_cost_have_separate_roles():
     config = StudyConfig(normalize_bc_distance_time_by_gate=True,
                          normalized_distance_gate_vehicle=.4,
                          distance_weight=.8, time_weight=.2).resolver_config(10)
@@ -76,8 +76,36 @@ def test_normalized_bc_cost_and_hard_gates_are_independent_of_weight():
     zero = replace(config.cost_config, bc_weights={'direct_distance':0, 'time':0})
     assert not compute_c_bc([replace(release, mean_uv=np.array([100.01,40]))],
                             [actor],10,cost_config=zero,normalized_distance_gate=.4).valid
-    assert not compute_c_bc([release],[replace(actor,evidence_frame_index=17)],10,
-                            cost_config=zero,normalized_distance_gate=.4).valid
+    late = compute_c_bc(
+        [release], [replace(actor, evidence_frame_index=17)], 10,
+        cost_config=config.cost_config, normalized_distance_gate=.4,
+    )
+    assert late.valid
+    assert late.raw_features['time'] == pytest.approx(1.2 + 4 * .2 ** 2)
+    assert late.components['time'] == pytest.approx(.2 * (1.2 + 4 * .2 ** 2))
+
+    # The former AND hard gate remains available only as an explicit replay.
+    legacy = replace(config.cost_config, observation_time_cost_mode='hard')
+    assert not compute_c_bc(
+        [release], [replace(actor, evidence_frame_index=17)], 10,
+        cost_config=legacy, normalized_distance_gate=.4,
+    ).valid
+
+
+def test_production_vehicle_distance_gate_includes_d04_boundary_only():
+    actor = ActorObservation(
+        "vehicle", 1, 20, (0.0, 0.0, 60.0, 80.0),
+        evidence_frame_index=20,
+    )
+    # Vehicle diagonal is 100 px. The first point is exactly 40 px outside
+    # the bbox (D=0.4); the second is just beyond the production boundary.
+    at_boundary = ReleaseHypothesis(
+        20, [100.0, 40.0], np.eye(2), np.zeros(2), "ballistic", 0,
+    )
+    outside = replace(at_boundary, mean_uv=np.array([100.01, 40.0]))
+
+    assert compute_c_bc([at_boundary], [actor], fps=10).valid
+    assert not compute_c_bc([outside], [actor], fps=10).valid
 
 
 def test_config_roundtrip_null_and_sidecar_policy():

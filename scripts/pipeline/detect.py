@@ -23,6 +23,7 @@ from pipeline.geometry import (
 BLACK = (0, 0, 0)
 WARN = (0, 0, 255)
 RTDETR_DEBUG = (255, 0, 255)
+LITTER_ALLOW_SHAKE_CANDIDATES_DEFAULT = True
 
 
 ACTOR_CLASSES = ('person', 'scooter', 'vehicle')
@@ -52,6 +53,11 @@ def _float_env(name, default):
         return float(os.environ.get(name, str(default)))
     except (TypeError, ValueError):
         return float(default)
+
+
+def _allow_shake_candidates():
+    default = "1" if LITTER_ALLOW_SHAKE_CANDIDATES_DEFAULT else "0"
+    return os.environ.get("LITTER_ALLOW_SHAKE_CANDIDATES", default) not in ("0", "")
 
 
 # 車牌開罰前提：只有畫面「最近一段時間內出現過 vehicle/scooter」才跑後續昂貴判斷
@@ -659,10 +665,12 @@ def _stage_filter_litter_candidates(current_frame_litters, shake_active, shake_m
                 record['filter_reason'] = 'duplicate_iou'
                 record['tracker_outcome'] = 'not_submitted'
     with profile_block(profiler, "detect.motion_holding_filter"):
-        # 晃動冷卻區間內:整幀都在位移,litter 偵測不可靠 → 全數丟棄,不餵 tracker。
+        # 8/27 recovery profile 預設允許晃動幀候選繼續接受下游
+        # motion/holding/tracker gates；可設 LITTER_ALLOW_SHAKE_CANDIDATES=0
+        # 恢復整幀丟棄的保守策略。
         shake_skip = (
             shake_active and
-            os.environ.get("LITTER_ALLOW_SHAKE_CANDIDATES", "0") in ("0", "")
+            not _allow_shake_candidates()
         )
         if shake_skip and getattr(litter_tracker, '_debug', False):
             print(f"  [SHAKE_SKIP fi={frame_index} mag={shake_mag:.1f}px thr={shake_threshold:.1f} drop={len(current_frame_litters)}]")

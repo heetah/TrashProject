@@ -8,6 +8,11 @@ import time
 import numpy as np
 from collections import deque
 from scipy.spatial import distance
+from pipeline.calibration import (
+    build_dynamic_exclusion_mask,
+    CalibrationPhase1Config,
+    DynamicHomographyCalibrator,
+)
 from pipeline.geometry import validate_trajectory, calculate_mask_overlap_ratio
 
 
@@ -53,12 +58,12 @@ CONFIRMED_SHAPE_CHANGE_RATIO = 1.20     # confirmed 寬鬆，吸收形變
 MIN_CONFIRM_AGE = 2
 MIN_CONFIRM_ABS_DISPLACEMENT = 14.0
 MIN_CONFIRM_DOWNWARD_DISPLACEMENT = 7.0
-MIN_CONFIRM_HORIZONTAL_DISPLACEMENT = 5.0
+MIN_CONFIRM_HORIZONTAL_DISPLACEMENT = 1.0
 
-# === Confirm 門檻：vehicle thrower 加嚴（FP 多為車輛部件）===
-MIN_CONFIRM_AGE_VEHICLE = 3
-MIN_CONFIRM_DOWNWARD_DISPLACEMENT_VEHICLE = 12.0
-MAX_HORIZ_TO_DOWN_RATIO_VEHICLE = 3.5    # 純水平滑動非丟擲
+# === Confirm 門檻：vehicle thrower（8/27 人工複核 recovery profile）===
+MIN_CONFIRM_AGE_VEHICLE = 2
+MIN_CONFIRM_DOWNWARD_DISPLACEMENT_VEHICLE = 7.0
+MAX_HORIZ_TO_DOWN_RATIO_VEHICLE = 10.0   # 保留極端水平滑動抑制
 MAX_VEHICLE_THROWER_STEP_PX = 200.0      # 真實單步 < 150px
 
 # === 車身/貨物誤判 FP 抑制（相對載體車輛分離判別）===
@@ -66,7 +71,7 @@ MAX_VEHICLE_THROWER_STEP_PX = 200.0      # 真實單步 < 150px
 # 靜態重疊無法區分「被丟出但仍與車重疊的真實垃圾」與「車身部件」。
 # 改以「相對載體車輛的淨位移」判別：部件隨車移動 (rel ≈ 0) → 擋；被丟出者脫離車輛 (rel 大) → 放行。
 CARRIER_OVERLAP_MIN = 0.15              # litter 與某車輛重疊達此值才視為「在車上」，啟用分離檢查
-MIN_VEHICLE_RELATIVE_SEPARATION = 60.0  # litter 相對載體車輛的最小淨位移（小於此視為隨車移動的部件）
+MIN_VEHICLE_RELATIVE_SEPARATION = 0.0   # 8/27 profile：關閉此 hard gate，仍保留診斷值
 
 # 註：隨車部件 / 純水平條紋 / 車輛共動 等 litter 候選 FP 篩選已集中到 detect 前處理
 # （smallFunction.litter_candidate_is_vehicle_fp）；tracker 只負責追蹤與軌跡確認，不再做這些判斷。
@@ -183,12 +188,12 @@ class GlobalLitterTracker:
         self.fall_stable_min_age = FALL_STABLE_MIN_AGE
         self.fall_stable_tail_window = FALL_STABLE_TAIL_WINDOW
 
-        # Confirmation recovery A/B: a track can be associated with its actor
-        # after the first accepted litter observation (e.g. actor detector
-        # cadence or occlusion), but the default still requires birth-time
-        # actor support.  This switch never bypasses motion/trajectory gates.
+        # 8/27 reviewed recovery profile: actor detection may arrive after the
+        # first litter observation (detector cadence/occlusion), while an actor
+        # association is still required before confirmation. This never bypasses
+        # motion, trajectory, displacement, or stationary-object gates.
         self.require_birth_thrower_for_confirmation = (
-            _env_int("LITTER_CONFIRM_REQUIRE_BIRTH_ACTOR", 1) != 0
+            _env_int("LITTER_CONFIRM_REQUIRE_BIRTH_ACTOR", 0) != 0
         )
         self.max_horiz_to_down_ratio_vehicle = max(
             0.0,
@@ -336,6 +341,32 @@ class GlobalLitterTracker:
         self._bev_cached_homography = None
         self._bev_cache_count = 0
         self._bev_lock = threading.Lock()
+
+        # Online pseudo-homography calibration is collected continuously.  Its
+        # use by attribution is a separate opt-in: only a LOCKED, sufficiently
+        # confident state is frozen into an event task; otherwise that event
+        # explicitly falls back to the original image coordinate system.
+        self._dynamic_homography_config = CalibrationPhase1Config.from_env()
+        self._dynamic_homography_attribution_enabled = (
+            os.environ.get("SMART_BACKTRACK_DYNAMIC_HOMOGRAPHY", "0")
+            not in ("0", "")
+        )
+        self._dynamic_homography_attribution_min_confidence = min(
+            max(
+                _env_float(
+                    "SMART_BACKTRACK_HOMOGRAPHY_MIN_CONFIDENCE", 0.65
+                ),
+                0.0,
+            ),
+            1.0,
+        )
+        self._dynamic_homography_calibrator = DynamicHomographyCalibrator(
+            phase1_config=self._dynamic_homography_config
+        )
+        # Compatibility alias for diagnostics/tests that inspect the collector.
+        self._dynamic_homography_collector = (
+            self._dynamic_homography_calibrator.collector
+        )
 
         # === Backward worker thread ===
         self._actor_history_lock = threading.Lock()
@@ -511,7 +542,12 @@ class GlobalLitterTracker:
 
         self._record_raw_litter_frame(raw_detected_litters, frame_index)
 
-        self._record_actor_frame(actors, frame_index, frame=frame)
+        self._record_actor_frame(
+            actors,
+            frame_index,
+            frame=frame,
+            dynamic_litters=raw_detected_litters,
+        )
         self._drain_backward_results(vehicle_history=vehicle_history)
 
         if person_vehicle_map:
@@ -676,9 +712,9 @@ class GlobalLitterTracker:
                     # - 軌跡符合物理特性且有向下位移
                     # - 或 有明顯位移 + 向下位移 + 具 thrower 關聯
 
-                    # 車輛/機車 thrower 的加嚴確認條件：
-                    # 分析顯示 FP 案例幾乎都是 vehicle thrower + age=2；
-                    # 加嚴 min_age 與向下位移門檻，排除車輛部件或快速車輛造成的假陽性。
+                    # 車輛/機車 thrower 使用 8/27 人工複核 recovery profile。
+                    # Production 仍要求 actor、位移、軌跡/運動與非靜止證據；
+                    # age=2 與較低位移門檻用來救回小物件的短而稀疏軌跡。
                     is_vehicle_thrower = (
                         thrower_key is not None and
                         thrower_key[0] in ('vehicle', 'scooter')
@@ -714,10 +750,10 @@ class GlobalLitterTracker:
                     is_downward_enough_effective = (
                         is_downward_enough_effective or has_arc_descent
                     )
-                    # Attribution can rank several actors later, but event
-                    # confirmation itself needs release-time causal support.
-                    # A passer-by acquired only after birth must not turn noise
-                    # into a confirmed litter event.
+                    # Attribution can rank several actors later. Production's
+                    # recovery profile permits actor support acquired after the
+                    # first litter observation, but still requires a thrower
+                    # association before confirming the event.
                     release_actor_supported = (
                         thrower_key is not None and
                         (
@@ -779,9 +815,39 @@ class GlobalLitterTracker:
                         ):
                             vehicle_relative_ok = False
 
+                    # A short vehicle-associated trajectory needs either
+                    # size-aware absolute displacement or direct evidence that
+                    # it started near and ended clear of the same actor.  This
+                    # separates true small/short releases (for example case 17)
+                    # from vehicle-edge reveal jitter and tiny in-box noise.
+                    vehicle_release_origin_ok = False
+                    if is_vehicle_thrower and thrower_key is not None:
+                        for _actor in actors:
+                            if self._actor_key(_actor) == thrower_key:
+                                vehicle_release_origin_ok = self._release_origin_near_actor(
+                                    l_data['history'], _actor,
+                                )
+                                break
+                    vehicle_strong_descent_ok = (
+                        downward_disp >= FAST_DROP_MIN_DOWNWARD
+                    )
+
                     can_confirm_by_trajectory = (
                         age >= effective_min_age and
                         is_physics_valid and
+                        # Two/three-point vehicle-edge jitter can look like a
+                        # perfectly straight trajectory. Vehicle routes must
+                        # additionally show size-aware displacement, direct
+                        # release-origin separation, or >=35 px strong descent.
+                        # The dedicated fast-drop path below remains stricter:
+                        # it requires both strong descent and release-origin
+                        # evidence plus consecutive-observation constraints.
+                        (
+                            not is_vehicle_thrower or
+                            is_moved_enough or
+                            vehicle_release_origin_ok or
+                            vehicle_strong_descent_ok
+                        ) and
                         is_downward_enough_effective and
                         is_horizontal_enough and
                         is_horiz_ratio_ok and
@@ -836,14 +902,7 @@ class GlobalLitterTracker:
                     _fast_history_frames = l_data.get('history_frames', [])
                     _fast_prev_fi = int(_fast_history_frames[-1]) if _fast_history_frames else frame_index
                     fast_drop_frame_gap = int(frame_index) - _fast_prev_fi
-                    fast_drop_release_ok = False
-                    if is_vehicle_thrower and thrower_key is not None:
-                        for _actor in actors:
-                            if self._actor_key(_actor) == thrower_key:
-                                fast_drop_release_ok = self._release_origin_near_actor(
-                                    l_data['history'], _actor,
-                                )
-                                break
+                    fast_drop_release_ok = vehicle_release_origin_ok
                     fast_drop_horiz_ratio_ok = (
                         downward_disp > 0 and
                         (horizontal_disp / downward_disp) >= 0.15
@@ -1331,14 +1390,17 @@ class GlobalLitterTracker:
             'bindings': bindings,
         }
 
-    def _record_actor_frame(self, actors, frame_index, frame=None):
+    def _record_actor_frame(
+        self, actors, frame_index, frame=None, dynamic_litters=None
+    ):
         # 每幀保留 actor 快照。confirmed 延遲出現時，backward worker 可回看出生幀附近。
+        actors = list(actors or [])
         actor_snapshots = []
         frame_h = frame.shape[0] if frame is not None else 0
         frame_w = frame.shape[1] if frame is not None else 0
         bev_bottoms = []   # 本幀車輛/機車底邊中心 + 高度，供 BEV 穩定平面累積。
 
-        for actor in actors or []:
+        for actor in actors:
             try:
                 cls_name = str(actor.get('cls', '')).lower()
                 if cls_name not in ('person', 'vehicle', 'scooter'):
@@ -1363,6 +1425,24 @@ class GlobalLitterTracker:
                 'frame_index': int(frame_index),
                 'frame_size': (int(frame_w), int(frame_h)),
             }
+
+            if (
+                self._dynamic_homography_config.enabled
+                and cls_name in ('vehicle', 'scooter')
+            ):
+                self._dynamic_homography_calibrator.add_vehicle_observation(
+                    track_id=track_id,
+                    timestamp=float(frame_index) / max(self.fps, 1e-9),
+                    frame_id=frame_index,
+                    mask=actor.get('mask_poly'),
+                    confidence=snapshot['confidence'],
+                    bbox=box,
+                    image_shape=(frame_h, frame_w),
+                    class_name=cls_name,
+                    observed=snapshot['observed'],
+                    occluded=bool(actor.get('occluded', False)),
+                    tracking_stable=bool(actor.get('tracking_stable', True)),
+                )
 
             # Track ID 可能被外部 tracker 回收。長時間中斷後重現時增加 epoch，
             # 成本層可用 tracklet_uid 區分物理上不同的軌跡。
@@ -1393,6 +1473,31 @@ class GlobalLitterTracker:
                 bev_bottoms.append((((bx1 + bx2) / 2.0, by2), max(by2 - by1, 1.0)))
 
             actor_snapshots.append(snapshot)
+
+        if (
+            self._dynamic_homography_config.enabled
+            and self._dynamic_homography_calibrator.stabilizer_config.enabled
+            and frame is not None
+        ):
+            dynamic_regions = [
+                actor.get("mask_poly", actor.get("box"))
+                for actor in actors
+            ]
+            dynamic_regions.extend(
+                tuple(litter[:4]) for litter in (dynamic_litters or [])
+                if litter is not None and len(litter) >= 4
+            )
+            exclusion_mask = build_dynamic_exclusion_mask(
+                (frame_h, frame_w), dynamic_regions
+            )
+            self._dynamic_homography_calibrator.stabilize_frame(
+                frame, exclusion_mask=exclusion_mask
+            )
+
+        if self._dynamic_homography_config.enabled:
+            self._dynamic_homography_calibrator.update(
+                float(frame_index) / max(self.fps, 1e-9)
+            )
 
         with self._actor_history_lock:
             self.actor_frame_history.append({
@@ -1429,6 +1534,60 @@ class GlobalLitterTracker:
                 for bottom, height in bev_bottoms:
                     self._bev_bottoms.append(bottom)
                     self._bev_heights.append(height)
+
+    def get_homography_calibration_summary(self):
+        """Return calibration state; this is not attribution accuracy."""
+
+        summary = self._dynamic_homography_calibrator.summary()
+        summary["attribution"] = {
+            "requested": bool(self._dynamic_homography_attribution_enabled),
+            "minimum_confidence": float(
+                self._dynamic_homography_attribution_min_confidence
+            ),
+            "event_snapshot_required": True,
+            "fallback_coordinate_system": "image_pixels",
+        }
+        return summary
+
+    def _event_homography_snapshot(self, confirm_frame):
+        """Freeze one auditable transform or return an explicit fallback."""
+
+        base = {
+            "requested": bool(self._dynamic_homography_attribution_enabled),
+            "attribution_eligible": False,
+        }
+        if not self._dynamic_homography_attribution_enabled:
+            return {**base, "fallback_reason": "feature_disabled"}
+        if not self._dynamic_homography_config.enabled:
+            return {**base, "fallback_reason": "calibration_disabled"}
+
+        state = self._dynamic_homography_calibrator.get_state()
+        status = str(state.get("status", "UNCALIBRATED"))
+        confidence = float(state.get("confidence", 0.0) or 0.0)
+        base.update({
+            "status": status,
+            "confidence": confidence,
+            "homography_version": int(state.get("homography_version", 0)),
+        })
+        if self._dynamic_homography_calibrator.get_homography() is None:
+            return {**base, "fallback_reason": "homography_uninitialized"}
+        if status != "LOCKED":
+            return {**base, "fallback_reason": "calibration_not_locked"}
+        if confidence < self._dynamic_homography_attribution_min_confidence:
+            return {**base, "fallback_reason": "confidence_below_threshold"}
+
+        try:
+            snapshot = self._dynamic_homography_calibrator.capture_event_snapshot(
+                float(confirm_frame) / max(self.fps, 1e-9)
+            ).as_dict()
+        except (RuntimeError, ValueError, np.linalg.LinAlgError):
+            return {**base, "fallback_reason": "snapshot_failed"}
+        snapshot.update({
+            "requested": True,
+            "attribution_eligible": True,
+            "fallback_reason": None,
+        })
+        return snapshot
 
     def _submit_backward_resolution(self, litter_id, litter_data, current_bbox,
                                     current_centroid, confirm_frame, prev_thrower_key=None):
@@ -1547,6 +1706,7 @@ class GlobalLitterTracker:
             'prev_thrower_key': prev_thrower_key,
             'actor_frames': actor_frames,
             'plate_actor_frames': plate_actor_frames,
+            'homography_snapshot': self._event_homography_snapshot(confirm_frame),
         }
 
         try:

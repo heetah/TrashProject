@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Join user-supplied actor IDs with a replay's attribution sidecars.
+"""Legacy join of user-supplied run-local IDs with attribution sidecars.
 
 This is a research/reporting utility.  It deliberately reports both clip-level
 and event-level rows: multiple confirmed tracks in one clip are not independent
 observations and must not be silently counted as extra samples.
+
+Numeric tracker IDs are not stable across inference runs.  Do not use this
+utility for a different run than the one from which ``VEHICLE_GT`` was
+transcribed.  Use ``evaluate_reviewed_readiness.py`` for same-run box-to-track
+mapping and product-readiness decisions.
 """
 
 from __future__ import annotations
@@ -94,19 +99,33 @@ def _component_fields(record: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
 
 def _sidecar_events(sidecar_dir: Path) -> dict[int, list[dict[str, Any]]]:
     result: dict[int, list[dict[str, Any]]] = {}
-    for path in sorted(sidecar_dir.glob("litter_case_*_annotated_backtrack_candidates.jsonl")):
+    # Production batch runs isolate each clip in ``case_<id>/`` while older
+    # research replays wrote every sidecar directly under one directory.
+    # Support both layouts so reporting cannot silently turn a completed batch
+    # into zero detected events merely because its storage topology changed.
+    for path in sorted(sidecar_dir.rglob("litter_case_*_annotated_backtrack_candidates.jsonl")):
         cid = _case_id(path)
         records = _read_jsonl(path)
-        result[cid] = [record for record in records if record.get("record_type") == "candidate"]
+        result.setdefault(cid, []).extend(
+            record for record in records if record.get("record_type") == "candidate"
+        )
     return result
 
 
 def _confirmed_count(sidecar_dir: Path, cid: int) -> int:
-    path = sidecar_dir / f"litter_case_{cid}_annotated_analysis.json"
-    if not path.exists():
+    paths = sorted(sidecar_dir.rglob(f"litter_case_{cid}_annotated_analysis.json"))
+    if not paths:
         return 0
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return int((data.get("litter_detection") or {}).get("confirmed_event_count") or 0)
+    return sum(
+        int(
+            (
+                json.loads(path.read_text(encoding="utf-8")).get("litter_detection")
+                or {}
+            ).get("confirmed_event_count")
+            or 0
+        )
+        for path in paths
+    )
 
 
 def _event_row(cid: int, index: int, record: dict[str, Any], gt_event: dict[str, Any], unused: bool) -> dict[str, Any]:
@@ -263,6 +282,15 @@ def build_report(sidecar_dir: Path, ground_truth_path: Path, clip_path: Path) ->
     known_event_rows = [row for row in event_rows if row["route_match"] is not None]
     summary = {
         "schema": "actor-ground-truth-metrics/v1",
+        "validity": {
+            "status": "LEGACY_RUN_LOCAL_ID_COMPARISON",
+            "product_readiness_eligible": False,
+            "warning": (
+                "Numeric tracker IDs are run-local. This report is invalid for "
+                "cross-run accuracy unless the ID table came from this exact run."
+            ),
+            "replacement": "scripts/evaluate_reviewed_readiness.py",
+        },
         "sidecar_directory": str(sidecar_dir),
         "unused_cases": sorted(unused),
         "clip_count": len(clip_rows),
@@ -344,7 +372,20 @@ def main() -> None:
     parser.add_argument("--ground-truth", type=Path, default=Path("runs/grounding_truth/event_annotations.jsonl"))
     parser.add_argument("--clip-annotations", type=Path, default=Path("runs/grounding_truth/clip_annotations.jsonl"))
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--acknowledge-run-local-ids",
+        action="store_true",
+        help=(
+            "Required acknowledgement that VEHICLE_GT IDs came from the exact "
+            "same tracker run. This legacy output is never release-eligible."
+        ),
+    )
     args = parser.parse_args()
+    if not args.acknowledge_run_local_ids:
+        parser.error(
+            "numeric tracker IDs are run-local; use evaluate_reviewed_readiness.py "
+            "or pass --acknowledge-run-local-ids for an exact historical replay"
+        )
     event_rows, clip_rows, summary = build_report(args.sidecar_dir, args.ground_truth, args.clip_annotations)
     args.output.mkdir(parents=True, exist_ok=True)
     _write_csv(args.output / "actor_event_metrics.csv", event_rows)

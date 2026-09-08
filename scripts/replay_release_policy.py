@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Controlled vehicle-only replay of the release-time/BC cost proposal.
+"""Legacy controlled replay using one historical run's numeric tracker IDs.
 
 Replays frozen confirmed inputs. The historical +2 manual adjustment is
 reported separately; it is not new evidence of correctness for changed routes.
+The summary is not eligible for product-readiness claims because tracker IDs
+are run-local. Use evaluate_reviewed_readiness.py for same-run bbox mapping.
 """
 import argparse
 from dataclasses import asdict, replace
@@ -91,13 +93,21 @@ def main():
     configs = [baseline,
         replace(baseline,name='normalized_bc_d04', normalized_distance_gate_vehicle=.4,
                 normalize_bc_distance_time_by_gate=True),
+        replace(baseline,name='queued_observed_bbox',
+                preserve_observed_actor_boxes=True),
         replace(baseline,name='release_1s',max_release_back_seconds=1),
         replace(baseline,name='combined_d04_1s',normalized_distance_gate_vehicle=.4,
-                normalize_bc_distance_time_by_gate=True,max_release_back_seconds=1)]
+                normalize_bc_distance_time_by_gate=True,max_release_back_seconds=1),
+        replace(baseline,name='release_1s_queued_observed_bbox',
+                max_release_back_seconds=1,
+                preserve_observed_actor_boxes=True)]
     source_paths = [Path(__file__), Path('scripts/summarize_actor_ground_truth_metrics.py'),
                     Path('scripts/pipeline/config.py'),
                     *sorted(Path('scripts/pipeline/backtrack').glob('*.py'))]
     report = dict(schema='release-policy-replay/v1',
+        validity=dict(status='LEGACY_RUN_LOCAL_ID_COMPARISON',
+            product_readiness_eligible=False,
+            replacement='scripts/evaluate_reviewed_readiness.py'),
         git_commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
         source_sha256={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in source_paths},
         input_sha256=hashes, clips_sha256=hashlib.sha256(args.clips.read_bytes()).hexdigest(),

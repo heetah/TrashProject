@@ -72,28 +72,30 @@ def test_study_config_can_ablate_bc_direction_features_in_sequence():
 def test_study_config_exposes_research_distance_and_hybrid_time_gates():
     config = StudyConfig(
         stage="full",
-        normalized_distance_gate_vehicle=0.3,
+        normalized_distance_gate_vehicle=0.4,
         normalized_distance_gate_person=0.85,
         max_observation_gap_seconds=0.25,
         max_observation_gap_frames=3,
     ).resolver_config(fps=10)
 
-    assert config.normalized_distance_gate_vehicle == pytest.approx(0.3)
+    assert config.normalized_distance_gate_vehicle == pytest.approx(0.4)
     assert config.normalized_distance_gate_person == pytest.approx(0.85)
     assert config.max_observation_gap_seconds == pytest.approx(0.25)
     assert config.max_observation_gap_frames == 3
 
 
-def test_production_defaults_are_no_expansion_d03_and_hybrid_time_gate():
+def test_production_defaults_are_no_expansion_d04_and_hybrid_time_soft_penalty():
     config = SmartBacktrackConfig()
     study_config = StudyConfig().resolver_config(fps=30)
 
     for actual in (config, study_config):
-        assert actual.normalized_distance_gate_vehicle == pytest.approx(0.3)
+        assert actual.normalized_distance_gate_vehicle == pytest.approx(0.4)
         assert actual.max_observation_gap_seconds == pytest.approx(0.25)
         assert actual.max_observation_gap_frames == 3
         assert actual.vehicle_bbox_expand_x_ratio == pytest.approx(0.0)
         assert actual.vehicle_bbox_expand_y_ratio == pytest.approx(0.0)
+        assert actual.cost_config.observation_time_cost_mode == "soft"
+        assert actual.cost_config.observation_time_soft_kappa == pytest.approx(4.0)
 
 
 def test_study_can_replay_legacy_vehicle_gate():
@@ -198,7 +200,7 @@ def test_distance_time_stage_normalizes_by_gate_before_weighting():
     assert cell.total == pytest.approx(.465)
 
 
-def test_full_stage_keeps_historical_feature_units():
+def test_full_stage_uses_dimensionless_hybrid_time_soft_penalty():
     release = ReleaseHypothesis(
         10, np.asarray([181.0, 90.0]), np.eye(2), np.zeros(2), "test", 0.0
     )
@@ -207,7 +209,17 @@ def test_full_stage_keeps_historical_feature_units():
     cell = compute_c_ba([release], [person], 10)
 
     assert cell.raw_features["release_distance"] == pytest.approx(.425)
-    assert cell.raw_features["time"] == pytest.approx(.1)
+    assert cell.raw_features["time"] == pytest.approx(.4)
+
+
+def test_study_can_replay_legacy_hard_time_gate():
+    config = StudyConfig(
+        observation_time_cost_mode="hard",
+        observation_time_soft_kappa=0.0,
+    ).resolver_config(fps=30)
+
+    assert config.cost_config.observation_time_cost_mode == "hard"
+    assert config.cost_config.observation_time_soft_kappa == pytest.approx(0.0)
 
 
 def test_runtime_distance_time_weights_are_explicit(monkeypatch):
@@ -227,6 +239,16 @@ def test_runtime_distance_time_weights_are_explicit(monkeypatch):
         "endpoint_proximity": .75, "time": .25,
     }
     assert config.cost_config.normalize_distance_time_by_gate
+
+
+def test_runtime_time_soft_penalty_parameters_are_explicit(monkeypatch):
+    monkeypatch.setenv("SMART_BACKTRACK_TIME_COST_MODE", "soft")
+    monkeypatch.setenv("SMART_BACKTRACK_TIME_SOFT_KAPPA", "2.5")
+
+    config = SmartBacktrackConfig.from_env(fps=10)
+
+    assert config.cost_config.observation_time_cost_mode == "soft"
+    assert config.cost_config.observation_time_soft_kappa == pytest.approx(2.5)
 
 
 def test_runtime_boundary_depth_weight_applies_only_to_reverse_full(monkeypatch):
@@ -272,6 +294,20 @@ def test_kalman_rts_stage_keeps_only_distance_time_costs():
     }
 
 
+def test_research_mode_can_preserve_exact_queued_bbox_at_observed_frame():
+    task = _task()
+    raw_box = tuple(task["actor_frames"][2]["actors"][1]["box"])
+    config = StudyConfig(
+        preserve_observed_actor_boxes=True,
+    ).resolver_config(fps=10)
+    tracks = SmartBacktrackResolver(10, config)._build_actor_tracks(task)
+    exact = next(item for item in tracks[("vehicle", 2)] if item.frame_index == 10)
+
+    assert exact.observed
+    assert exact.source == "detector"
+    assert exact.bbox == raw_box
+
+
 def test_kalman_rts_stage_fills_missing_actor_frame_without_extra_costs():
     task = _task()
     task["actor_frames"] = [
@@ -311,3 +347,16 @@ def test_kalman_rts_stage_fills_missing_actor_frame_without_extra_costs():
 def test_kalman_rts_tuning_parameters_are_validated(field, value):
     with pytest.raises(ValueError, match=field):
         StudyConfig(stage="kalman_rts", **{field: value})
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("observation_time_cost_mode", "unknown"),
+        ("observation_time_soft_kappa", -1.0),
+        ("observation_time_soft_kappa", float("nan")),
+    ],
+)
+def test_observation_time_soft_penalty_parameters_are_validated(field, value):
+    with pytest.raises(ValueError, match=field):
+        StudyConfig(**{field: value})

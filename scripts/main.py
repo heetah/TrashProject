@@ -571,6 +571,15 @@ if __name__ == "__main__":
             }
             if smart_backtrack_summary is not None:
                 run_summary["smart_backtrack"] = smart_backtrack_summary
+            if (
+                litter_tracker is not None
+                and hasattr(litter_tracker, "get_homography_calibration_summary")
+            ):
+                homography_summary = (
+                    litter_tracker.get_homography_calibration_summary()
+                )
+                if homography_summary.get("enabled"):
+                    run_summary["homography_calibration"] = homography_summary
             # Legacy-only Offline P↔V Hungarian。Smart mode 會回 None，避免
             # 1-to-1 結果覆蓋 many-to-many Min-Cost Flow attribution。
             if litter_tracker is not None and hasattr(litter_tracker, "finalize_associations"):
@@ -668,28 +677,28 @@ if __name__ == "__main__":
                     # candidate trace so an A/B replay is reproducible from
                     # its output directory rather than from shell history.
                     "confirm_require_birth_actor": os.environ.get(
-                        "LITTER_CONFIRM_REQUIRE_BIRTH_ACTOR", "1"
+                        "LITTER_CONFIRM_REQUIRE_BIRTH_ACTOR", "0"
                     ) not in ("0", ""),
                     "min_confirm_age_vehicle": _safe_float_env(
-                        "LITTER_MIN_CONFIRM_AGE_VEHICLE", 3
+                        "LITTER_MIN_CONFIRM_AGE_VEHICLE", 2
                     ),
                     "min_confirm_downward_vehicle": _safe_float_env(
-                        "LITTER_MIN_CONFIRM_DOWNWARD_VEHICLE", 12
+                        "LITTER_MIN_CONFIRM_DOWNWARD_VEHICLE", 7
                     ),
                     "min_confirm_horizontal_displacement": _safe_float_env(
-                        "LITTER_MIN_CONFIRM_HORIZONTAL_DISPLACEMENT", 5
+                        "LITTER_MIN_CONFIRM_HORIZONTAL_DISPLACEMENT", 1
                     ),
                     "max_horiz_to_down_ratio_vehicle": _safe_float_env(
-                        "LITTER_MAX_HORIZ_TO_DOWN_RATIO_VEHICLE", 3.5
+                        "LITTER_MAX_HORIZ_TO_DOWN_RATIO_VEHICLE", 10
                     ),
                     "min_vehicle_relative_separation": _safe_float_env(
-                        "LITTER_MIN_VEHICLE_RELATIVE_SEPARATION", 60
+                        "LITTER_MIN_VEHICLE_RELATIVE_SEPARATION", 0
                     ),
                     "fp_streak_ratio": _safe_float_env(
-                        "LITTER_FP_STREAK_RATIO", 5
+                        "LITTER_FP_STREAK_RATIO", 10
                     ),
                     "allow_shake_candidates": os.environ.get(
-                        "LITTER_ALLOW_SHAKE_CANDIDATES", "0"
+                        "LITTER_ALLOW_SHAKE_CANDIDATES", "1"
                     ) not in ("0", ""),
                 }
                 write_backtrack_jsonl(

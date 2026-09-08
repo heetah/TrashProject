@@ -53,7 +53,7 @@ def _get_only_litter(active):
 
 
 def test_horizontal_confirmation_threshold_can_be_overridden(monkeypatch):
-    """The replay knob is explicit and keeps the production default intact."""
+    """The production recovery default remains explicitly overridable."""
     from litterTracker import GlobalLitterTracker, MIN_CONFIRM_HORIZONTAL_DISPLACEMENT
 
     monkeypatch.setenv("LITTER_MIN_CONFIRM_HORIZONTAL_DISPLACEMENT", "1.25")
@@ -69,6 +69,48 @@ def test_horizontal_confirmation_threshold_can_be_overridden(monkeypatch):
         assert tracker.min_confirm_horizontal_displacement == MIN_CONFIRM_HORIZONTAL_DISPLACEMENT
     finally:
         tracker.close()
+
+
+def test_0827_confirmation_recovery_defaults(monkeypatch):
+    """Guard the manually reviewed recovery profile promoted to production."""
+    names = (
+        "LITTER_CONFIRM_REQUIRE_BIRTH_ACTOR",
+        "LITTER_MIN_CONFIRM_AGE_VEHICLE",
+        "LITTER_MIN_CONFIRM_DOWNWARD_VEHICLE",
+        "LITTER_MIN_CONFIRM_HORIZONTAL_DISPLACEMENT",
+        "LITTER_MAX_HORIZ_TO_DOWN_RATIO_VEHICLE",
+        "LITTER_MIN_VEHICLE_RELATIVE_SEPARATION",
+    )
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+
+    from litterTracker import GlobalLitterTracker
+
+    tracker = GlobalLitterTracker()
+    try:
+        assert tracker.require_birth_thrower_for_confirmation is False
+        assert tracker.min_confirm_age_vehicle == 2
+        assert tracker.min_confirm_downward_displacement_vehicle == pytest.approx(7.0)
+        assert tracker.min_confirm_horizontal_displacement == pytest.approx(1.0)
+        assert tracker.max_horiz_to_down_ratio_vehicle == pytest.approx(10.0)
+        assert tracker.min_vehicle_relative_separation == pytest.approx(0.0)
+    finally:
+        tracker.close()
+
+
+def test_0827_pretracker_recovery_defaults(monkeypatch):
+    """Guard the streak and camera-shake defaults in the same profile."""
+    monkeypatch.delenv("LITTER_FP_STREAK_RATIO", raising=False)
+    monkeypatch.delenv("LITTER_ALLOW_SHAKE_CANDIDATES", raising=False)
+
+    from pipeline.detect import _allow_shake_candidates
+    from pipeline.geometry import LITTER_FP_STREAK_RATIO
+
+    assert LITTER_FP_STREAK_RATIO == pytest.approx(10.0)
+    assert _allow_shake_candidates() is True
+
+    monkeypatch.setenv("LITTER_ALLOW_SHAKE_CANDIDATES", "0")
+    assert _allow_shake_candidates() is False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -147,6 +189,25 @@ class TestThrownLitterConfirm:
         assert active[l_id]['state'] == 'confirmed', (
             "24px span throw should confirm regardless of threshold fix."
         )
+
+    def test_three_point_strong_vehicle_descent_confirms_despite_large_bbox(self):
+        """Case-167 guard: physical descent is evidence despite size scaling."""
+        from litterTracker import GlobalLitterTracker
+
+        tracker = GlobalLitterTracker(fps=30)
+        vehicle = _vehicle_actor(
+            track_id=3, x1=1180, y1=500, x2=1390, y2=720
+        )
+        try:
+            points = [(1287, 659.5), (1291.5, 704), (1294.5, 740.5)]
+            active = {}
+            for frame_index, (cx, cy) in zip((139, 140, 141), points):
+                active, _ = tracker.update(
+                    [_lbox(cx, cy, half=20)], [vehicle], frame_index=frame_index
+                )
+            assert any(item['state'] == 'confirmed' for item in active.values())
+        finally:
+            tracker.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -850,7 +911,8 @@ class TestReleaseTimeActorCausality:
         finally:
             tracker.close()
 
-    def test_actorless_birth_rejects_horizontal_dominant_fast_drop(self):
+    def test_actorless_birth_allows_moderate_horizontal_drop_in_0827_profile(self):
+        """The 8/27 profile permits ratio 85/60, below its extreme-streak gate."""
         from litterTracker import GlobalLitterTracker
         tracker = GlobalLitterTracker(fps=10)
         vehicle = _vehicle_actor(
@@ -861,7 +923,7 @@ class TestReleaseTimeActorCausality:
             active, _ = tracker.update(
                 [_lbox(605, 360)], [vehicle], frame_index=1
             )
-            assert all(item['state'] != 'confirmed' for item in active.values())
+            assert any(item['state'] == 'confirmed' for item in active.values())
         finally:
             tracker.close()
 

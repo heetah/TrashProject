@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, fields, replace
 import hashlib
 import json
+import math
 from pathlib import Path
 import random
 import subprocess
@@ -64,12 +65,14 @@ class StudyConfig:
     max_release_back_seconds: Optional[float] = None
     release_soft_seconds: float = 0.25
     release_time_weight: float = 1.0
-    # Physical gates default to production; explicit values reproduce legacy
-    # or sensitivity trials without changing process-wide environment state.
+    # Observation-time scales default to production soft-penalty bend points;
+    # ``hard`` reproduces the former AND gate for controlled replay.
     max_observation_gap_seconds: float = 0.25
     max_observation_gap_frames: Optional[int] = 3
+    observation_time_cost_mode: str = "soft"
+    observation_time_soft_kappa: float = 4.0
     normalized_distance_gate_person: float = 0.85
-    normalized_distance_gate_vehicle: float = 0.3
+    normalized_distance_gate_vehicle: float = 0.4
     vehicle_bbox_expand_x_ratio: float = 0.0
     vehicle_bbox_expand_y_ratio: float = 0.0
     normalize_bc_distance_time_by_gate: bool = False
@@ -78,6 +81,7 @@ class StudyConfig:
     kalman_process_noise_scale: float = 1.0
     kalman_measurement_noise_scale: float = 1.0
     kalman_max_extrapolation_seconds: Optional[float] = None
+    preserve_observed_actor_boxes: bool = False
     confidence_weighted_trajectory: Optional[bool] = None
     ac_overlap_weight: Optional[float] = None
     bc_exit_deficit_weight: float = 0.0
@@ -111,6 +115,13 @@ class StudyConfig:
             raise ValueError("max_observation_gap_seconds must be non-negative")
         if self.max_observation_gap_frames is not None and self.max_observation_gap_frames < 0:
             raise ValueError("max_observation_gap_frames must be non-negative")
+        if self.observation_time_cost_mode not in {"hard", "soft"}:
+            raise ValueError("observation_time_cost_mode must be hard or soft")
+        if (
+            not math.isfinite(float(self.observation_time_soft_kappa))
+            or self.observation_time_soft_kappa < 0.0
+        ):
+            raise ValueError("observation_time_soft_kappa must be non-negative")
         if self.normalized_distance_gate_person <= 0.0:
             raise ValueError("normalized_distance_gate_person must be positive")
         if self.normalized_distance_gate_vehicle <= 0.0:
@@ -159,6 +170,13 @@ class StudyConfig:
             self.stage,
             distance_weight=float(self.distance_weight),
             time_weight=float(self.time_weight),
+        )
+        cost_config = replace(
+            cost_config,
+            observation_time_cost_mode=str(self.observation_time_cost_mode),
+            observation_time_soft_kappa=float(
+                self.observation_time_soft_kappa
+            ),
         )
         if self.normalize_bc_distance_time_by_gate:
             cost_config = replace(
@@ -262,6 +280,9 @@ class StudyConfig:
             kalman_max_extrapolation_seconds=(
                 float(self.kalman_max_extrapolation_seconds)
                 if self.kalman_max_extrapolation_seconds is not None else None
+            ),
+            preserve_observed_actor_boxes=bool(
+                self.preserve_observed_actor_boxes
             ),
             use_reverse_trajectory=use_reverse_trajectory,
             confidence_weighted_trajectory=(
