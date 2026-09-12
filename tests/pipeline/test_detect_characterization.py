@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"
 
 from pipeline.detect import (
     _deduplicate_litter_candidates,
+    _stage_filter_litter_candidates,
     _stage_render_actors,
     _stage_render_rtdetr_debug,
     detect,
@@ -252,3 +253,83 @@ def test_containment_threshold_override_preserves_default(monkeypatch):
     # motion/holding/tracker confirmation remains mandatory either way.
     monkeypatch.setenv("LITTER_FP_CONTAINMENT_THR", "0.85")
     assert litter_candidate_is_vehicle_fp(near_contained_litter, near_contained_actor)[0] is True
+
+
+def test_contained_candidate_is_submitted_only_as_quarantine(monkeypatch):
+    """The detect-stage gate preserves evidence without ordinary release."""
+    monkeypatch.setattr("pipeline.detect.motion_evidence", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        "pipeline.detect.litter_candidate_is_vehicle_fp",
+        lambda *_a, **_k: (True, "vehicle_contained"),
+    )
+
+    litter = [10, 10, 30, 30, 0.9]
+    record = {
+        "_box_object_id": id(litter),
+        "bbox": [10, 10, 30, 30],
+        "filter_outcome": None,
+        "filter_reason": None,
+        "tracker_outcome": "not_evaluated",
+    }
+    tracker = type(
+        "TrackerStub",
+        (),
+        {"active_litters": {}, "distance_threshold": 250, "_debug": False},
+    )()
+    stats = {}
+
+    accepted, quarantined = _stage_filter_litter_candidates(
+        [litter], False, 0.0, 10.0,
+        np.ones((40, 40), dtype=np.uint8), 1.0, 0.1, 0.1,
+        1, 0.1, tracker,
+        [{"cls": "vehicle", "track_id": 3, "box": [0, 0, 40, 40]}],
+        _fresh_vehicle_history(), 0, stats, None,
+        candidate_records=[record],
+    )
+
+    assert accepted == [litter]
+    assert quarantined == [litter]
+    assert record["filter_outcome"] == "passed"
+    assert record["filter_reason"] == "vehicle_contained_quarantine"
+    assert stats["quarantined_litter_candidates"] == 1
+
+
+def test_quarantine_history_cannot_reject_ordinary_candidate(monkeypatch):
+    """Tentative containment history is isolated from ordinary prefilters."""
+    observed_histories = []
+    monkeypatch.setattr("pipeline.detect.motion_evidence", lambda *_a, **_k: True)
+
+    def _capture_filter(*_args, **kwargs):
+        observed_histories.append(kwargs.get("prev_litter_history"))
+        return False, None
+
+    monkeypatch.setattr(
+        "pipeline.detect.litter_candidate_is_vehicle_fp", _capture_filter,
+    )
+    litter = [40, 40, 60, 60, 0.9]
+    tracker = type(
+        "TrackerStub",
+        (),
+        {
+            "active_litters": {
+                7: {
+                    "bbox": [42, 42, 62, 62, 0.8],
+                    "history": [(52, 52), (54, 54)],
+                    "missed": 0,
+                    "vehicle_quarantine_active": True,
+                }
+            },
+            "distance_threshold": 250,
+            "_debug": False,
+        },
+    )()
+
+    accepted, quarantined = _stage_filter_litter_candidates(
+        [litter], False, 0.0, 10.0,
+        np.ones((80, 80), dtype=np.uint8), 1.0, 0.1, 0.1,
+        1, 0.1, tracker, [], _fresh_vehicle_history(), 3, {}, None,
+    )
+
+    assert observed_histories == [None]
+    assert accepted == [litter]
+    assert quarantined == []

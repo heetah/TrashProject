@@ -729,6 +729,192 @@ class TestVehiclePartAndStreakFP:
             tracker.close()
 
 
+class TestVehicleContainmentQuarantine:
+
+    def test_same_carrier_comotion_remains_pending(self):
+        """A vehicle part can accumulate history but can never self-confirm."""
+        from litterTracker import GlobalLitterTracker
+
+        tracker = GlobalLitterTracker(fps=10)
+        try:
+            for frame_index in range(5):
+                offset = 12 * frame_index
+                vehicle = _vehicle_actor(
+                    track_id=5,
+                    x1=400 + offset,
+                    y1=200,
+                    x2=600 + offset,
+                    y2=420,
+                )
+                litter = _lbox(500 + offset, 300, half=6)
+                active, _ = tracker.update(
+                    [litter],
+                    [vehicle],
+                    frame_index=frame_index,
+                    quarantined_litters=[litter],
+                )
+                _, data = _get_only_litter(active)
+                assert data['state'] == 'pending'
+                assert data['vehicle_quarantine_active'] is True
+                assert data.get('vehicle_quarantine_released') is False
+        finally:
+            tracker.close()
+
+    def test_three_point_relative_descent_releases_then_confirms(self):
+        """A sustained in-box drop is released to the normal confirmation gates."""
+        from litterTracker import GlobalLitterTracker
+
+        tracker = GlobalLitterTracker(fps=10)
+        vehicle = _vehicle_actor(
+            track_id=5, x1=400, y1=180, x2=620, y2=460,
+        )
+        try:
+            released_data = None
+            for frame_index, (cx, cy) in enumerate(
+                ((500, 250), (504, 280), (509, 320))
+            ):
+                litter = _lbox(cx, cy, half=6)
+                active, _ = tracker.update(
+                    [litter],
+                    [vehicle],
+                    frame_index=frame_index,
+                    quarantined_litters=[litter],
+                )
+                _, released_data = _get_only_litter(active)
+            assert released_data is not None
+            assert released_data['vehicle_quarantine_active'] is False
+            assert released_data['vehicle_quarantine_released'] is True
+            assert released_data['vehicle_quarantine_release_frame'] == 2
+            # Quarantine release is not confirmation. A subsequent ordinary
+            # observation must still satisfy actor and trajectory gates.
+            assert released_data['state'] == 'pending'
+
+            released_litter = _lbox(515, 480, half=6)
+            active, _ = tracker.update(
+                [released_litter],
+                [vehicle],
+                frame_index=3,
+            )
+            _, final_data = _get_only_litter(active)
+            assert final_data['state'] == 'confirmed'
+        finally:
+            tracker.close()
+
+    def test_two_observations_cannot_release_even_after_large_jump(self):
+        """One detector jump is insufficient physical evidence for release."""
+        from litterTracker import GlobalLitterTracker
+
+        tracker = GlobalLitterTracker(fps=10)
+        vehicle = _vehicle_actor(
+            track_id=5, x1=300, y1=100, x2=700, y2=600,
+        )
+        try:
+            final_data = None
+            for frame_index, (cx, cy) in enumerate(((450, 180), (500, 420))):
+                litter = _lbox(cx, cy, half=6)
+                active, _ = tracker.update(
+                    [litter],
+                    [vehicle],
+                    frame_index=frame_index,
+                    quarantined_litters=[litter],
+                )
+                _, final_data = _get_only_litter(active)
+            assert final_data is not None
+            assert final_data['state'] == 'pending'
+            assert final_data['vehicle_quarantine_active'] is True
+        finally:
+            tracker.close()
+
+    def test_late_box_restarts_quarantine_evidence_segment(self):
+        """A long detector gap cannot join a vehicle part to another box."""
+        from litterTracker import GlobalLitterTracker
+
+        tracker = GlobalLitterTracker(fps=10)
+        vehicle = _vehicle_actor(
+            track_id=5, x1=300, y1=100, x2=700, y2=600,
+        )
+        try:
+            for frame_index, (cx, cy) in (
+                (0, (450, 180)),
+                (1, (455, 190)),
+                (6, (500, 420)),
+            ):
+                litter = _lbox(cx, cy, half=6)
+                active, _ = tracker.update(
+                    [litter],
+                    [vehicle],
+                    frame_index=frame_index,
+                    quarantined_litters=[litter],
+                )
+            _, data = _get_only_litter(active)
+            assert data['state'] == 'pending'
+            assert data['vehicle_quarantine_active'] is True
+            assert data['vehicle_quarantine_frames'] == [6]
+        finally:
+            tracker.close()
+
+    def test_ordinary_exit_starts_independent_pending_track(self):
+        """Contained evidence cannot seed an ordinary confirmation history."""
+        from litterTracker import GlobalLitterTracker
+
+        tracker = GlobalLitterTracker(fps=10)
+        vehicle = _vehicle_actor(
+            track_id=5, x1=300, y1=100, x2=700, y2=600,
+        )
+        try:
+            contained = _lbox(500, 560, half=6)
+            active, _ = tracker.update(
+                [contained], [vehicle], frame_index=0,
+                quarantined_litters=[contained],
+            )
+            quarantined_id, quarantined = _get_only_litter(active)
+            assert quarantined['vehicle_quarantine_active'] is True
+
+            ordinary = _lbox(520, 610, half=6)
+            active, _ = tracker.update(
+                [ordinary], [vehicle], frame_index=1,
+            )
+
+            ordinary_ids = set(active) - {quarantined_id}
+            assert len(ordinary_ids) == 1
+            ordinary_data = active[ordinary_ids.pop()]
+            assert ordinary_data['state'] == 'pending'
+            assert ordinary_data['age'] == 1
+            assert ordinary_data['history'] == [(520.0, 610.0)]
+            assert ordinary_data.get('vehicle_quarantine_active', False) is False
+        finally:
+            tracker.close()
+
+    def test_contained_observation_cannot_quarantine_ordinary_track(self):
+        """A containment-classification jitter starts a separate track."""
+        from litterTracker import GlobalLitterTracker
+
+        tracker = GlobalLitterTracker(fps=10)
+        vehicle = _vehicle_actor(
+            track_id=5, x1=300, y1=100, x2=700, y2=600,
+        )
+        try:
+            ordinary = _lbox(500, 610, half=6)
+            active, _ = tracker.update(
+                [ordinary], [vehicle], frame_index=0,
+            )
+            ordinary_id, ordinary_data = _get_only_litter(active)
+            assert ordinary_data.get('vehicle_quarantine_active', False) is False
+
+            contained = _lbox(500, 590, half=6)
+            active, _ = tracker.update(
+                [contained], [vehicle], frame_index=1,
+                quarantined_litters=[contained],
+            )
+
+            contained_ids = set(active) - {ordinary_id}
+            assert len(contained_ids) == 1
+            assert active[contained_ids.pop()]['vehicle_quarantine_active'] is True
+            assert active[ordinary_id].get('vehicle_quarantine_active', False) is False
+        finally:
+            tracker.close()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tests: detect-stage litter candidate FP filter (Phase 2 relocated)
 #

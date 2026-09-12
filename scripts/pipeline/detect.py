@@ -648,6 +648,7 @@ def _stage_filter_litter_candidates(current_frame_litters, shake_active, shake_m
                                     frame_index, stats, profiler, candidate_records=None):
     # motion + holding 前處理:只有真的在動、且不像仍被人車持有的 litter 才進 tracker。
     filtered_frame_litters = []
+    quarantined_frame_litters = []
     record_by_object_id = {
         record.get('_box_object_id'): record
         for record in (candidate_records or [])
@@ -724,6 +725,12 @@ def _stage_filter_litter_candidates(current_frame_litters, shake_active, shake_m
             min_prev_dist = float('inf')
             curr_center = ((lx1 + lx2) / 2.0, (ly1 + ly2) / 2.0)
             for l_data in litter_tracker.active_litters.values():
+                if l_data.get('vehicle_quarantine_active', False):
+                    # Quarantine evidence is intentionally not trusted as a
+                    # normal litter trajectory yet. Let the tracker associate
+                    # it, but do not let its tentative history trigger streak
+                    # or holding rejection on a later ordinary candidate.
+                    continue
                 prev_box = l_data['bbox']
                 prev_center = (
                     (float(prev_box[0]) + float(prev_box[2])) / 2.0,
@@ -741,6 +748,23 @@ def _stage_filter_litter_candidates(current_frame_litters, shake_active, shake_m
                 prev_litter_history=prev_litter_history,
             )
             if is_fp_candidate:
+                if fp_reason == 'vehicle_contained':
+                    # A detector box can remain inside the carrier vehicle for
+                    # the first few observations of a real release.  Preserve
+                    # it as tracker-only quarantine evidence; the tracker must
+                    # prove sustained litter-vs-carrier separation before the
+                    # track can participate in event confirmation.
+                    filtered_frame_litters.append(litter_box)
+                    quarantined_frame_litters.append(litter_box)
+                    if record is not None:
+                        record['filter_outcome'] = 'passed'
+                        record['filter_reason'] = 'vehicle_contained_quarantine'
+                    if getattr(litter_tracker, '_debug', False):
+                        print(
+                            f"  [FP_QUARANTINE fi={frame_index} "
+                            f"cx={curr_center[0]:.0f},{curr_center[1]:.0f}]"
+                        )
+                    continue
                 if record is not None:
                     record['filter_outcome'] = 'rejected'
                     record['filter_reason'] = str(fp_reason or 'vehicle_fp')
@@ -785,19 +809,25 @@ def _stage_filter_litter_candidates(current_frame_litters, shake_active, shake_m
                 record['filter_reason'] = 'released_motion'
     if stats is not None:
         stats['filtered_litter_candidates'] = stats.get('filtered_litter_candidates', 0) + len(filtered_frame_litters)
+        if quarantined_frame_litters:
+            stats['quarantined_litter_candidates'] = (
+                stats.get('quarantined_litter_candidates', 0)
+                + len(quarantined_frame_litters)
+            )
         _record_litter_candidate_frame(
             stats,
             'filtered_litter_candidate_frames',
             frame_index,
             len(filtered_frame_litters),
         )
-    return filtered_frame_litters
+    return filtered_frame_litters, quarantined_frame_litters
 
 
 def _stage_update_litter_tracker(litter_tracker, filtered_frame_litters, raw_frame_litters,
                                  tracking_objects,
                                  person_vehicle_map, frame_index, frame, vehicle_history,
-                                 stats, profiler, candidate_records=None):
+                                 stats, profiler, candidate_records=None,
+                                 quarantined_frame_litters=None):
     # 更新 GlobalLitterTracker,將 pending litter 依軌跡轉成 confirmed。
     # 回傳 (tracked_litters, active_violators)。
     with profile_block(profiler, "detect.litter_tracker_update"):
@@ -806,6 +836,7 @@ def _stage_update_litter_tracker(litter_tracker, filtered_frame_litters, raw_fra
             person_vehicle_map=person_vehicle_map, frame_index=frame_index,
             frame=frame, vehicle_history=vehicle_history,
             raw_detected_litters=raw_frame_litters,
+            quarantined_litters=quarantined_frame_litters,
         )
     if stats is not None:
         confirmed_ids = [
@@ -1095,7 +1126,7 @@ def detect(frame, model_bbox, model_trash,
         prepared_litter_input=prepared_litter_input,
     )
 
-    filtered_frame_litters = _stage_filter_litter_candidates(
+    filtered_frame_litters, quarantined_frame_litters = _stage_filter_litter_candidates(
         current_frame_litters, shake_active, shake_mag, shake_threshold,
         fg_mask, fg_mask_scale, moving_threshold, core_moving_threshold,
         motion_min_component_area, motion_min_largest_component_ratio,
@@ -1108,6 +1139,7 @@ def detect(frame, model_bbox, model_trash,
         tracking_objects,
         person_vehicle_map, frame_index, frame, vehicle_history, stats, profiler,
         candidate_records=candidate_records,
+        quarantined_frame_litters=quarantined_frame_litters,
     )
 
     active_violators = _stage_register_action_violators(

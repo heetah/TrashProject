@@ -694,6 +694,28 @@ if __name__ == "__main__":
                     "min_vehicle_relative_separation": _safe_float_env(
                         "LITTER_MIN_VEHICLE_RELATIVE_SEPARATION", 0
                     ),
+                    "vehicle_quarantine_min_observations": int(
+                        _safe_float_env(
+                            "LITTER_VEHICLE_QUARANTINE_MIN_OBSERVATIONS", 3
+                        )
+                    ),
+                    "vehicle_quarantine_min_relative_displacement": _safe_float_env(
+                        "LITTER_VEHICLE_QUARANTINE_MIN_RELATIVE_DISPLACEMENT", 25
+                    ),
+                    "vehicle_quarantine_min_relative_downward": _safe_float_env(
+                        "LITTER_VEHICLE_QUARANTINE_MIN_RELATIVE_DOWNWARD", 15
+                    ),
+                    "vehicle_quarantine_min_scale_ratio": _safe_float_env(
+                        "LITTER_VEHICLE_QUARANTINE_MIN_SCALE_RATIO", 1
+                    ),
+                    "vehicle_quarantine_min_downward_steps": int(
+                        _safe_float_env(
+                            "LITTER_VEHICLE_QUARANTINE_MIN_DOWNWARD_STEPS", 2
+                        )
+                    ),
+                    "vehicle_quarantine_max_gap_sec": _safe_float_env(
+                        "LITTER_VEHICLE_QUARANTINE_MAX_GAP_SEC", 0.35
+                    ),
                     "fp_streak_ratio": _safe_float_env(
                         "LITTER_FP_STREAK_RATIO", 10
                     ),

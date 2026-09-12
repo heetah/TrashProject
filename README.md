@@ -65,6 +65,7 @@ trashProject/
       │     -> sustained temporal confirmation
       ├── RT-DETR 4-channel litter candidate
       │     -> geometry/motion/core-motion/holding filter
+      │     -> vehicle-contained quarantine / same-carrier release evidence
       │     -> GlobalLitterTracker pending/confirmed
       └── confirmed event
             -> Smart Backtrack person/vehicle/NULL
@@ -122,7 +123,9 @@ batch、batch repair 與 TensorRT smoke test 共用同一個 input builder。
 3. 中心區 core-motion evidence。
 4. Camera-shake evidence；8/27 recovery profile 允許候選繼續進入下游 gates。
 5. Actor polygon/relative-motion holding gate。
-6. `GlobalLitterTracker` trajectory、displacement、temporal confirmation。
+6. 幾乎完全位於 vehicle/scooter 內的候選進入 tracker-only quarantine，不可直接 confirmation。
+7. Quarantine 只能由同一載體座標系中連續下落軌跡解除；離開載體的普通候選改建獨立 pending 軌跡，禁止隔離歷史污染正常確認。
+8. `GlobalLitterTracker` trajectory、displacement、temporal confirmation。
 
 近車候選仍會先排除 vehicle-contained、共動與純水平條紋；唯一例外是剛由車框內明顯脫離的前三個 observation。當該軌跡起點確實在同一車框內、終點已脫離，會保留該車作為 thrower fallback；這不是最近車輛配對，仍須通過 vehicle-relative、物理與 temporal confirmation gate。
 
@@ -447,7 +450,13 @@ MP4 片段，並附一份列出違規、關聯車輛、車牌與審核資料的 
 | `SMART_BACKTRACK_RELEASE_WINDOW_WEIGHT` | `0.35` | 超出 B0/B1 零成本窗後，每一個 observation-gap 的軟性 prior 增量 |
 | `SMART_BACKTRACK_BC_BOUNDARY_DEPTH_WEIGHT` | `0.0` | `full/reverse` 中 release 點位於 vehicle bbox 深處的軟成本；`0` 關閉，須經 reviewed replay 後才啟用 |
 | `LITTER_DEBUG` | `0` | 設為 `1` 時輸出逐幀診斷；annotated video 顯示 actor track ID，並以洋紅框顯示 RT-DETR 通過 class/confidence、但尚未經 geometry/motion/holding/tracker 後處理的 litter bbox 與 confidence |
-| `LITTER_FP_CONTAINMENT_THR` | `0.999` | RT-DETR 候選與車輛 bbox 幾乎完全重疊時才在前處理淘汰；設 `0.85` 可重現舊版 baseline，後續仍須通過 motion/holding/tracker confirmation |
+| `LITTER_FP_CONTAINMENT_THR` | `0.999` | 車輛容納判定門檻；命中時不丟棄候選，而是進入無法直接 confirmation 的 tracker-only quarantine |
+| `LITTER_VEHICLE_QUARANTINE_MIN_OBSERVATIONS` | `3` | 同載體相對軌跡至少 observation 數，不足時保持 pending |
+| `LITTER_VEHICLE_QUARANTINE_MIN_RELATIVE_DISPLACEMENT` | `25` | 解除隔離所需的載體相對總位移下限（px），並取物件初始尺寸的較嚴格值 |
+| `LITTER_VEHICLE_QUARANTINE_MIN_RELATIVE_DOWNWARD` | `15` | 解除隔離所需的載體相對向下位移下限（px） |
+| `LITTER_VEHICLE_QUARANTINE_MIN_SCALE_RATIO` | `1` | 依初始 litter bbox 尺寸縮放的位移／下落證據下限 |
+| `LITTER_VEHICLE_QUARANTINE_MIN_DOWNWARD_STEPS` | `2` | 解除隔離前至少連續向下的 step 數 |
+| `LITTER_VEHICLE_QUARANTINE_MAX_GAP_SEC` | `0.35` | 隔離證據的最大 detector 中斷；超過後重置證據段，避免將無關 bbox 接成落下軌跡 |
 | `LITTER_CANDIDATE_SIDECAR` | `0` | 研究用逐 candidate JSONL，記錄 gate reason、tracker ID 與可重現設定；不供前端或 ground truth 使用 |
 | `LITTER_CANDIDATE_DEDUP` | `0` | 實驗性同幀 IoU 去重；目前 replay 未採用（未增加正確 confirmed 且 safety proxy 惡化） |
 | `LITTER_CANDIDATE_DEDUP_IOU` | `0.5` | 同幀 candidate 去重 IoU 門檻；僅在 `LITTER_CANDIDATE_DEDUP=1` 時生效 |

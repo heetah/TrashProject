@@ -73,6 +73,16 @@ MAX_VEHICLE_THROWER_STEP_PX = 200.0      # 真實單步 < 150px
 CARRIER_OVERLAP_MIN = 0.15              # litter 與某車輛重疊達此值才視為「在車上」，啟用分離檢查
 MIN_VEHICLE_RELATIVE_SEPARATION = 0.0   # 8/27 profile：關閉此 hard gate，仍保留診斷值
 
+# === 車框內候選隔離釋放 ===
+# 車框內 detector box 不是事件證據。至少三次同載體觀測，且 litter 相對車體呈現
+# 尺度化、持續向下的分離，才解除隔離；解除後仍需通過下方完整 confirmation gates。
+VEHICLE_QUARANTINE_MIN_OBSERVATIONS = 3
+VEHICLE_QUARANTINE_MIN_RELATIVE_DISPLACEMENT = 25.0
+VEHICLE_QUARANTINE_MIN_RELATIVE_DOWNWARD = 15.0
+VEHICLE_QUARANTINE_MIN_SCALE_RATIO = 1.0
+VEHICLE_QUARANTINE_MIN_DOWNWARD_STEPS = 2
+VEHICLE_QUARANTINE_MAX_OBSERVATION_GAP_SEC = 0.35
+
 # 註：隨車部件 / 純水平條紋 / 車輛共動 等 litter 候選 FP 篩選已集中到 detect 前處理
 # （smallFunction.litter_candidate_is_vehicle_fp）；tracker 只負責追蹤與軌跡確認，不再做這些判斷。
 
@@ -208,6 +218,54 @@ class GlobalLitterTracker:
                 "LITTER_MIN_VEHICLE_RELATIVE_SEPARATION",
                 MIN_VEHICLE_RELATIVE_SEPARATION,
             ),
+        )
+        self.vehicle_quarantine_min_observations = max(
+            3,
+            _env_int(
+                "LITTER_VEHICLE_QUARANTINE_MIN_OBSERVATIONS",
+                VEHICLE_QUARANTINE_MIN_OBSERVATIONS,
+            ),
+        )
+        self.vehicle_quarantine_min_relative_displacement = max(
+            0.0,
+            _env_float(
+                "LITTER_VEHICLE_QUARANTINE_MIN_RELATIVE_DISPLACEMENT",
+                VEHICLE_QUARANTINE_MIN_RELATIVE_DISPLACEMENT,
+            ),
+        )
+        self.vehicle_quarantine_min_relative_downward = max(
+            0.0,
+            _env_float(
+                "LITTER_VEHICLE_QUARANTINE_MIN_RELATIVE_DOWNWARD",
+                VEHICLE_QUARANTINE_MIN_RELATIVE_DOWNWARD,
+            ),
+        )
+        self.vehicle_quarantine_min_scale_ratio = max(
+            0.0,
+            _env_float(
+                "LITTER_VEHICLE_QUARANTINE_MIN_SCALE_RATIO",
+                VEHICLE_QUARANTINE_MIN_SCALE_RATIO,
+            ),
+        )
+        self.vehicle_quarantine_min_downward_steps = max(
+            2,
+            _env_int(
+                "LITTER_VEHICLE_QUARANTINE_MIN_DOWNWARD_STEPS",
+                VEHICLE_QUARANTINE_MIN_DOWNWARD_STEPS,
+            ),
+        )
+        self.vehicle_quarantine_max_observation_gap_frames = max(
+            1,
+            int(round(
+                self.fps
+                * max(
+                    0.0,
+                    _env_float(
+                        "LITTER_VEHICLE_QUARANTINE_MAX_GAP_SEC",
+                        VEHICLE_QUARANTINE_MAX_OBSERVATION_GAP_SEC,
+                    ),
+                )
+            )),
         )
 
         # --- 每幀像素速度上限：隨 fps 反向縮放 ---
@@ -532,7 +590,8 @@ class GlobalLitterTracker:
         )
 
     def update(self, detected_litters, actors, person_vehicle_map=None, frame_index=None,
-               frame=None, vehicle_history=None, raw_detected_litters=None):
+               frame=None, vehicle_history=None, raw_detected_litters=None,
+               quarantined_litters=None):
         # 主更新流程：接收本幀通過前處理的 litter，更新軌跡與違規者集合。
         if frame_index is None:
             frame_index = self._fallback_frame_index
@@ -575,9 +634,13 @@ class GlobalLitterTracker:
                 del self.violators[actor_key]
         
         new_active_litters = {}
+        quarantined_object_ids = {
+            id(litter_box) for litter_box in (quarantined_litters or [])
+        }
 
         # 第一段：把每個 detected litter 與既有 active litter 做距離/尺寸配對。
         for litter_box in detected_litters:
+            is_contained_observation = id(litter_box) in quarantined_object_ids
             lx1, ly1, lx2, ly2, _ = litter_box
             centroid = ((lx1 + lx2) / 2, (ly1 + ly2) / 2)
 
@@ -589,6 +652,21 @@ class GlobalLitterTracker:
 
             # 找到目前仍在追蹤的 litter 相關資料。
             for l_id, l_data in self.active_litters.items():
+                prev_state = l_data.get('state', 'pending')
+                if (
+                    prev_state == 'pending'
+                    and not l_data.get('vehicle_quarantine_released', False)
+                    and bool(l_data.get('vehicle_quarantine_active', False))
+                    != bool(is_contained_observation)
+                ):
+                    # Vehicle-contained observations are an evidence-only
+                    # stream until their same-carrier motion releases them.
+                    # Never let that tentative history seed an ordinary track,
+                    # or let a one-frame containment classification quarantine
+                    # an already ordinary candidate.  A candidate that exits
+                    # containment starts a clean pending trajectory and must
+                    # independently satisfy the normal confirmation gates.
+                    continue
                 prev_box = l_data['bbox']
                 prev_centroid = (
                     (prev_box[0] + prev_box[2]) / 2, 
@@ -600,7 +678,6 @@ class GlobalLitterTracker:
                 w_diff_ratio = abs(curr_w - ref_w) / max(ref_w, 1e-6)
                 h_diff_ratio = abs(curr_h - ref_h) / max(ref_h, 1e-6)
 
-                prev_state = l_data.get('state', 'pending')
                 shape_thr = (
                     CONFIRMED_SHAPE_CHANGE_RATIO
                     if prev_state == 'confirmed'
@@ -637,6 +714,14 @@ class GlobalLitterTracker:
                 age = l_data.get('age', 1) + 1
                 state = l_data.get('state', 'pending')
                 backward_submitted = bool(l_data.get('backward_submitted', False))
+                vehicle_quarantine_active = self._update_vehicle_quarantine(
+                    l_data,
+                    litter_box,
+                    centroid,
+                    actors,
+                    frame_index,
+                    is_contained_observation,
+                )
                 
                 # 繼承剛出生時記錄的肇事者，並在 pending 階段依 homography 座標重新評分。
                 thrower_key = l_data.get('thrower_key')
@@ -954,8 +1039,11 @@ class GlobalLitterTracker:
                         )
 
                     if (
-                        can_confirm_by_trajectory or can_confirm_by_motion or
-                        can_confirm_vehicle_fast_drop or can_confirm_fall_then_stable
+                        not vehicle_quarantine_active and
+                        (
+                            can_confirm_by_trajectory or can_confirm_by_motion or
+                            can_confirm_vehicle_fast_drop or can_confirm_fall_then_stable
+                        )
                     ):
                         state = 'confirmed' # 確認為垃圾！
                         if self._pv_assoc_enabled and best_id not in self._pv_litter_seen_ids:
@@ -1070,6 +1158,27 @@ class GlobalLitterTracker:
                     'backward_submitted': backward_submitted,
                     'backward_result': l_data.get('backward_result'),
                     'stationary_locked': bool(l_data.get('stationary_locked', False)),
+                    'vehicle_quarantine_active': bool(
+                        l_data.get('vehicle_quarantine_active', False)
+                    ),
+                    'vehicle_quarantine_carrier_key': l_data.get(
+                        'vehicle_quarantine_carrier_key'
+                    ),
+                    'vehicle_quarantine_relative_points': list(
+                        l_data.get('vehicle_quarantine_relative_points', [])
+                    ),
+                    'vehicle_quarantine_frames': list(
+                        l_data.get('vehicle_quarantine_frames', [])
+                    ),
+                    'vehicle_quarantine_released': bool(
+                        l_data.get('vehicle_quarantine_released', False)
+                    ),
+                    'vehicle_quarantine_release_frame': l_data.get(
+                        'vehicle_quarantine_release_frame'
+                    ),
+                    'vehicle_quarantine_evidence': l_data.get(
+                        'vehicle_quarantine_evidence'
+                    ),
                     'ref_shape': (
                         0.7 * float(l_data.get('ref_shape', l_data['init_shape'])[0]) + 0.3 * float(curr_w),
                         0.7 * float(l_data.get('ref_shape', l_data['init_shape'])[1]) + 0.3 * float(curr_h),
@@ -1096,7 +1205,7 @@ class GlobalLitterTracker:
                         break
 
                 litter_id = self.next_id
-                new_active_litters[litter_id] = {
+                new_litter_data = {
                     'bbox': litter_box,
                     'history': [centroid],
                     'missed': 0,
@@ -1117,6 +1226,15 @@ class GlobalLitterTracker:
                     'backward_result': None,
                     'stationary_locked': inherit_locked,
                 }
+                self._update_vehicle_quarantine(
+                    new_litter_data,
+                    litter_box,
+                    centroid,
+                    actors,
+                    frame_index,
+                    is_contained_observation,
+                )
+                new_active_litters[litter_id] = new_litter_data
 
                 self.next_id += 1
         # 第四段：處理本幀沒被配對到的舊 litter；短暫消失可保留，超過門檻移除。
@@ -2602,6 +2720,140 @@ class GlobalLitterTracker:
                 best_key = key
                 best_center = self._actor_center(actor)
         return best_key, best_overlap, best_center
+
+    def _vehicle_quarantine_actor_center(self, actor_key, actors):
+        """Return the current center of the exact quarantined carrier."""
+        for actor in actors or []:
+            try:
+                key = (str(actor.get('cls', '')).lower(), int(actor['track_id']))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if key == actor_key:
+                return self._actor_center(actor)
+        return None
+
+    def _update_vehicle_quarantine(
+        self,
+        litter_data,
+        litter_box,
+        centroid,
+        actors,
+        frame_index,
+        is_contained_observation,
+    ):
+        """Advance containment quarantine and return whether it remains active.
+
+        Relative points are measured in the coordinate frame of one immutable
+        carrier track. A carrier-ID change, missing carrier, one large jump, or
+        absolute image motion alone cannot release the track. This method only
+        removes quarantine; the normal trajectory/actor gates remain the sole
+        path to a confirmed event.
+        """
+        if litter_data.get('state', 'pending') != 'pending':
+            return False
+        if litter_data.get('vehicle_quarantine_released', False):
+            # Release is based on the accumulated same-carrier trajectory and
+            # remains valid for this litter track; a still-overlapping bbox on
+            # the next sampled frame must not restart the quarantine.
+            return False
+
+        active = bool(litter_data.get('vehicle_quarantine_active', False))
+        saved_carrier = litter_data.get('vehicle_quarantine_carrier_key')
+        overlap_carrier, _overlap, overlap_center = self._carrier_vehicle(
+            litter_box, actors,
+        )
+
+        if not active:
+            if not is_contained_observation or overlap_carrier is None:
+                return False
+            active = True
+            saved_carrier = overlap_carrier
+            litter_data['vehicle_quarantine_active'] = True
+            litter_data['vehicle_quarantine_carrier_key'] = saved_carrier
+            litter_data['vehicle_quarantine_relative_points'] = []
+            litter_data['vehicle_quarantine_frames'] = []
+            litter_data['vehicle_quarantine_released'] = False
+
+        carrier_center = None
+        if overlap_carrier == saved_carrier:
+            carrier_center = overlap_center
+        if carrier_center is None:
+            carrier_center = self._vehicle_quarantine_actor_center(
+                saved_carrier, actors,
+            )
+        if carrier_center is None:
+            return True
+
+        frames = list(litter_data.get('vehicle_quarantine_frames', []))
+        relative_points = list(
+            litter_data.get('vehicle_quarantine_relative_points', [])
+        )
+        if (
+            frames
+            and int(frame_index) - int(frames[-1])
+            > self.vehicle_quarantine_max_observation_gap_frames
+        ):
+            # A small contained box cannot retain physical identity through a
+            # long detector gap. Start a fresh evidence segment so one late,
+            # unrelated box cannot turn prior vehicle-part jitter into release.
+            relative_points = []
+            frames = []
+        if not frames or int(frames[-1]) != int(frame_index):
+            relative_points.append((
+                float(centroid[0]) - float(carrier_center[0]),
+                float(centroid[1]) - float(carrier_center[1]),
+            ))
+            frames.append(int(frame_index))
+        relative_points = relative_points[-self.trajectory_history_len:]
+        frames = frames[-self.trajectory_history_len:]
+        litter_data['vehicle_quarantine_relative_points'] = relative_points
+        litter_data['vehicle_quarantine_frames'] = frames
+
+        if len(relative_points) < self.vehicle_quarantine_min_observations:
+            return True
+
+        start = relative_points[0]
+        end = relative_points[-1]
+        rel_dx = float(end[0]) - float(start[0])
+        rel_dy = float(end[1]) - float(start[1])
+        rel_displacement = math.hypot(rel_dx, rel_dy)
+        init_w, init_h = litter_data.get('init_shape', (1.0, 1.0))
+        scale_floor = (
+            self.vehicle_quarantine_min_scale_ratio
+            * max(float(init_w), float(init_h), 1.0)
+        )
+        required_displacement = max(
+            self.vehicle_quarantine_min_relative_displacement,
+            scale_floor,
+        )
+        required_downward = max(
+            self.vehicle_quarantine_min_relative_downward,
+            self.vehicle_quarantine_min_scale_ratio * float(init_h),
+        )
+        downward_steps = sum(
+            1
+            for previous, current in zip(relative_points, relative_points[1:])
+            if float(current[1]) - float(previous[1]) >= 2.0
+        )
+        release = (
+            rel_displacement >= required_displacement
+            and rel_dy >= required_downward
+            and downward_steps >= self.vehicle_quarantine_min_downward_steps
+        )
+        litter_data['vehicle_quarantine_evidence'] = {
+            'observations': len(relative_points),
+            'relative_displacement': rel_displacement,
+            'relative_downward': rel_dy,
+            'downward_steps': downward_steps,
+            'required_displacement': required_displacement,
+            'required_downward': required_downward,
+        }
+        if release:
+            litter_data['vehicle_quarantine_active'] = False
+            litter_data['vehicle_quarantine_released'] = True
+            litter_data['vehicle_quarantine_release_frame'] = int(frame_index)
+            return False
+        return True
 
     def _actor_center_near_frame(self, actor_key, target_frame):
         # actor ring buffer 中最接近 target_frame 的中心點 (YOLO-seg 可能隔幀執行，就近取值)。
