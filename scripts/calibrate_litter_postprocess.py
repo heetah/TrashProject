@@ -21,6 +21,20 @@ def _read_jsonl(path: Path) -> list[dict]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
+def _sidecar_path(sidecar_dir: Path, video_name: str) -> Path | None:
+    """Resolve flat research outputs or isolated production case directories."""
+    filename = f"{Path(video_name).stem}_litter_candidates.jsonl"
+    direct = sidecar_dir / filename
+    if direct.is_file():
+        return direct
+    matches = sorted(sidecar_dir.rglob(filename))
+    if len(matches) > 1:
+        raise ValueError(
+            f"multiple candidate sidecars found for {video_name}: {matches}"
+        )
+    return matches[0] if matches else None
+
+
 def _bbox_xyxy(value) -> list[float] | None:
     if not isinstance(value, dict):
         return None
@@ -190,8 +204,8 @@ def build_report(events: list[dict], sidecar_dir: Path, **match_options) -> dict
     results = []
     for event in events:
         video_name = str(event.get("video_filename", ""))
-        sidecar = sidecar_dir / f"{Path(video_name).stem}_litter_candidates.jsonl"
-        records = _read_jsonl(sidecar) if sidecar.exists() else []
+        sidecar = _sidecar_path(sidecar_dir, video_name)
+        records = _read_jsonl(sidecar) if sidecar is not None else []
         matched = match_event(event, records, **match_options)
         results.append({
             "gt_event_id": event.get("gt_event_id"),
@@ -242,8 +256,8 @@ def summarize_clip_outputs(clip_annotations: list[dict], sidecar_dir: Path) -> d
     rows = []
     for clip in clip_annotations:
         video_name = str(clip.get("video_filename", ""))
-        sidecar = sidecar_dir / f"{Path(video_name).stem}_litter_candidates.jsonl"
-        records = _read_jsonl(sidecar) if sidecar.exists() else []
+        sidecar = _sidecar_path(sidecar_dir, video_name)
+        records = _read_jsonl(sidecar) if sidecar is not None else []
         confirmed_ids = sorted({
             int(record["tracker_litter_id"])
             for record in records

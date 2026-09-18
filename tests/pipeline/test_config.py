@@ -34,6 +34,7 @@ EXPECTED_DEFAULTS = {
     "yolo_seg_frame_skip": 2,
     "actor_mode": "predict",
     "rtdetr_zero_repair": "off",
+    "rtdetr_imgsz": None,
     "bbox_conf": 0.45,
     "trash_conf": 0.4,
     "actor_track_iou": 0.3,
@@ -84,6 +85,7 @@ def test_from_env_without_env_equals_defaults(monkeypatch):
         "BBOX_CONF", "TRASH_CONF", "ACTION_WINDOW", "VIOLATOR_DISPLAY_TTL",
         "WRITER_CRF", "MODEL_BBOX_PATH", "MOTION_DIFF_THRESHOLD",
         "VIDEO_HW_DEVICE",
+        "RTDETR_IMGSZ",
     ):
         monkeypatch.delenv(name, raising=False)
     assert PipelineConfig.from_env() == PipelineConfig()
@@ -99,6 +101,7 @@ def test_from_env_overrides(monkeypatch):
     monkeypatch.setenv("MODEL_BBOX_PATH", "modules_weight/custom-actor.pt")
     monkeypatch.setenv("MOTION_DIFF_THRESHOLD", "17")
     monkeypatch.setenv("VIDEO_HW_DEVICE", "1")
+    monkeypatch.setenv("RTDETR_IMGSZ", "1536")
     cfg = PipelineConfig.from_env()
     assert cfg.batch_size == 4
     assert cfg.pipeline_queue_size == 12
@@ -111,6 +114,7 @@ def test_from_env_overrides(monkeypatch):
     )
     assert cfg.motion_diff_threshold == 17
     assert cfg.video_hw_device == 1
+    assert cfg.rtdetr_imgsz == 1536
     # 未覆寫者維持預設
     assert cfg.trash_conf == 0.4
 

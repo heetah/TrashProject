@@ -746,6 +746,7 @@ def _stage_filter_litter_candidates(current_frame_litters, shake_active, shake_m
             is_fp_candidate, fp_reason = litter_candidate_is_vehicle_fp(
                 litter_box, tracking_objects, vehicle_history=vehicle_history,
                 prev_litter_history=prev_litter_history,
+                prev_litter_missed=prev_litter_missed,
             )
             if is_fp_candidate:
                 if fp_reason == 'vehicle_contained':
@@ -877,6 +878,14 @@ def _stage_update_litter_tracker(litter_tracker, filtered_frame_litters, raw_fra
         _finalize_litter_candidate_diagnostics(candidate_records, tracked_litters)
         if stats is not None and isinstance(stats.get('litter_candidate_records'), list):
             stats['litter_candidate_records'].extend(candidate_records)
+    if (
+        stats is not None and
+        isinstance(stats.get('litter_candidate_records'), list) and
+        hasattr(litter_tracker, 'consume_visual_bridge_records')
+    ):
+        stats['litter_candidate_records'].extend(
+            litter_tracker.consume_visual_bridge_records()
+        )
     return tracked_litters, active_violators
 
 

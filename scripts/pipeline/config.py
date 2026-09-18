@@ -154,6 +154,7 @@ class PipelineConfig:
     yolo_seg_frame_skip: int = 2
     actor_mode: str = "predict"
     rtdetr_zero_repair: str = "off"
+    rtdetr_imgsz: Optional[int] = None
     bbox_conf: float = 0.45
     trash_conf: float = 0.4
     actor_track_iou: float = 0.3
@@ -232,6 +233,7 @@ class PipelineConfig:
             yolo_seg_frame_skip=_env_int("YOLO_SEG_FRAME_SKIP", d.yolo_seg_frame_skip),
             actor_mode=_env_str("ACTOR_MODE", d.actor_mode),
             rtdetr_zero_repair=_env_str("RTDETR_ZERO_REPAIR", d.rtdetr_zero_repair),
+            rtdetr_imgsz=_env_optional_int("RTDETR_IMGSZ", d.rtdetr_imgsz),
             bbox_conf=_env_float("BBOX_CONF", d.bbox_conf),
             trash_conf=_env_float("TRASH_CONF", d.trash_conf),
             actor_track_iou=_env_float("ACTOR_TRACK_IOU", d.actor_track_iou),

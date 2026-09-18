@@ -108,3 +108,32 @@ def test_risk_coverage_orders_by_margin():
 def test_uniform_choice_nll_uses_positive_mass():
     rows = _rows()
     assert MODULE.uniform_choice_nll(rows) == np.log(2.0)
+
+
+def test_paired_binary_changes_reports_gain_loss_and_net():
+    first = [
+        {"event_key": "a", "ok": True},
+        {"event_key": "b", "ok": False},
+        {"event_key": "c", "ok": True},
+    ]
+    second = [
+        {"event_key": "a", "ok": False},
+        {"event_key": "b", "ok": True},
+        {"event_key": "c", "ok": True},
+    ]
+    result = MODULE.paired_binary_changes(first, second, "ok")
+    assert result == {"support": 3, "gains": ["a"], "losses": ["b"], "net": 0}
+
+
+def test_markdown_report_uses_live_cohort_counts():
+    report = {
+        "data": {"ground_truth_events": 58},
+        "primary": {
+            "events": 40,
+            "route_counts": {"direct_vehicle": 33, "person_vehicle": 7},
+        },
+    }
+    rendered = MODULE._cohort_description(report)
+    assert "58 件人工事件中" in rendered
+    assert "person→vehicle 7" in rendered
+    assert "63片中" not in rendered

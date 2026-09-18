@@ -54,6 +54,8 @@ def estimate_global_shift(prev_frame, curr_frame, downscale=SHAKE_DOWNSCALE):
 # override remains available for rollback/A-B via LITTER_FP_CONTAINMENT_THR.
 LITTER_FP_CONTAINMENT_THR = 0.999      # 候選與某車輛 bbox 幾乎完全重疊 → 隨車部件
 LITTER_FP_STREAK_RATIO = 10.0          # 8/27 recovery profile；仍排除極端純水平條紋
+LITTER_FP_STREAK_MIN_OBSERVATIONS = 2  # 包含本幀；2 保持既有 production 行為
+LITTER_FP_STREAK_DEFER_MAX_STEP_DIAGONALS_PER_FRAME = 1.1
 LITTER_FP_ARC_MIN_DESCENT = 7.0        # 最高點後至少下降此像素，才視為重力下降證據
 LITTER_FP_NEAREST_VEHICLE_DIST = 40.0  # 候選距車輛 bbox 此值內才做共動判斷（像素）
 LITTER_FP_COMOTION_MIN_VEH_STEP = 4.0  # 該步車輛位移 ≥ 此值才足以判斷共動（px/frame）
@@ -121,6 +123,14 @@ def _float_env(name, default):
         return float(os.environ.get(name, str(default)))
     except (TypeError, ValueError):
         return float(default)
+
+
+def _int_env(name, default):
+    """Read an optional integer research override without changing defaults."""
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def _motion_crop(fg_mask, coords, mask_scale=1.0):
@@ -818,7 +828,8 @@ def litter_holding(litter_box, actors,
 
 
 def litter_candidate_is_vehicle_fp(litter_box, actors, vehicle_history=None,
-                                   prev_litter_history=None):
+                                   prev_litter_history=None,
+                                   prev_litter_missed=None):
     """前處理 FP 篩選：判斷此 litter 候選是否為『隨車部件』或『純水平條紋』。
 
     依使用者架構決策：垃圾辨識的篩選動作集中在 detect 前處理，tracker 只負責追蹤、
@@ -876,8 +887,21 @@ def litter_candidate_is_vehicle_fp(litter_box, actors, vehicle_history=None,
     streak_ratio = max(
         _float_env("LITTER_FP_STREAK_RATIO", LITTER_FP_STREAK_RATIO), 0.0
     )
+    streak_min_observations = max(
+        _int_env(
+            "LITTER_FP_STREAK_MIN_OBSERVATIONS",
+            LITTER_FP_STREAK_MIN_OBSERVATIONS,
+        ),
+        2,
+    )
 
     # 2) horizontal streak（需軌跡）
+    # A two-point ratio is ill-conditioned while a real throw is still rising:
+    # down <= 0 collapses the denominator to epsilon, so any horizontal motion
+    # appears infinitely non-ballistic before an apex/descent can be observed.
+    # The production default (2) preserves existing behaviour.  A larger
+    # opt-in minimum defers rejection; it does not confirm the candidate, which
+    # must still satisfy holding and tracker physical-evidence gates.
     if hist:
         x0, y0 = float(hist[0][0]), float(hist[0][1])
         down = lcy - y0
@@ -899,10 +923,11 @@ def litter_candidate_is_vehicle_fp(litter_box, actors, vehicle_history=None,
             descent_from_apex >= LITTER_FP_ARC_MIN_DESCENT and
             descent_horiz <= streak_ratio * descent_from_apex
         )
-        if (
+        is_horizontal_streak = (
             horiz > streak_ratio * max(down, 1e-6)
             and not has_gravity_descent
-        ):
+        )
+        if is_horizontal_streak:
             # 真正從車窗/車斗邊緣拋出的輕物，一開始可能幾乎水平飛行。
             # 只有軌跡剛出生、起點在車框內且本幀已明顯離開同一車框時，
             # 才不在此前處理 gate 丟棄；後續仍需通過 holding、vehicle-relative
@@ -928,7 +953,45 @@ def litter_candidate_is_vehicle_fp(litter_box, actors, vehicle_history=None,
                         released_from_vehicle_edge = True
                         break
             if not released_from_vehicle_edge:
-                return True, 'horizontal_streak'
+                total_observations = len(hist) + 1
+                defer_until_more_evidence = (
+                    total_observations < streak_min_observations
+                )
+                if defer_until_more_evidence:
+                    # Do not let a deferred observation bridge to a different
+                    # object. Normalize the latest centroid jump by source-frame
+                    # gap and current box diagonal: px / (frame * px).
+                    # The 1.1 bound is an explicit development hypothesis, not
+                    # a calibrated physical speed or a production accuracy claim.
+                    px, py = float(hist[-1][0]), float(hist[-1][1])
+                    frame_gap = max(int(prev_litter_missed or 0) + 1, 1)
+                    bbox_diagonal = max(math.hypot(lx2 - lx1, ly2 - ly1), 1.0)
+                    residual_x = lcx - px
+                    residual_y = lcy - py
+                    if len(hist) >= 2:
+                        # A fast airborne object may move several own box
+                        # diagonals per frame.  Once two observations exist,
+                        # judge continuity against constant-velocity
+                        # prediction instead of raw displacement.  This only
+                        # postpones the streak rejection; it cannot confirm.
+                        prior_x, prior_y = map(float, hist[-2])
+                        residual_x -= px - prior_x
+                        residual_y -= py - prior_y
+                    normalized_step = (
+                        math.hypot(residual_x, residual_y)
+                        / (float(frame_gap) * bbox_diagonal)
+                    )
+                    max_normalized_step = max(
+                        _float_env(
+                            "LITTER_FP_STREAK_DEFER_MAX_STEP_DIAGONALS_PER_FRAME",
+                            LITTER_FP_STREAK_DEFER_MAX_STEP_DIAGONALS_PER_FRAME,
+                        ),
+                        0.0,
+                    )
+                    if normalized_step <= max_normalized_step:
+                        is_horizontal_streak = False
+                if is_horizontal_streak:
+                    return True, 'horizontal_streak'
 
     # 3) co-motion（需軌跡 + 鄰近移動車輛的逐幀 centroid）
     if (nearest_veh_id is not None and nearest_dist <= LITTER_FP_NEAREST_VEHICLE_DIST

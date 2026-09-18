@@ -183,7 +183,11 @@ if __name__ == "__main__":
                         channels = int(engine_shape[1])
                     else:
                         channels = _get_model_input_channels(model)
-                        imgsz = _get_model_warmup_imgsz(model)
+                        imgsz = (
+                            max(int(cfg.rtdetr_imgsz), 32)
+                            if cfg.rtdetr_imgsz is not None
+                            else _get_model_warmup_imgsz(model)
+                        )
                         if imgsz != 640:
                             model.overrides["imgsz"] = imgsz
                         print(f"[trash_warmup] fallback: imgsz={imgsz}, channels={channels}")
@@ -718,6 +722,14 @@ if __name__ == "__main__":
                     ),
                     "fp_streak_ratio": _safe_float_env(
                         "LITTER_FP_STREAK_RATIO", 10
+                    ),
+                    "fp_streak_min_observations": int(
+                        _safe_float_env(
+                            "LITTER_FP_STREAK_MIN_OBSERVATIONS", 2
+                        )
+                    ),
+                    "fp_streak_defer_max_step_diagonals_per_frame": _safe_float_env(
+                        "LITTER_FP_STREAK_DEFER_MAX_STEP_DIAGONALS_PER_FRAME", 1.1
                     ),
                     "allow_shake_candidates": os.environ.get(
                         "LITTER_ALLOW_SHAKE_CANDIDATES", "1"

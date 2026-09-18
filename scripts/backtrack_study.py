@@ -5,9 +5,10 @@ import json
 from pathlib import Path
 
 from pipeline.backtrack.annotations import load_records
-from pipeline.backtrack.sidecar import SCHEMA_NAME, write_jsonl
+from pipeline.backtrack.sidecar import write_jsonl
 from pipeline.backtrack.study import (
-    build_manifest, evaluate_trial, load_config, replay_candidates,
+    build_manifest, evaluate_trial, load_candidate_records, load_config,
+    replay_candidates,
 )
 
 
@@ -16,10 +17,7 @@ def _json(path):
 
 
 def _candidate_records(path):
-    return [
-        record for record in load_records(path)
-        if record.get("schema") == SCHEMA_NAME
-    ]
+    return load_candidate_records(path)
 
 
 def main():

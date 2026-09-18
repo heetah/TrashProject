@@ -328,6 +328,36 @@ def _candidate_events(records: Iterable[Mapping[str, Any]]):
     ]
 
 
+def load_candidate_records(path: str | Path) -> list[Dict[str, Any]]:
+    """Load candidate rows from one sidecar or a production batch directory.
+
+    Batch inference isolates each clip below ``case_<id>/``.  Recursive,
+    deterministic discovery lets research replay consume that immutable tree
+    directly, without flattening files or changing run provenance.
+    """
+    target = Path(path)
+    if target.is_file():
+        paths = [target]
+    elif target.is_dir():
+        paths = sorted(target.rglob("*_backtrack_candidates.jsonl"))
+    else:
+        raise FileNotFoundError("candidate path does not exist: {}".format(target))
+    if not paths:
+        raise AnnotationError(
+            "candidate directory contains no *_backtrack_candidates.jsonl files: {}".format(
+                target
+            )
+        )
+    records: list[Dict[str, Any]] = []
+    for sidecar in paths:
+        records.extend(
+            dict(record)
+            for record in load_records(sidecar)
+            if record.get("schema") == CANDIDATE_SCHEMA
+        )
+    return records
+
+
 def build_manifest(
     candidate_records: Sequence[Mapping[str, Any]], *, seed: int = 20260802
 ) -> Dict[str, Any]:
@@ -501,5 +531,5 @@ def load_config(path: str) -> StudyConfig:
 
 __all__ = [
     "STUDY_SCHEMA", "StudyConfig", "build_manifest", "evaluate_trial",
-    "load_config", "replay_candidates",
+    "load_candidate_records", "load_config", "replay_candidates",
 ]

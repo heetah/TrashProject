@@ -70,6 +70,31 @@ Semantics:
 - Every event has a NULL route. Invalid or highly uncertain candidates are not
   forced into a match.
 
+### Ordinal occlusion feasibility boundary
+
+`SMART_BACKTRACK_MASK_DIAGNOSTICS` only exports bounded mask/litter scalars for
+research. The resolver does not read them and their production weight is zero.
+Visible segmentation-mask containment is not metric depth and does not identify
+the litter source; a foreground vehicle may contain the litter pixel while being
+the wrong thrower.
+
+The historical `build_ordinal_occlusion_package.py` created a separate,
+attribution-blinded queue from observed vehicle/scooter overlaps. Its one-off
+source is now in `artifacts/research_python_archive_20260915.tar.gz`; the
+existing research result and limitations remain documented. It never reads route,
+assignment, release, litter, or ground-truth actor fields. Public rows use opaque
+A/B aliases; raw paths, model tracklet IDs, and display boxes stay in a private
+mapping. The current builder is still event-conditioned and uses model box
+proposals, so its output is feasibility material rather than independent ordinal
+truth. It does not modify `runs/grounding_truth`, the production UI, resolver
+tasks, costs, or NULL behavior.
+
+One reviewer may label `a_front_b`, `b_front_a`, `tie`, or `unknown`; uncertainty
+must not be forced into a direction. A delayed blinded repeat round with A/B
+reversal measures intra-rater consistency. Camera IDs and source-video groups
+must be verified before camera-separated evaluation. Correlated frames cannot be
+counted as independent accuracy samples.
+
 Production entrypoint 會從 repository root `.env` 載入以下控制項；shell 明確 export 的值優先，
 完整集中範本見 root `.env.example`。Environment controls (defaults shown):
 
@@ -126,6 +151,230 @@ smooths detector jitter and supplies covariance. Production currently uses the
 smoothed state even at observed frames while retaining the nearest real
 detector frame as evidence for the freshness gate.
 
+### Litter observation provenance contract
+
+Each immutable resolver task keeps the legacy `history_sources` values
+(`accepted_tracker` or `raw_rtdetr_recovered`) for sidecar/replay compatibility.
+Two additive diagnostic arrays have the same length and ordering as `history`,
+`history_frames`, `history_boxes` and `history_confidences`:
+
+- `history_provenance`: exact producer `detector`, `visual_bridge`,
+  `raw_rtdetr_recovered`, or conservative `legacy_unknown` for old callers;
+- `history_lineage`: deterministic observation ID, optional parent observation,
+  independence-group ID, `derived`, and `independent_measurement`.
+
+Detector observations are independent measurement roots. A `visual_bridge`
+inherits the preceding observation's independence group. A recovered raw prefix
+is retrospectively selected from the first accepted anchor and is also marked
+non-independent. A duplicate observation ID remains in the legacy trajectory
+when necessary for behavior compatibility, but its later lineage row is not
+independent. This prevents future research from treating one observation and
+its derived copies as separate statistical evidence.
+
+Phase 0 is serialization-only: `SmartBacktrackResolver` does not read either
+new array. Let `P` remove the two new fields from enriched task `T'`; then the
+production contract is `resolve(T') = resolve(P(T'))`. The regression test
+checks selected route, person, vehicle and every route cost exactly. No release,
+cost, confirmation, route or NULL rule changed. Multi-hypothesis smoothing is a
+later research phase and must not consume these fields without a separately
+validated policy.
+
+### Release-state marginalization primitives (Phase 1A, research only)
+
+`release_marginalization.py` has no production caller. It provides three strict
+building blocks for later experiments:
+
+1. Gaussian NLL
+   `0.5 * (d*log(2*pi) + log(det(Sigma)) + r^T*Sigma^-1*r)` computed by
+   Cholesky factorization and solve. Residual and covariance axes must have
+   matching dimensions and units; covariance must be finite, exactly symmetric
+   and positive definite. The function never repairs covariance or adds jitter.
+2. Caller-defined release-time prior density discretized in seconds. For sorted
+   unique points `t_i`, interior cell boundaries are
+   `b_i=(t_(i-1)+t_i)/2`; the caller supplies both outer domain boundaries.
+   Mass is `density_i*(b_(i+1)-b_i)` followed by global normalization.
+   Duplicate time points merge before integration and cannot gain prior mass.
+3. Stable log-sum-exp marginalization of auditable hypotheses within routes and
+   then across routes. Every hypothesis carries an ID, route ID, release time,
+   log likelihood and log prior mass. Conditional hypothesis priors and route
+   priors must already sum to one; a caller-specified NULL route and hypothesis
+   are mandatory.
+
+`-inf` log likelihood/prior denotes exactly zero likelihood/mass. A zero-
+evidence route receives posterior zero when another route has finite evidence;
+all-zero route evidence fails explicitly. NaN and `+inf` remain invalid. Prior
+normalization tolerance uses the standard floating-point forward-error bound
+`gamma_(N+1) = ((N+1)u)/(1-(N+1)u)`, where `u=ulp(1.0)/2`; it accounts for N
+exponentiations and the final accurately rounded sum, rather than introducing a
+model threshold. This bound assumes the standard floating-point model for the
+platform `exp`/`fsum` implementations; it is not a cross-libm formal guarantee.
+A singleton prior must be exactly `log(1)=0`.
+
+The module does not read `history_lineage`, multiply observation likelihoods,
+construct identity/visibility states, choose top-1, or write resolver output.
+Its posterior is conditional on explicitly supplied priors and likelihoods; it
+is not calibrated attribution accuracy. Release windows, bandwidths, gates and
+weights remain entirely caller-supplied. Production `trajectory.py`,
+`costs.py`, `resolver.py`, flow routes and schemas are unchanged.
+
+### Target-48 guarded route composition (research only)
+
+The frozen 58-clip development sidecar was also evaluated with a research-only
+composition of five guarded comparisons: a ballistic boundary-ambiguity check,
+same-vehicle person disambiguation from `C_AC` endpoint distance, a high/low
+`C_BC` quality consistency check, a weak person-to-vehicle association check,
+and a same-model motion-consistency check. Each comparison uses only existing
+dimensionless sidecar features and an explicit route-cost-difference bound; it
+does not add a production weight, alter event confirmation, or remove the
+complete `NULL` route. `boundary_depth` remains a normalized image-box edge
+diagnostic, not metric depth or a pseudo-homography reconstruction.
+
+On the reviewed positive development cohort this candidate changed 9 of 93
+confirmed-record assignments and moved the official fail-closed result from
+43/58 to 48/58 route-correct clips (51/58 assignment-conditioned event
+matches), with five gains and zero losses. The exact paired sign-test
+diagnostic is `p=0.0625`; the point estimate reaches the interim 48/58 target,
+but the 85% gate requires 50/58 and the Wilson lower bound is only 0.711.
+Nine existing confidence/scale/compression sidecars reproduce 48/58 with no
+losses. This is decision-stability evidence on the same development cohort,
+not calibrated accuracy or cross-camera generalization. The candidate has no
+production caller; thresholds must be preregistered and re-evaluated on a
+reviewed camera/source-recording-disjoint holdout and a reviewed negative set
+before any promotion.
+
+The complete rule equations, hashes, case-level gains, temporal-offset
+sensitivity and rollback boundary are recorded in
+`versions/2026-09-15_codex_target48_guarded_route_research.md`.
+
+### Single-reviewer camera/site holdout worksheet (research only)
+
+`camera_holdout_review.py` creates a deterministic `camera-holdout-review/v1`
+worksheet from the 18-case camera-safe index. It copies only immutable source
+filename/path/SHA-256 fields and one blank `review` object per case; model
+summaries, assignments, route scores, release hypotheses and annotated output
+paths are stripped. `verify_source_files` rehashes each source before review,
+and `validate_completed_review` requires one reviewer, explicit positive /
+negative / ambiguous / unusable status, source SHA confirmation,
+camera/site/session/source-recording IDs and reviewed timestamps. It reports
+camera-disjoint readiness only when the caller supplies non-empty reviewed
+camera/source groups and no exact provenance overlap; it never invents a
+camera ID or treats missing labels as negatives. This worksheet has no
+production caller and does not compute attribution accuracy.
+
+Build the worksheet from the existing camera-safe index and verify the source
+bytes before handing it to the reviewer:
+
+```bash
+PYTHONPATH=scripts conda run -n rtdetr python scripts/build_camera_holdout_review.py \
+  --index /tmp/target41_camera_safe_review_index.json \
+  --output /tmp/target41_camera_safe_blinded_review.json \
+  --verify-sources
+```
+
+The command refuses to overwrite an existing file and keeps all review fields
+blank. After the reviewer fills the copy, run `validate_completed_review` with
+the reviewed camera/source-recording sets before any accuracy evaluator.
+
+The standalone gate reports a blank worksheet as not ready and exits non-zero;
+it likewise rejects a partially completed or malformed worksheet. It never
+infers missing provenance or starts an evaluator:
+
+```bash
+PYTHONPATH=scripts conda run -n rtdetr python scripts/validate_camera_holdout_review.py \
+  --review /tmp/target41_camera_safe_blinded_review.json \
+  --verify-sources
+```
+
+After human review, repeat the command with the independently reviewed
+reference `--reviewed-camera-id` and `--reviewed-source-recording-id` values
+(and, when available, `--reviewed-source-hash`). Exit code `0` means the
+provenance/coverage gate is ready for a separately frozen evaluation; it does
+not certify attribution accuracy.
+
+The current blind runtime sample under `/tmp/target41_camera_safe_run` has
+18/18 analysis JSON files, backtrack sidecars, and decodable H.264 MP4 output.
+This is a container/output smoke check only; the worksheet remains
+`unreviewed`, so no accuracy or attribution number may be derived from it.
+
+The frozen Target-48 composition was also replayed in memory against these
+blind sidecars as a behaviour preflight. It read no truth labels and wrote no
+production or evaluation sidecar: 29 confirmed-record rows from 13 clips were
+parsed, one `direct_person` guard changed one assignment (`litter_case_202`),
+and all 29 rows retained a NULL alternative, one selected-route alignment, and
+the original input path. The 18 source SHA-256 values are unique and the
+source-case audit reports no overlap with the reviewed source cases, but
+camera/site identity is still unverified; this is source-recording/output
+stability evidence, not a camera-independent accuracy result. The worksheet
+remains 18/18 `unreviewed` and the camera-disjoint gate remains blocked.
+
+For spreadsheet-friendly handoff, the worksheet can be exported and imported
+through a strict, model-blind CSV round trip. The JSON template remains the
+source of immutable case identity; the table contains exactly the columns
+`case_id`, `video_filename`, `source_video`, `source_sha256`, the explicit
+review/provenance fields, `events_json`, and `notes`. Extra prediction columns,
+changed paths or hashes, duplicate/missing case IDs, malformed booleans, and a
+changed header fail closed. Importing a partial table is allowed so a reviewer
+can save progress, but it never makes the worksheet evaluation-ready:
+
+```bash
+PYTHONPATH=scripts conda run -n rtdetr python scripts/export_camera_holdout_review.py \
+  --review /tmp/target41_camera_safe_blinded_review.json \
+  --output /tmp/target41_camera_safe_blinded_review.csv \
+  --verify-sources
+
+PYTHONPATH=scripts conda run -n rtdetr python scripts/import_camera_holdout_review.py \
+  --template /tmp/target41_camera_safe_blinded_review.json \
+  --table /tmp/target41_camera_safe_blinded_review.csv \
+  --output /tmp/target41_camera_safe_blinded_review_roundtrip.json \
+  --verify-sources
+```
+
+Both commands refuse to overwrite an existing output. The CSV contains no
+model summaries, route IDs, scores, release hypotheses, or annotated output
+paths. After the reviewer finishes the imported JSON, run the validation gate
+above and supply independently reviewed camera/source-recording groups.
+
+### Replay decision consensus (research only)
+
+`replay_consensus.py` is a pure, no-caller primitive for checking whether a
+single event keeps the same route under a caller-supplied set of replay
+conditions (for example confidence, image scale or codec perturbations). It
+canonicalizes `(route_type, person_key, vehicle_key)` and deliberately ignores
+local `route_id` values when comparing conditions; those IDs are retained only
+for audit output. A route is returned as `consensus_route` only when every
+condition agrees. Any disagreement, including disagreement with an explicit
+NULL route, returns `safe_route = ("null", None, None)` and sets
+`manual_review_required`; no plurality or top-1 choice is made. Unanimous NULL
+is preserved as a valid consensus, not treated as missing data.
+
+The check validates unique non-empty condition IDs, strict actor-key shapes and
+route semantics, and sorts audit rows by condition ID for deterministic replay.
+It does not combine scores, multiply observations, infer camera/depth
+relationships, or change resolver costs, release logic, route schemas or NULL
+behavior. The nine-condition development replay currently has 58/58 identical
+route tuples, but this primitive does not convert that in-sample invariance
+into accuracy or camera-independent robustness evidence.
+
+The retained `{0,+1}` release-mask window also passed a fixed single-offset
+sensitivity screen: offsets `-1`, `0`, and `+1` produced 41/58, 43/58, and
+42/58 respectively, with no route or accepted-event losses; offsets `-2` and
+`+2` produced 40/58. This is a development missing-observation check only and
+does not justify a production weight or a camera-generalization claim.
+
+The frozen mask replay is also isolated from detector/tracker evidence: its
+93 baseline/candidate records have identical keys and route payloads, with
+zero non-decision evidence differences; only five documented assignment
+selection mirrors changed. See
+`/tmp/target41_mask_candidate_lineage_audit.json`.
+
+Exact source-file lineage also supports a paired source-case sensitivity check:
+on 54 clips in 50 SHA-linked source groups, the candidate-minus-baseline rate
+difference was +9.26 percentage points with a grouped bootstrap 95% interval
+of +1.92 to +17.54 points. The groups are source recordings, not verified
+cameras, and the replay was selected on the same development set; see
+`/tmp/target41_source_case_paired_bootstrap.json` and do not treat this as
+confirmatory significance.
+
 `SMART_BACKTRACK=0` keeps the legacy resolver available as a rollback path.
 When smart mode is enabled, the legacy heuristic is used only if the smart
 resolver raises an exception.
@@ -135,6 +384,155 @@ represented exactly. With all actor capacities intentionally unbounded, events
 currently decompose mathematically into independent shortest routes. The graph
 form is retained for explicit NULL handling and later cross-event consistency
 constraints; it should not be described as adding cross-event coupling today.
+
+### Target-41 evidence ledger (research only)
+
+Maintenance note: this target-41 implementation and its focused tests were
+superseded by the frozen target-48 study and moved to
+`artifacts/research_python_archive_20260915.tar.gz`. The section below is a
+historical evidence record; restore the archive into an isolated directory
+before attempting its old commands. It is not an active production workflow.
+
+`target41_evidence.py` and `scripts/build_target41_evidence_ledger.py` verify
+that baseline/candidate case tables and their official readiness reports have
+the same fixed denominator, reviewed labels, and exact case IDs. The ledger
+records each case's outcome transition and an explicit explanation code, then
+checks the separately supplied replay-consensus report. It does not rerun
+matching, infer truth, select a route, or call production code.
+
+Example for the frozen `{0,+1}` replay:
+
+```bash
+PYTHONPATH=scripts conda run -n rtdetr python scripts/build_target41_evidence_ledger.py \
+  --baseline-cases /tmp/target41_mask_temporal_aggregate/+0_+1/baseline_eval/case_outcomes.csv \
+  --candidate-cases /tmp/target41_mask_temporal_aggregate/+0_+1/candidate_eval/case_outcomes.csv \
+  --baseline-readiness /tmp/target41_mask_temporal_aggregate/+0_+1/baseline_eval/readiness.json \
+  --candidate-readiness /tmp/target41_mask_temporal_aggregate/+0_+1/candidate_eval/readiness.json \
+  --consensus /tmp/target41_mask_decision_consensus.json \
+  --expected-denominator 58 --target-count 41 \
+  --output /tmp/target41_evidence_ledger.json
+```
+
+The resulting ledger reports 43/58 candidate correctness, five explicit
+`wrong_route -> correct_route` gains, zero losses, and nine replay conditions
+with no unstable cases. These are development-set evidence and decision
+consistency, not calibrated accuracy or camera-independent robustness.
+
+The 18-case camera-safe runtime audit currently reports 29 event snapshots,
+`applied_events=0`, and 29 `feature_disabled` fallbacks for dynamic
+pseudo-homography. Thus the 43/58 mask replay contains no implicit 3D-depth
+effect; a future H experiment requires a separately reviewed continuous-camera
+run that reaches `LOCKED`.
+
+### Target-41 robustness certificate (research only)
+
+Maintenance note: the certificate builders/modules and their tests are stored
+in the same research archive. Existing hashes and conclusions are retained for
+audit, while the active tree keeps the target-48, Phase 0/1A, replay-consensus,
+camera-holdout and release-validation paths.
+
+`target41_robustness.py` joins the audited target-41 evidence ledger with its
+replay-consensus report and emits a strict, hash-linked status certificate. It
+reports the development point estimate (currently 43/58), complete per-case
+explanation coverage, and the nine supplied confidence/scale/compression replay
+conditions (58/58 route tuples consistent). The certificate is an accounting
+and reproducibility primitive: it does not rerun inference, multiply correlated
+observations, choose a route, infer camera identity, or modify resolver costs,
+release logic, schemas, or NULL behavior. It must not be described as calibrated
+accuracy, a confidence interval, or cross-camera generalization.
+
+The explanation vocabulary is closed and validated against the six outcome
+reasons emitted by `target41_evidence.py`; an unknown code fails closed. The
+candidate outcome is also checked against its one-to-one explanation reason,
+so a known code cannot be attached to the wrong result semantics. The
+certificate also emits `case_ids_by_explanation`, a deterministic mapping from
+each explanation code to the exact clip IDs, so aggregate counts cannot hide a
+case-level audit gap.
+It also emits `case_explanations`: one deterministic row per clip containing
+the baseline/candidate outcomes, expected route type, and selected route
+tuples, plus the case-table observables (`match_tier`, event-match flag,
+mapped actor keys, and provisional correctness) on each side. These are audit
+summaries only; they do not become resolver input or ground truth.
+
+For stronger replay provenance, `replay_evidence.py` and
+`scripts/build_target41_replay_evidence.py` consume the official
+`case_outcomes.csv` from each replay condition. They rehash every table,
+recompute the complete per-case route/outcome rows, and record disagreements as
+`unstable_cases`; no voting or fallback route is introduced. Supplying
+`--replay-evidence` to the certificate makes it verify this artifact against
+the consensus condition IDs and source CSV bytes. The current artifact covers
+all nine conditions and all 58 cases with zero unstable routes:
+`/tmp/target41_replay_evidence_full_paired_v3.json` (SHA-256
+`620ccc246710237b4ae26b62afaece81035023401ed189ad515f6501793edf8d`).
+When a baseline table is supplied, the artifact also recomputes each
+condition's baseline-to-candidate gains/losses and event-match changes; the
+current nine conditions all reproduce 38→43, five gains, zero losses.
+The certificate also recomputes the exact two-sided paired sign-test diagnostic
+for the discordant cases: `p=0.0625` for five gains and zero losses. This is a
+development-cohort diagnostic only; it is not calibrated accuracy, proof of
+causality, or a production promotion gate.
+For this frozen artifact, the machine-readable provenance fields report
+`condition_table_sha256_unique_count=1` and
+`all_condition_tables_byte_identical=true`: all nine final
+`case_outcomes.csv` files are byte-identical (SHA-256
+`e4033acf3e6ba49b46e33566e25edb1c603e8370ccf0e93a6633f0fb22d50a80`). This
+therefore proves final-decision-table invariance only. The fact that the
+upstream mask perturbations were actually applied is supported separately by
+their raw audits (confidence measurements 441/437/437; image-size
+measurements 431/437/439; JPEG measurements 440/440); the certificate does
+not infer that fact from identical decision tables.
+The paired certificate carrying this diagnostic is
+`/tmp/target41_robustness_certificate_replay_paired_v7.json` (SHA-256
+`0a39af1a6511fd14b80f1a21cb750c8d119c0044e7a562f9d40274bca15b7ce7`).
+Build it by repeating caller-supplied condition/table pairs; the command
+requires at least two conditions and refuses to overwrite its output:
+
+```bash
+PYTHONPATH=scripts conda run -n rtdetr python scripts/build_target41_replay_evidence.py \
+  --condition base=/path/to/base/case_outcomes.csv \
+  --condition scale640=/path/to/scale640/case_outcomes.csv \
+  --baseline /path/to/baseline/case_outcomes.csv \
+  --denominator 58 \
+  --output /tmp/target41_replay_evidence.json
+```
+
+An optional `--source-case-bootstrap` input adds the already-computed grouped
+sensitivity artifact. The current artifact covers 54 mapped clips in 50 exact
+source-lineage groups: candidate-minus-baseline is +9.26 percentage points,
+with a paired percentile-bootstrap interval of +1.92 to +17.54 points. The
+certificate validates its count/rate arithmetic, finite interval bounds,
+replicate metadata and SHA, but labels these groups as source recordings—not
+verified cameras—and does not interpret the bootstrap probability as
+confirmatory significance. Without this option, the source-case section remains
+explicitly unavailable.
+
+An optional `--temporal-offset-summary` input separately records the fixed
+single-observation offset screen. The current artifact reports 40/58, 41/58,
+43/58, 42/58 and 40/58 for offsets `-2,-1,0,+1,+2`, respectively, with no
+correctness losses in that positive development cohort. Only `-1, 0, +1`
+reach the 41/58 point target. This is missing-observation sensitivity, not
+evidence that the chosen `{0,+1}` window is camera-invariant or production-safe.
+
+Build it from the immutable ledger and consensus artifacts:
+
+```bash
+PYTHONPATH=scripts conda run -n rtdetr python scripts/build_target41_robustness_certificate.py \
+  --ledger /tmp/target41_evidence_ledger.json \
+  --consensus /tmp/target41_mask_decision_consensus.json \
+  --replay-evidence /tmp/target41_replay_evidence_full_paired_v3.json \
+  --source-case-bootstrap /tmp/target41_source_case_paired_bootstrap.json \
+  --temporal-offset-summary /tmp/target41_mask_single_offsets__it1z8re/summary.json \
+  --target-count 41 \
+  --output /tmp/target41_robustness_certificate.json
+```
+
+The command refuses to overwrite an existing output and fails closed on a
+changed SHA-256, denominator/case mismatch, duplicate replay or case ID,
+inconsistent gain/loss arithmetic, or unstable replay. `target_point_estimate_reached`
+may be true while `camera_independence.verified` and
+`promotion.ready_for_production` remain false. A human-reviewed, camera/site /
+source-recording-disjoint holdout and a reviewed negative set are still required
+before any release claim.
 
 ## Reproducible cost study
 
@@ -273,6 +671,15 @@ Research runs with `SMART_BACKTRACK_SIDECAR=1` additionally include:
 Production keeps it disabled so the frontend receives only `analysis.json`.
 The research sidecar stores labeling, gate-analysis and cost-calibration data;
 it is not part of the frontend schema.
+
+`SMART_BACKTRACK_MASK_DIAGNOSTICS=1` may additionally place compact
+`mask_litter_diagnostics` on resolver-input frame rows that contain raw litter
+candidates. The producer accepts only real observed `seg_track`/`seg_predict`
+vehicle or scooter masks. It serializes bounded scalar overlap, containment,
+mask-fill and signed-distance summaries, never polygons or dense masks. The
+resolver ignores the field, so it cannot alter event confirmation, costs,
+routes or NULL. This describes visible-silhouette evidence only; it is neither
+ordinal depth nor a 3D coordinate.
 
 Schema `smart-backtrack-candidates/v1` contains:
 

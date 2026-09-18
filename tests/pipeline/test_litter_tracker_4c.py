@@ -15,6 +15,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'scripts'))
 
 import pytest
+import numpy as np
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -101,12 +102,17 @@ def test_0827_confirmation_recovery_defaults(monkeypatch):
 def test_0827_pretracker_recovery_defaults(monkeypatch):
     """Guard the streak and camera-shake defaults in the same profile."""
     monkeypatch.delenv("LITTER_FP_STREAK_RATIO", raising=False)
+    monkeypatch.delenv("LITTER_FP_STREAK_MIN_OBSERVATIONS", raising=False)
     monkeypatch.delenv("LITTER_ALLOW_SHAKE_CANDIDATES", raising=False)
 
     from pipeline.detect import _allow_shake_candidates
-    from pipeline.geometry import LITTER_FP_STREAK_RATIO
+    from pipeline.geometry import (
+        LITTER_FP_STREAK_MIN_OBSERVATIONS,
+        LITTER_FP_STREAK_RATIO,
+    )
 
     assert LITTER_FP_STREAK_RATIO == pytest.approx(10.0)
+    assert LITTER_FP_STREAK_MIN_OBSERVATIONS == 2
     assert _allow_shake_candidates() is True
 
     monkeypatch.setenv("LITTER_ALLOW_SHAKE_CANDIDATES", "0")
@@ -208,6 +214,72 @@ class TestThrownLitterConfirm:
             assert any(item['state'] == 'confirmed' for item in active.values())
         finally:
             tracker.close()
+
+    def test_motion_consistent_shape_change_keeps_one_pending_track(self):
+        """Motion blur may change aspect ratio without changing identity."""
+        tracker = self.tracker
+        actors = [_person_actor(track_id=1, x1=850, y1=300, x2=900, y2=520)]
+
+        active, _ = tracker.update(
+            [_lbox(880, 510, half=15)], actors, frame_index=0
+        )
+        litter_id = next(iter(active))
+        # Tall blurred box: height changes by >60%, but its centre motion is
+        # bounded by the combined source/target object scale.
+        active, _ = tracker.update(
+            [(740, 420, 765, 481, 0.9)], actors, frame_index=1
+        )
+
+        assert litter_id in active
+        assert active[litter_id]['age'] == 2
+
+    def test_motion_prediction_rejects_shape_changed_off_path_box(self):
+        """A nearby shape change away from predicted motion starts a new ID."""
+        tracker = self.tracker
+        actors = [_person_actor(track_id=1, x1=850, y1=300, x2=900, y2=520)]
+        tracker.update([_lbox(880, 510, half=15)], actors, frame_index=0)
+        active, _ = tracker.update(
+            [(740, 420, 765, 481, 0.9)], actors, frame_index=1
+        )
+        original_id = min(active)
+        active, _ = tracker.update(
+            [(790, 650, 852, 688, 0.9)], actors, frame_index=2
+        )
+
+        assert original_id in active
+        assert active[original_id]['age'] == 2
+        assert len(active) == 2
+
+    def test_actorless_six_point_gravity_arc_confirms_with_null_route(self):
+        """A physical object event must not depend on successful attribution."""
+        tracker = self.tracker
+        points = [
+            (880, 510, 15),
+            (752, 455, 30),
+            (650, 435, 25),
+            (550, 430, 14),
+            (235, 660, 15),
+            (52, 770, 16),
+        ]
+        active = {}
+        for frame_index, (cx, cy, half) in zip((0, 1, 2, 3, 7, 12), points):
+            active, _ = tracker.update(
+                [_lbox(cx, cy, half=half)], [], frame_index=frame_index
+            )
+
+        assert any(item['state'] == 'confirmed' for item in active.values())
+        event = tracker.get_litter_events()[0]
+        assert event['thrower_key'] is None
+
+    def test_actorless_short_linear_track_does_not_confirm(self):
+        """Missing attribution is allowed only with stronger object physics."""
+        tracker = self.tracker
+        active = {}
+        for frame_index, (cx, cy) in enumerate(((500, 300), (530, 315), (560, 330))):
+            active, _ = tracker.update(
+                [_lbox(cx, cy)], [], frame_index=frame_index
+            )
+        assert all(item['state'] == 'pending' for item in active.values())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -729,7 +801,170 @@ class TestVehiclePartAndStreakFP:
             tracker.close()
 
 
-class TestVehicleContainmentQuarantine:
+class TestTemporalVisualBridgeAndVehicleQuarantine:
+
+    def test_two_detector_anchors_allow_one_temporal_component_bridge(self):
+        """A third visible moving frame may satisfy, but not bypass, quarantine."""
+        from litterTracker import GlobalLitterTracker
+
+        tracker = GlobalLitterTracker(fps=10)
+        vehicle = _vehicle_actor(
+            track_id=5, x1=300, y1=100, x2=700, y2=600,
+        )
+        try:
+            active = {}
+            for frame_index, (cx, cy) in enumerate(((500, 300), (504, 340))):
+                frame = np.zeros((720, 960, 3), dtype=np.uint8)
+                frame[cy - 6:cy + 6, cx - 6:cx + 6] = 255
+                litter = _lbox(cx, cy, half=6)
+                active, _ = tracker.update(
+                    [litter], [vehicle], frame_index=frame_index, frame=frame,
+                    quarantined_litters=[litter],
+                )
+            litter_id = next(iter(active))
+
+            frame = np.zeros((720, 960, 3), dtype=np.uint8)
+            frame[374:386, 502:514] = 255
+            active, _ = tracker.update(
+                [], [vehicle], frame_index=2, frame=frame,
+            )
+
+            assert list(active) == [litter_id]
+            assert active[litter_id]['detector_observation_count'] == 2
+            assert active[litter_id]['history_sources'][-1] == 'visual_bridge'
+            assert active[litter_id]['state'] == 'confirmed'
+            task = tracker._smart_tasks[litter_id]
+            assert task['history_sources'] == [
+                'accepted_tracker', 'accepted_tracker', 'accepted_tracker'
+            ]
+            assert task['history_provenance'] == [
+                'detector', 'detector', 'visual_bridge'
+            ]
+            assert task['history_lineage'][-1]['independent_measurement'] is False
+        finally:
+            tracker.close()
+
+
+    @staticmethod
+    def _moving_frame(frame_index):
+        frame = np.zeros((600, 800, 3), dtype=np.uint8)
+        cx = 320 + 25 * frame_index
+        cy = 220 + 25 * frame_index
+        value = 255 if frame_index % 2 == 0 else 128
+        frame[cy - 20:cy + 20, cx - 20:cx + 20] = value
+        return frame
+
+    def test_large_seed_requires_four_visual_observations_before_confirmation(self):
+        """A large high-confidence seed may bridge, but cannot confirm early."""
+        from litterTracker import GlobalLitterTracker
+
+        tracker = GlobalLitterTracker(fps=10)
+        person = _person_actor(
+            track_id=1, x1=250, y1=80, x2=350, y2=280,
+        )
+        try:
+            active, _ = tracker.update(
+                [(300, 200, 340, 240, 0.9)],
+                [person],
+                frame_index=0,
+                frame=self._moving_frame(0),
+            )
+            litter_id = next(iter(active))
+            for frame_index in range(1, 4):
+                active, _ = tracker.update(
+                    [], [person], frame_index=frame_index,
+                    frame=self._moving_frame(frame_index),
+                )
+                assert active[litter_id]['state'] == 'pending'
+
+            active, _ = tracker.update(
+                [], [person], frame_index=4,
+                frame=self._moving_frame(4),
+            )
+            assert active[litter_id]['state'] == 'confirmed'
+            assert active[litter_id]['detector_observation_count'] == 1
+            assert active[litter_id]['history_sources'].count('visual_bridge') == 4
+        finally:
+            tracker.close()
+
+    def test_small_single_seed_cannot_start_visual_chain(self):
+        """Small objects retain the stricter two-detector single-bridge rule."""
+        from litterTracker import GlobalLitterTracker
+
+        tracker = GlobalLitterTracker(fps=10)
+        person = _person_actor(track_id=1)
+        try:
+            first = np.zeros((600, 800, 3), dtype=np.uint8)
+            first[295:305, 495:505] = 255
+            active, _ = tracker.update(
+                [_lbox(500, 300)], [person], frame_index=0, frame=first,
+            )
+            litter_id = next(iter(active))
+            second = np.zeros_like(first)
+            second[305:315, 505:515] = 128
+            active, _ = tracker.update(
+                [], [person], frame_index=1, frame=second,
+            )
+            assert active[litter_id]['age'] == 1
+            assert active[litter_id]['history_sources'] == ['detector']
+        finally:
+            tracker.close()
+
+    def test_visual_bridge_cannot_authorize_later_containment_exit_handoff(self):
+        """Synthetic evidence must not merge a later ordinary release segment."""
+        from litterTracker import GlobalLitterTracker
+
+        tracker = GlobalLitterTracker(fps=10)
+        vehicle = _vehicle_actor(track_id=5, x1=300, y1=100, x2=700, y2=600)
+        try:
+            for frame_index, (cx, cy) in enumerate(((500, 300), (504, 305))):
+                frame = np.zeros((720, 960, 3), dtype=np.uint8)
+                frame[cy - 6:cy + 6, cx - 6:cx + 6] = 255
+                litter = _lbox(cx, cy, half=6)
+                active, _ = tracker.update(
+                    [litter], [vehicle], frame_index=frame_index, frame=frame,
+                    quarantined_litters=[litter],
+                )
+            original_id = next(iter(active))
+            bridge_frame = np.zeros((720, 960, 3), dtype=np.uint8)
+            bridge_frame[304:316, 502:514] = 255
+            active, _ = tracker.update(
+                [], [vehicle], frame_index=2, frame=bridge_frame,
+            )
+            assert active[original_id]['history_sources'][-1] == 'visual_bridge'
+
+            ordinary = _lbox(540, 430, half=6)
+            active, _ = tracker.update(
+                [ordinary], [vehicle], frame_index=3,
+                frame=np.zeros((720, 960, 3), dtype=np.uint8),
+            )
+            assert len(active) == 2
+            assert active[original_id]['bbox'] != ordinary
+        finally:
+            tracker.close()
+
+    def test_stale_quarantine_track_cannot_absorb_new_release(self):
+        """A long detector gap starts a new identity even at the same location."""
+        from litterTracker import GlobalLitterTracker
+
+        tracker = GlobalLitterTracker(fps=30)
+        vehicle = _vehicle_actor(track_id=5, x1=300, y1=100, x2=700, y2=600)
+        try:
+            old = _lbox(500, 300, half=6)
+            active, _ = tracker.update(
+                [old], [vehicle], frame_index=0,
+                quarantined_litters=[old],
+            )
+            old_id = next(iter(active))
+            new = _lbox(502, 302, half=6)
+            active, _ = tracker.update(
+                [new], [vehicle], frame_index=30,
+                quarantined_litters=[new],
+            )
+            assert len(active) == 2
+            assert active[old_id]['age'] == 1
+        finally:
+            tracker.close()
 
     def test_same_carrier_comotion_remains_pending(self):
         """A vehicle part can accumulate history but can never self-confirm."""
@@ -885,6 +1120,40 @@ class TestVehicleContainmentQuarantine:
         finally:
             tracker.close()
 
+    def test_three_contained_observations_can_use_ordinary_exit_for_release(self):
+        """The first box outside the carrier completes, rather than resets, evidence."""
+        from litterTracker import GlobalLitterTracker
+
+        tracker = GlobalLitterTracker(fps=10)
+        vehicle = _vehicle_actor(
+            track_id=5, x1=300, y1=100, x2=700, y2=600,
+        )
+        try:
+            active = {}
+            for frame_index, (cx, cy) in enumerate(
+                ((500, 480), (502, 484), (504, 488))
+            ):
+                litter = _lbox(cx, cy, half=6)
+                active, _ = tracker.update(
+                    [litter], [vehicle], frame_index=frame_index,
+                    quarantined_litters=[litter],
+                )
+            litter_id, data = _get_only_litter(active)
+            assert data['vehicle_quarantine_active'] is True
+
+            # Same physical track exits below the carrier.  It supplies the
+            # fourth relative point and passes the existing displacement gates.
+            exited = _lbox(510, 640, half=6)
+            active, _ = tracker.update(
+                [exited], [vehicle], frame_index=3,
+            )
+
+            assert list(active) == [litter_id]
+            assert active[litter_id]['vehicle_quarantine_active'] is False
+            assert active[litter_id]['vehicle_quarantine_released'] is True
+        finally:
+            tracker.close()
+
     def test_contained_observation_cannot_quarantine_ordinary_track(self):
         """A containment-classification jitter starts a separate track."""
         from litterTracker import GlobalLitterTracker
@@ -952,6 +1221,74 @@ class TestLitterCandidateFilter:
         hist = [(500, 300), (650, 303)]           # huge horiz, tiny down
         drop, reason = litter_candidate_is_vehicle_fp(litter, [], prev_litter_history=hist)
         assert drop and reason == 'horizontal_streak'
+
+    def test_can_defer_horizontal_streak_until_enough_observations(self, monkeypatch):
+        """Research override defers rejection without declaring an event."""
+        from smallFunction import litter_candidate_is_vehicle_fp
+        monkeypatch.setenv("LITTER_FP_STREAK_MIN_OBSERVATIONS", "6")
+        litter = _lbox(800, 305, half=10)
+        hist = [(770, 300), (785, 303)]
+
+        drop, reason = litter_candidate_is_vehicle_fp(
+            litter, [], prev_litter_history=hist
+        )
+
+        assert not drop
+        assert reason is None
+
+    def test_deferred_streak_rejects_implausible_identity_jump(self, monkeypatch):
+        """Deferral cannot bridge a large normalized jump to another object."""
+        from smallFunction import litter_candidate_is_vehicle_fp
+        monkeypatch.setenv("LITTER_FP_STREAK_MIN_OBSERVATIONS", "6")
+        monkeypatch.setenv(
+            "LITTER_FP_STREAK_DEFER_MAX_STEP_DIAGONALS_PER_FRAME", "1.1"
+        )
+        litter = _lbox(800, 305, half=10)
+        hist = [(500, 300)]
+
+        drop, reason = litter_candidate_is_vehicle_fp(
+            litter, [], prev_litter_history=hist, prev_litter_missed=0
+        )
+
+        assert drop
+        assert reason == 'horizontal_streak'
+
+    def test_deferred_streak_normalizes_for_source_frame_gap(self, monkeypatch):
+        """Sparse inference uses elapsed source frames, not processed calls."""
+        from smallFunction import litter_candidate_is_vehicle_fp
+        monkeypatch.setenv("LITTER_FP_STREAK_MIN_OBSERVATIONS", "6")
+        monkeypatch.setenv(
+            "LITTER_FP_STREAK_DEFER_MAX_STEP_DIAGONALS_PER_FRAME", "1.1"
+        )
+        litter = _lbox(800, 305, half=10)
+        hist = [(740, 300)]
+
+        drop, reason = litter_candidate_is_vehicle_fp(
+            litter, [], prev_litter_history=hist, prev_litter_missed=2
+        )
+
+        assert not drop
+        assert reason is None
+
+    def test_deferred_streak_still_drops_at_minimum_observations(self, monkeypatch):
+        """The override delays the gate; it does not disable it."""
+        from smallFunction import litter_candidate_is_vehicle_fp
+        monkeypatch.setenv("LITTER_FP_STREAK_MIN_OBSERVATIONS", "6")
+        litter = _lbox(800, 305, half=5)
+        hist = [
+            (500, 300),
+            (560, 301),
+            (620, 302),
+            (680, 303),
+            (740, 304),
+        ]
+
+        drop, reason = litter_candidate_is_vehicle_fp(
+            litter, [], prev_litter_history=hist
+        )
+
+        assert drop
+        assert reason == 'horizontal_streak'
 
     def test_keeps_recent_horizontal_release_from_vehicle_edge(self):
         """A bottle that starts inside a vehicle box may initially fly almost horizontally."""

@@ -504,6 +504,25 @@ def paired_bootstrap_difference(
     }
 
 
+def paired_binary_changes(
+    first: Sequence[Mapping[str, Any]],
+    second: Sequence[Mapping[str, Any]],
+    metric: str,
+) -> dict[str, Any]:
+    """Return case-level gains/losses for ``first`` relative to ``second``."""
+    first_map = {str(row["event_key"]): bool(row[metric]) for row in first}
+    second_map = {str(row["event_key"]): bool(row[metric]) for row in second}
+    keys = sorted(set(first_map).intersection(second_map))
+    gains = [key for key in keys if first_map[key] and not second_map[key]]
+    losses = [key for key in keys if second_map[key] and not first_map[key]]
+    return {
+        "support": len(keys),
+        "gains": gains,
+        "losses": losses,
+        "net": len(gains) - len(losses),
+    }
+
+
 def paired_sign_flip_test(
     first: Sequence[Mapping[str, Any]],
     second: Sequence[Mapping[str, Any]],
@@ -569,6 +588,18 @@ def _ci(value: Sequence[float] | None) -> str:
     return "N/A" if value is None else f"{value[0]:.3f}–{value[1]:.3f}"
 
 
+def _cohort_description(report: Mapping[str, Any]) -> str:
+    primary = report["primary"]
+    return (
+        f"主分析只有 {primary['events']} 件可用事件（direct vehicle "
+        f"{primary['route_counts'].get('direct_vehicle', 0)}、person→vehicle "
+        f"{primary['route_counts'].get('person_vehicle', 0)}）。這是 "
+        f"{report['data']['ground_truth_events']} 件人工事件中，同時具有 reviewed GT、"
+        "confirmed sidecar、B0/B1、release hypothesis 與 actor track mapping 的 "
+        "strict+moderate 子集。"
+    )
+
+
 def markdown_report(report: Mapping[str, Any]) -> str:
     primary = report["primary"]
     models = primary["models"]
@@ -580,7 +611,7 @@ def markdown_report(report: Mapping[str, Any]) -> str:
         "",
         "## 結論",
         "",
-        f"主分析只有 {primary['events']} 件可用事件（direct vehicle {primary['route_counts'].get('direct_vehicle', 0)}、person→vehicle {primary['route_counts'].get('person_vehicle', 0)}）。這是63片中同時具有 reviewed GT、confirmed sidecar、B0/B1、release hypothesis 與 actor track mapping 的 strict+moderate 子集。",
+        _cohort_description(report),
         "",
         "`-log P(correct association)` 可以計算，但目前樣本只能視為可行性研究，不能用來宣稱通用公式已成立。尤其沒有 reviewed NULL 與真正 negative clips，無法驗證自動拒判的安全性。",
         "",
@@ -632,7 +663,7 @@ def markdown_report(report: Mapping[str, Any]) -> str:
         )
     lines.extend([
         "",
-        "Actor top-1 明顯高於 exact top-1，表示主要瓶頸是精確 release frame，而非所有 actor 排序都失效；但 person 子集只有6件，仍不足以估 person 專用係數。",
+        f"Actor top-1 明顯高於 exact top-1，表示主要瓶頸是精確 release frame，而非所有 actor 排序都失效；但 person 子集只有 {dtd['summary_by_actor_type']['person']['events']} 件，仍不足以估 person 專用係數。",
         "",
         "## D+T+A 係數穩定性",
         "",
@@ -653,9 +684,13 @@ def markdown_report(report: Mapping[str, Any]) -> str:
         "## 第三參數方向的增益檢驗",
         "",
         f"- Exact accuracy：D+T+A − D+T = {primary['comparisons']['dtd_minus_dt_exact']['mean_first_minus_second']:.3f}，95% CI {_ci(primary['comparisons']['dtd_minus_dt_exact']['bootstrap_95ci'])}。",
+        f"- Exact gain/loss：{len(primary['comparisons']['dtd_minus_dt_exact_changes']['gains'])}/{len(primary['comparisons']['dtd_minus_dt_exact_changes']['losses'])}，net={primary['comparisons']['dtd_minus_dt_exact_changes']['net']}。",
+        f"- Gains：{', '.join(primary['comparisons']['dtd_minus_dt_exact_changes']['gains']) or 'none'}。",
+        f"- Losses：{', '.join(primary['comparisons']['dtd_minus_dt_exact_changes']['losses']) or 'none'}。",
         f"- Choice NLL：D+T+A − D+T = {primary['comparisons']['dtd_minus_dt_nll']['mean_first_minus_second']:.3f}，95% CI {_ci(primary['comparisons']['dtd_minus_dt_nll']['bootstrap_95ci'])}；負值代表加入方向較好。",
         f"- 對上述逐事件 NLL 差做exact paired sign-flip test：單尾 p={primary['comparisons']['dtd_minus_dt_nll_sign_flip']['one_sided_p']:.4f}。",
         f"- 單調約束版 D+T+A − D+T NLL = {primary['comparisons']['monotone_dtd_minus_dt_nll']['mean_first_minus_second']:.3f}，95% CI {_ci(primary['comparisons']['monotone_dtd_minus_dt_nll']['bootstrap_95ci'])}，單尾sign-flip p={primary['comparisons']['monotone_dtd_minus_dt_nll_sign_flip']['one_sided_p']:.4f}。",
+        "- 41/58 目標以 exact attribution 為準；NLL 改善不能抵銷 top-1 exact regression。若 exact gain/loss 的 net < 0，此方向拒絕作為 route selector。",
         "",
         "## Selective coverage（不能視為 NULL 驗證）",
         "",
@@ -821,6 +856,9 @@ def analyze_scope(
             "dtd_minus_dt_exact": paired_bootstrap_difference(
                 dtd_predictions, dt_predictions, "exact_top1",
                 samples=samples, seed=SEED + 605,
+            ),
+            "dtd_minus_dt_exact_changes": paired_binary_changes(
+                dtd_predictions, dt_predictions, "exact_top1"
             ),
             "dtd_minus_dt_nll": paired_bootstrap_difference(
                 dtd_predictions, dt_predictions, "choice_nll",

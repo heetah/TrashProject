@@ -217,6 +217,33 @@ def test_candidate_contains_litter_history_and_allowed_raw_actor_tracklets():
     assert record["routes"][0]["selected"] is True
 
 
+def test_candidate_litter_history_adds_provenance_without_changing_old_shape():
+    task = {
+        "history": [(10.0, 20.0)],
+        "history_frames": [5],
+        "history_boxes": [(8, 18, 12, 22)],
+        "history_confidences": [0.8],
+        "history_sources": ["accepted_tracker"],
+        "history_provenance": ["visual_bridge"],
+        "history_lineage": [{
+            "observation_id": "litter:2:frame:5:visual_bridge",
+            "source": "visual_bridge",
+            "parent_observation_id": "litter:2:frame:4:detector",
+            "independence_group_id": "litter:2:frame:4:detector",
+            "derived": True,
+            "independent_measurement": False,
+        }],
+    }
+    event = {"litter_id": 2, "backtrack": {"route_id": "null"}}
+    record = build_candidate_record(
+        task, event, [RouteCandidate("null", 7.0, route_type="null")], "case.mp4"
+    )
+
+    assert record["litter_history"][0]["provenance"] == "visual_bridge"
+    assert record["litter_history"][0]["lineage"]["independent_measurement"] is False
+    assert record["resolver_input"]["history_sources"] == ["accepted_tracker"]
+
+
 def test_jsonl_roundtrip_and_half_away_from_zero(tmp_path):
     records = [
         build_run_record("a.mp4", None, 10, 3),

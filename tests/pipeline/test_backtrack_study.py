@@ -115,7 +115,12 @@ from pipeline.backtrack.trajectory import ReleaseHypothesis
 from pipeline.backtrack.costs import ActorObservation
 import numpy as np
 from pipeline.backtrack.sidecar import build_candidate_record
-from pipeline.backtrack.study import StudyConfig, build_manifest, replay_candidates
+from pipeline.backtrack.study import (
+    StudyConfig,
+    build_manifest,
+    load_candidate_records,
+    replay_candidates,
+)
 from pipeline.backtrack.annotations import AnnotationError
 
 
@@ -150,6 +155,25 @@ def _record():
 def test_sidecar_keeps_replayable_resolver_input():
     record = _record()
     assert record["resolver_input"]["actor_frames"] == _task()["actor_frames"]
+
+
+def test_load_candidate_records_discovers_isolated_batch_cases(tmp_path):
+    case_dir = tmp_path / "case_7"
+    case_dir.mkdir()
+    sidecar = case_dir / "litter_case_7_annotated_backtrack_candidates.jsonl"
+    sidecar.write_text(
+        "\n".join([
+            '{"schema":"smart-backtrack-candidates/v1","record_type":"run"}',
+            '{"schema":"smart-backtrack-candidates/v1","record_type":"candidate",'
+            '"event":{"litter_id":7}}',
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    records = load_candidate_records(tmp_path)
+
+    assert [row["record_type"] for row in records] == ["run", "candidate"]
+    assert records[1]["event"]["litter_id"] == 7
 
 
 def test_manifest_is_grouped_and_replay_is_deterministic():

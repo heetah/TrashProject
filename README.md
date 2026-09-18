@@ -127,6 +127,17 @@ batch、batch repair 與 TensorRT smoke test 共用同一個 input builder。
 7. Quarantine 只能由同一載體座標系中連續下落軌跡解除；離開載體的普通候選改建獨立 pending 軌跡，禁止隔離歷史污染正常確認。
 8. `GlobalLitterTracker` trajectory、displacement、temporal confirmation。
 
+稀疏 detector observation 可使用兩種有界 temporal evidence，但都不能自行建立軌跡：
+
+- 已有兩個 detector anchors 的 quarantine 軌跡，允許下一幀使用一次 grayscale change-component 補點，以完成至少三個同載體 observation；補點不增加 detector observation count，也不能授權後續 containment→ordinary identity handoff。
+- 單一 detector seed 只有在 bbox 至少占畫面 `0.001`、連續取得四個 prediction-gated change-components，且最後仍通過 holding、trajectory、displacement 與 stationary gates 時才可確認。小物件不能使用這條鏈。
+
+Pending bbox 尺寸劇變時，短 gap association 另以 constant-velocity residual／bbox diagonal
+檢查 motion continuity；完整 missed-window 後的 quarantine observation 必須建立新 identity，
+避免舊車身候選吸收後來真正的 release。沒有可歸因 actor 的候選只有在至少五個 observation、
+具有內部 apex/descent 的強重力弧線且通過其餘物理 gate 時，才能確認 object event；下游仍保留
+`NULL` route，不因事件確認而強制歸因。
+
 近車候選仍會先排除 vehicle-contained、共動與純水平條紋；唯一例外是剛由車框內明顯脫離的前三個 observation。當該軌跡起點確實在同一車框內、終點已脫離，會保留該車作為 thrower fallback；這不是最近車輛配對，仍須通過 vehicle-relative、物理與 temporal confirmation gate。
 
 只有 `state == "confirmed"` 才是垃圾事件。Pending candidate 不會畫成最終違規。
@@ -168,6 +179,26 @@ frame尺度限制逐幀 detector observation 的陳舊程度。距離／不確�
 有界 Kalman horizon 及完整 `NULL` route 仍保留，避免 forced match。
 
 Backtrack sidecar 用於標註、成本校正與 gate 分析。沒有人工 reviewed ground truth 時，只能報告 candidate coverage/resolved/dustbin，不能宣稱歸因準確率。
+
+2026-09-15 已將被後續研究取代的一次性 Python 工具與測試移出 active tree，封存於
+`artifacts/research_python_archive_20260915.tar.gz`。下文若提到這些歷史工具，代表既有
+研究方法與結果；如需重跑，先在隔離目錄解開封存檔。Production、目前 48/58 研究成果、
+Phase 0/1A、mask diagnostics、camera holdout 與 release-validation 工具不在清理範圍。
+
+Visible segmentation mask 與 bbox overlap 目前只作研究診斷，權重為 0。它們只能描述
+影像中的可見包含／鄰近關係，不能等同真實深度，也不能直接判定垃圾來源。獨立的
+歷史的 `build_ordinal_occlusion_package.py` 曾建立匿名 A/B 車輛遮擋標註 queue；原始碼
+現已封存，既有研究結論保留。該 queue 不讀取
+route、assignment、release 或 ground-truth actor，但目前仍由事件 sidecar 取樣且使用模型
+bbox proposal，因此只適合可行性研究。未取得單一複核者的盲化重標一致性、可驗證相機群組
+與 camera-separated holdout 前，不得把 ordinal 訊號加入 production costs。
+
+Release hypothesis 另有已完成的獨立可識別性稽核；其一次性
+`analyze_release_identifiability.py` 已封存。該研究只讀 resolver sidecar，統計每個事件的
+觀測點數、hypothesis 範圍、協方差與搜尋截斷。最新 64 筆 records 中，36 筆只有兩個
+觀測點、28 筆的反推搜尋仍被計算上限截斷；兩點資料不能唯一識別 birth 前軌跡。因此
+這兩類事件不能用未驗證的 release cost 強行配對，未來應先建立獨立 camera holdout 的
+不確定性／abstention 驗證。
 
 ### Online pseudo-homography calibration
 
@@ -371,6 +402,7 @@ MP4 片段，並附一份列出違規、關聯車輛、車牌與審核資料的 
 | `STGCN_WEIGHT_PATH` / `STGCN_CONFIG_PATH` | `modules_weight/...` / `mmaction2/...` | STGCN checkpoint 與 config |
 | `PLATE_MODEL_PATH` | `modules_weight/best-licnese-plate.pt` | 車牌 detector 權重 |
 | `PREFER_TENSORRT` | `1` | 優先嘗試同模型的 matching `.engine`，失敗仍依既有候選回退 |
+| `RTDETR_IMGSZ` | 空值 | 選用的 PyTorch RT-DETR inference size；空值沿用 checkpoint/runtime 預設，固定 shape engine 不受此值改變 |
 | `PIPELINE_BATCH` | `8` | Pipeline batch size |
 | `PIPELINE_QUEUE_SIZE` | `8` | Prepared frame 有界 queue；預設保留一個 batch，避免高解析影片無界佔用 RAM |
 | `PIPELINE_PREPARE_4C` | `1` | 在背景 reader 預先建立 RT-DETR 4-channel input；設 `0` 回到主推論執行緒即時建立 |
@@ -391,6 +423,7 @@ MP4 片段，並附一份列出違規、關聯車輛、車牌與審核資料的 
 | `MOTION_MIN_COMPONENT_AREA` | `4` | Litter motion evidence 的最小 component 面積 |
 | `SMART_BACKTRACK` | `1` | Smart attribution enable |
 | `SMART_BACKTRACK_SIDECAR` | `0` | Research candidate sidecar；需明確設 `1` 啟用 |
+| `SMART_BACKTRACK_MASK_DIAGNOSTICS` | `0` | 只記錄 observed YOLO-Seg mask 與 raw litter bbox 的純量關係；不進入成本、route 或 NULL 判定 |
 | `SMART_BACKTRACK_STUDY_STAGE` | `full` | Research ablation stage；production 預設不變 |
 | `SMART_BACKTRACK_RAW_PREFIX` | `1` | confirmed event 才能使用 pre-postprocessing RT-DETR bbox 補 release trajectory；不參與 event confirmation |
 | `SMART_BACKTRACK_DT_DISTANCE_WEIGHT` | `1.0` | D+T stage 的 gate-normalized distance weight |
@@ -458,7 +491,7 @@ MP4 片段，並附一份列出違規、關聯車輛、車牌與審核資料的 
 | `LITTER_VEHICLE_QUARANTINE_MIN_DOWNWARD_STEPS` | `2` | 解除隔離前至少連續向下的 step 數 |
 | `LITTER_VEHICLE_QUARANTINE_MAX_GAP_SEC` | `0.35` | 隔離證據的最大 detector 中斷；超過後重置證據段，避免將無關 bbox 接成落下軌跡 |
 | `LITTER_CANDIDATE_SIDECAR` | `0` | 研究用逐 candidate JSONL，記錄 gate reason、tracker ID 與可重現設定；不供前端或 ground truth 使用 |
-| `LITTER_CANDIDATE_DEDUP` | `0` | 實驗性同幀 IoU 去重；目前 replay 未採用（未增加正確 confirmed 且 safety proxy 惡化） |
+| `LITTER_CANDIDATE_DEDUP` | `0` | 實驗性同幀 IoU 去重；2026-09-12 僅與 streak probation 候選組合通過 58 正片 development replay，缺 reviewed negatives／camera holdout，production 仍關閉 |
 | `LITTER_CANDIDATE_DEDUP_IOU` | `0.5` | 同幀 candidate 去重 IoU 門檻；僅在 `LITTER_CANDIDATE_DEDUP=1` 時生效 |
 | `LITTER_CONFIRM_REQUIRE_BIRTH_ACTOR` | `0` | 8/27 recovery profile 允許 actor 在垃圾首個 observation 後才被偵測到；confirm 當下仍須有 actor 且通過其餘證據 gates |
 | `LITTER_MIN_CONFIRM_AGE_VEHICLE` | `2` | vehicle/scooter thrower 的最少 observation 次數；短軌跡須通過尺寸正規化絕對位移或「起點近 actor、終點已脫離」證據，兩點 fast-drop 另須 ≥35 px downward |
@@ -467,6 +500,8 @@ MP4 片段，並附一份列出違規、關聯車輛、車牌與審核資料的 
 | `LITTER_MAX_HORIZ_TO_DOWN_RATIO_VEHICLE` | `10` | vehicle thrower 水平／向下位移最大比例，保留極端水平滑動抑制 |
 | `LITTER_MIN_VEHICLE_RELATIVE_SEPARATION` | `0` | 關閉載體車輛相對分離 hard gate；相對分離仍可保留為診斷資料 |
 | `LITTER_FP_STREAK_RATIO` | `10` | 前處理水平 streak 與向下位移比例門檻 |
+| `LITTER_FP_STREAK_MIN_OBSERVATIONS` | `2` | 包含本幀的最小 streak 判決 observation 數；`2` 保持 production 行為，較大值只延後拒絕且不能直接 confirmation |
+| `LITTER_FP_STREAK_DEFER_MAX_STEP_DIAGONALS_PER_FRAME` | `1.1` | probation 期間相鄰候選的最大尺度正規化跳躍：`px / (source-frame × current-bbox-diagonal-px)`；只在 observation 門檻大於 `2` 時影響結果，屬未獨立校正研究值 |
 | `LITTER_ALLOW_SHAKE_CANDIDATES` | `1` | camera-shake frame 的 candidate 仍提交給下游 motion/holding/tracker gates |
 | `OUTPUT_ROOT` | `.` | Output directory；建議明確設為 `output` |
 
@@ -478,7 +513,8 @@ MP4 片段，並附一份列出違規、關聯車輛、車牌與審核資料的 
 ### 反追蹤研究 replay
 
 `scripts/backtrack_study.py` 只重播 confirmed event sidecar 內的 frozen
-resolver input；不重跑 detector，也不改變 litter confirmation。先由新 sidecar
+resolver input；不重跑 detector，也不改變 litter confirmation。`--candidates`
+可接受單一 JSONL，或遞迴尋找 production batch `case_<id>/` 內的 sidecar。先由新 sidecar
 建立不可變 group split，再只在 development/validation 調參，最後才讀 test：
 
 ```bash
@@ -490,6 +526,12 @@ conda run -n rtdetr python scripts/backtrack_study.py replay \
   --config artifacts/distance_time.json --split validation \
   --output artifacts/distance_time_validation.jsonl
 ```
+
+多組 frozen replay 完成後，歷史研究曾用已封存的
+`report_backtrack_route_ablation.py` 合併相同 58 案 readiness/paired comparison，
+並輸出 accepted-event 的 GT route rank、cost gap 與 `C_BA/C_AC/C_BC` raw feature
+拆解。若來源 metadata 無法建立獨立 camera group，結果只能標為 development
+characterization，不得宣稱 validation/test accuracy 或修改 production weight。
 
 固定案例 manifest 可用 shard runner 重跑；每個 worker 寫獨立 TSV，且明確
 啟用 compact research sidecar：
@@ -525,10 +567,12 @@ conda run -n rtdetr python scripts/calibrate_litter_postprocess.py \
 19/63 confirmed clip，paired gain=1/loss=0，Wilson 95% CI 分別為 13.59%--34.66%
 與 12.25%--32.77%。未驗證 confirmed track 14→14，但沒有 negative clip，故這只是
 safety proxy，不能宣稱 false-positive rate 或普適最佳門檻；event annotations 的
-`review_state` 目前仍應由人工確認（工具會在報告中標出 58 筆未 review）。
+`review_state` 在當時仍未寫入；該 metadata 遺漏已於 2026-09-13 依人工複核者確認補正。
 
-`exit_code=0` 只代表 pipeline 完成。無人工 reviewed route 的案例只能比較
-candidate coverage、route 變化與 margin，不可宣稱 attribution accuracy。
+`exit_code=0` 只代表 pipeline 完成。58 筆既有正片事件已由唯一負責人確認先前完成
+人工複核，並於 2026-09-13 將遺漏的 `review_state` metadata 更正為 `reviewed`；此更正
+沒有改動 event、release、actor bbox、route 或 ID。其餘未經人工 reviewed route 的資料
+仍只能比較 candidate coverage、route 變化與 margin，不可宣稱 attribution accuracy。
 
 2026-08-26 的研究 recovery replay（完整 63 部）使用 sidecar 記錄的放寬門檻，
 得到 41/63 confirmed clips（usable 41/58，Wilson 95% CI 52.75%--75.67%），達到
@@ -538,6 +582,33 @@ candidate coverage、route 變化與 margin，不可宣稱 attribution accuracy�
 自動開罰安全性。完整命令、paired CI 與原始回滾方式記於
 `versions/2026-08-26_codex_confirmation_recovery_replay.md`；機器可讀結果位於
 `artifacts/litter_postprocess_calibration/recovery_horiz1_full_20260826/`。
+
+2026-09-14 的 58 個 reviewed positive clips 完整 paired regression 使用 production
+RT-DETR 權重，以及 `LITTER_CANDIDATE_DEDUP=1`、
+`LITTER_FP_STREAK_MIN_OBSERVATIONS=6` 的 streak probation 研究設定，
+assignment-conditioned accepted event match
+由 41/58 提升至 45/58（77.59%，Wilson 95% CI 65.34%--86.41%），新增案例為
+23、30、69、75，accepted-event loss=0。58/58 pipeline jobs 完成且輸出 MP4 皆可解碼；
+逐案結果與鎖定 manifest 位於 `artifacts/target45_full_20260913/readiness_v2/` 及
+`artifacts/target45_full_20260913/experiment_manifest_v2.json`。這是 assignment-conditioned
+event sensitivity，不是 detector-only recall；正樣本資料不能估 precision/FPR，且目前沒有
+獨立 camera-group holdout、reviewed negative set 或 plate OCR ground truth，因此不可據此宣稱
+production enforcement ready。
+
+同日的 development-only cascade 保留上述 primary 輸出，並在 primary
+`confirmed_event_count` 不在 `[1, 3]` 時選用 alternate 4-channel checkpoint 的
+1216-pixel secondary 結果。選擇規則只讀模型輸出，不讀人工標註；一次性的
+`build_litter_cascade_view.py` 已隨該研究封存，既有 evidence 與版本紀錄仍保留。
+
+完整 58 案得到 50/58 assignment-conditioned accepted event matches（86.21%，
+Wilson 95% CI 75.07%--92.84%），相對 45/58 新增 18、34、135、143、193，loss=0；
+route correctness 為 33/58。這不是 production 預設或 enforcement release：觸發規則與
+secondary 尺度均在同一 positive development cohort 選定，尚缺 reviewed negatives、
+independent camera-group holdout 與 plate OCR ground truth；cascade 另新增四個未 accepted
+的 exploratory confirmations，沒有人工負樣本可判定是否為 false positive。證據位於
+`artifacts/target50_full_20260914/cascade_readiness/`、
+`artifacts/target50_full_20260914/cascade_paired/` 與
+`output/target50_cascade_composite_20260914/cascade_selection.jsonl`。
 
 將人工 actor ID 表與 recovery sidecar 對齊，可使用：
 
@@ -578,8 +649,68 @@ release gate。沒有 reviewed event labels、reviewed negative set 或獨立攝
 23/58（39.66%，Wilson 95% CI 28.09%--52.51%）。1.0 秒 release replay 為
 25/58，但 paired gain/loss=3/1、exact p=0.625，且 event match 有退化；0.5 秒為
 23/58、gain/loss=2/2。兩者均未通過 promotion gate，production 參數未變。
-此外 58 筆 event annotation 仍是 `unreviewed`，並缺 reviewed negatives 與跨攝影機
-holdout，因此上述數值只能作 provisional development evidence，不能作 85% 上線聲明。
+上述 58 筆 event annotation 的 `review_state` 已於 2026-09-13 依唯一人工複核者的確認
+更正為 `reviewed`。這是 metadata 補正，不是重新盲標或獨立複核；資料仍缺 reviewed
+negatives 與跨攝影機 holdout，因此上述數值只能作 development evidence，不能作 85%
+上線聲明。
+
+2026-09-14 的 Smart Backtrack Phase 0 新增逐點 observation provenance/lineage 診斷。
+既有 `history_sources=accepted_tracker/raw_rtdetr_recovered` 保持相容；新增
+`history_provenance` 區分 `detector`、`visual_bridge`、raw recovery 與舊資料未知來源，
+`history_lineage` 則標出父觀測、independence group 與是否為獨立 measurement。所有
+history 平行陣列在排序及 raw prefix 補點後維持同長對齊。Resolver 不讀新欄位；相同
+task 加入或移除這些欄位時，route、person、vehicle 與全部 costs 必須完全相同。這只是
+後續「釋放狀態與多假設平滑」研究的資料合約，沒有新增權重、門檻或 production 決策。
+Phase 1A 另加入無 production caller 的純數學模組，僅提供嚴格 Gaussian NLL、caller-defined
+不規則時間 prior mass 與包含 NULL 的 log-sum-exp route evidence；它不選 route、不讀
+lineage 自動相乘觀測，也不把 posterior 稱作準確率。
+
+2026-09-13 以較新 streak6/jump11/dedup frozen sidecar 執行 16 組單因子反追蹤研究。
+baseline 為 31/58 exact route；`direct_vehicle_penalty=1.1` 單獨增加 case 194，
+`release_window_prior_weight=0.2` 單獨增加 case 41，兩者合併為 33/58（56.90%，
+Wilson 95% CI 44.12%--68.82%），在 41 筆 accepted event 中為 33/41（80.49%，
+Wilson 95% CI 65.99%--89.77%），相對 baseline gain/loss=2/0。因調參與評估使用同一批
+development 正片，且沒有 reviewed negatives／camera holdout，兩項只保留為 fine-tune
+候選，production 預設不變。confirmation-time actor hint 另經 10 組 frozen rerank 驗證後
+出現淨退化，已拒絕且未接入 production。combined 的 strict match 另由 16 降至 13、
+moderate 由 25 增至 28；目前 event match 使用 selected route 的 release frame/point，
+所以 41/58 是 assignment-conditioned match，不是純 detector sensitivity。
+
+後續單幀 wrist-release 研究重用現有 YOLO-Pose、沒有新增 CNN，並在同輪 10 案 sidecar
+上鎖定 12 組 `distance scale × weight` replay。12/12 均未修正預先指定的 case 141/16；
+8 組反而使正確 control case 194 退化，另有一組使 case 42 strict→moderate。該方向已依
+預設 rollback gate 完整移除，production/data-path/config 均不保留 wrist 欄位。完整負面
+證據位於 `artifacts/wrist_release_study_20260913/`。下一方向只先研究 YOLO-Seg temporal
+mask 的局部遮擋順序，禁止用「畫面較低／框較大」充當深度；該簡化規則已出現 gain 2、
+loss 1（破壞 case 25）。
+
+同日後續研究加入預設關閉的 `SMART_BACKTRACK_MASK_DIAGNOSTICS`。它只在原始
+YOLO-Seg polygon 被丟棄前，計算 mask overlap、bbox containment、mask fill ratio 與
+尺度正規化 signed distance；只接受 `observed=True` 的 `seg_track/seg_predict`，不使用
+cache/Kalman，也不保存 polygon 或 bitmap。診斷資料完全不進 resolver。case 9 顯示錯車
+bbox 可覆蓋垃圾約 90%，但 visible mask overlap 為 0，確認 bbox proximity 會產生假支持；
+case 168 則顯示垃圾在人工正確背景車之前的另一車 visible mask 內，證明單幀 mask 不能
+直接當「深度」或加權來源。case 67 在每幀 actor inference 的獨立 run 中改為正確 route，
+但 mask overlap 仍為 0，改善來源是 detection cadence/release evidence，不是 mask。
+目前沒有獨立 reviewed ordinal front/behind 標註，因此 temporal occlusion 仍只具研究潛力，
+尚未提升或重新宣稱 58 案準確率。
+
+已完成的 RT-DETR intermediate 研究使用預設不接入 production 的 `.pt` 中間張量
+驗證器；一次性 `analyze_rtdetr_intermediates.py` 與其輔助模組已封存。該研究攔截
+query-aligned encoder/final-decoder box/score 與 final-query
+embedding，以 frozen confirmed-litter history 作 silver temporal label；輸出 manifest、逐案例
+執行紀錄、逐 query/pair CSV 與 clip-cluster bootstrap 摘要。silver label 不是人工物件身分真值，
+且工具不支援未額外匯出 hidden bindings 的 TensorRT engine，因此結果只能決定是否值得進入
+camera-separated 研究，不能直接設定歸因加分或宣稱準確率提升。
+
+第二階段 query-embedding 驗證只讀取 `resolver_input.history_sources` 中的
+`accepted_tracker`，排除 `raw_rtdetr_recovered`；用前三個 accepted query 以不等間隔
+OLS 常速模型預測第四點，並在 candidate universe、幾何距離與 embedding 距離凍結後才
+揭露 target 的一對一 IoU label。缺少 positive query 仍計為失敗；primary 每條軌跡只取
+第一個 holdout，rolling 只作敏感度描述。現有 62 條軌跡只有 5 條具四個 accepted 點，
+production score floor 下 median candidate count 為 1，因此 embedding 沒有增量空間；
+研究 floor 的 2 rescue / 0 harm 只有 5 clips（clip sign-flip `p=0.25`）。本方向目前維持
+production weight 0，不能解讀為 58 案準確率提升。
 
 車輛短軌跡 safety guard 的最終 58 案重跑維持 32/58 accepted events 與 23/58
 exact routes，paired gain/loss 皆為 0/0；case 42 的一筆 exploratory confirmation 被移除，
@@ -638,7 +769,8 @@ conda run -n rtdetr python scripts/analyze_attribution_log_likelihood.py \
 並提供所有 penalty 係數不得為正的物理單調約束版本。主結果使用 leave-one-event-out，
 並分開報 actor top-1、release hit 與兩者同時正確的 exact top-1。它只評估第一條
 release→actor edge；沒有 reviewed NULL／negative clip 時，risk-coverage 不可宣稱為
-正式 NULL safety 或自動開罰 threshold。
+正式 NULL safety 或自動開罰 threshold。報告另列相對 D+T 的逐事件 exact gain/loss；
+即使 NLL 改善，只要目標 exact top-1 退化，就不能升級為 route selector。
 
 純 Kalman/RTS trial 可在 JSON 另外掃描
 `kalman_process_noise_scale`、`kalman_measurement_noise_scale` 與
@@ -660,6 +792,27 @@ frame，`H0 = T_B1 - T_B0`，零成本可疑窗為
 
 建立人工盲標 queue 時使用 `scripts/backtrack_annotations.py init`；輸出的
 annotation schema 不複製 selected route、cost、rank 或 release prediction。
+
+要把既有事件標註整理為正式 release validation 複核包，可使用
+`scripts/build_release_validation_package.py`。工具會對正片原始影片建立 SHA-256、產生
+兩位 reviewer 的空白事件表與獨立 adjudication 欄位，並把舊的 unreviewed seed 隔離在
+`adjudication_only/`。指定的 normal 資料只會成為
+`unreviewed_negative_candidate`；資料夾名稱不會被提升為 ground truth。三幀視覺 hash
+只提供同攝影機人工分組的檢索建議，也永遠保持 unreviewed：
+
+```bash
+conda run -n rtdetr env PYTHONPATH=scripts python \
+  scripts/build_release_validation_package.py \
+  --ground-truth runs/grounding_truth \
+  --positive-source-root /path/to/original/litter/clips \
+  --negative-candidate-root /path/to/normal/candidates \
+  --output artifacts/release_validation_YYYYMMDD
+```
+
+目前由唯一負責人完整看片並填寫 primary reviewer 表即可建立 reviewed event、route、
+NULL 與 negative labels；secondary/adjudication 表只保留給未來可選的獨立稽核，不是現行
+人力要求。攝影機分組仍須由該負責人確認後才能凍結 development/validation/test，且必須
+以 camera group 切分，禁止同一攝影機洩漏到不同 split。
 
 ### Release 時間與距離成本優化研究
 
@@ -684,6 +837,24 @@ python3 scripts/create_backtrack_slides.py
 與同名 `.odp`。內容比較 D+T 舊版與 release-synchronized 新版，並涵蓋
 Kalman/RTS、confidence/covariance、C_BA/C_AC/C_BC、route cost、Min-Cost Flow、
 NULL、margin 與 replay evidence。
+
+### 優化版反追蹤技術說明簡報（2026-09-15）
+
+以 `08_27 專題進度回報.pptx` 的白底、細線、灰階卡片與右上角「反向追蹤」標籤為
+版型參考，說明目前優化版（研究候選）的 Kalman/RTS、release hypotheses、
+C_BA/C_AC/C_BC、Gaussian/Mahalanobis、Min-Cost Flow、NULL、provenance/lineage
+與 pseudo-homography 邊界。簡報中的 48/58 是 frozen development replay，並明確
+標示尚未通過 85% 與獨立 holdout gate；不代表 production accuracy。
+
+可用下列命令重建 13 頁簡報（需要系統的 LibreOffice 與 ffmpeg）：
+
+```bash
+/usr/bin/python3 artifacts/optimized_backtrack_presentation_20260915/build_deck.py
+```
+
+輸出為 `artifacts/optimized_backtrack_presentation_20260915/優化版反追蹤算法_技術說明_2026-09-15.pptx`；
+同目錄的 `rendered_svg/`、`rendered_png/` 與 `preview_v2/` 僅供版面檢查，沒有任何
+production caller。
 
 ## 輸出
 
@@ -748,6 +919,18 @@ conda run -n rtdetr python -m pytest -q \
 ```
 
 大型模型與影片測試必須明確列出使用的 weights、clip、環境變數與輸出結果。MP4 可解碼只代表輸出容器正常，不代表事件或歸因正確。
+
+### Backtrack 候選空間稽核（歷史研究）
+
+研究成本函數前，曾以已封存的 `analyze_route_oracle_gap.py` 確認正確 actor tuple 是否
+存在於同一 confirmed event 的 valid routes。該研究沿用 product-readiness 的
+fixed-denominator、same-run actor mapping 與 strict/moderate event-match 規則；結果與
+限制保留在版本紀錄，工具不再位於 active `scripts/`。
+
+輸出的 `frozen_match_candidate_oracle_correct` 只回答「凍結目前 event match 後，重排既有
+valid routes 的理論上限」，不是可部署準確率，也不能用來選取真實路徑。若此上限仍低於
+目標，繼續調整 route cost 無法達標，必須先改善 actor mapping、candidate generation 或
+event confirmation。
 
 ## Git 開發流程
 

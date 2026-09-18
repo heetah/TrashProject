@@ -5,6 +5,7 @@ import os
 import queue
 import threading
 import time
+import cv2
 import numpy as np
 from collections import deque
 from scipy.spatial import distance
@@ -13,7 +14,12 @@ from pipeline.calibration import (
     CalibrationPhase1Config,
     DynamicHomographyCalibrator,
 )
-from pipeline.geometry import validate_trajectory, calculate_mask_overlap_ratio
+from pipeline.geometry import (
+    validate_trajectory,
+    calculate_mask_overlap_ratio,
+    litter_holding,
+)
+from pipeline.backtrack.mask_diagnostics import build_mask_litter_diagnostics
 
 
 from pipeline.litter.trajfit import (
@@ -53,6 +59,26 @@ MAX_MISSED_FRAMES = 10
 TRAJECTORY_HISTORY_LEN = 15
 PENDING_SHAPE_CHANGE_RATIO = 0.60       # pending 嚴格，避免雜訊延續
 CONFIRMED_SHAPE_CHANGE_RATIO = 1.20     # confirmed 寬鬆，吸收形變
+# Small airborne litter can change apparent aspect ratio sharply under motion
+# blur and perspective.  Shape-inconsistent observations may still associate
+# when their short-gap centre motion is continuous at object scale.  This is
+# identity evidence only; every confirmation gate below remains unchanged.
+PENDING_MOTION_MATCH_MAX_GAP_SEC = 0.35
+PENDING_MOTION_MATCH_MAX_RESIDUAL_DIAGONALS = 1.50
+PENDING_MOTION_MATCH_DISTANCE_GAP_CAP = 2.0
+
+# Temporal-component observations never create a track.  A quarantined small
+# object may bridge one frame after two detector anchors.  A sufficiently large
+# detector seed may instead use a bounded four-frame visual chain, with explicit
+# holding and trajectory gates before confirmation.  Pixel-difference units are
+# uint8 intensity.
+VISUAL_BRIDGE_DIFF_THRESHOLD = 24
+VISUAL_BRIDGE_MIN_AREA_RATIO = 0.10
+VISUAL_BRIDGE_MAX_AREA_RATIO = 4.0
+VISUAL_BRIDGE_MAX_PREDICTION_ERROR_DIAGONALS = 0.50
+VISUAL_BRIDGE_MAX_SEARCH_RADIUS = 160
+VISUAL_CHAIN_MIN_SEED_FRAME_AREA_RATIO = 0.001
+VISUAL_CHAIN_REQUIRED_OBSERVATIONS = 4
 
 # === Confirm 門檻：一般 thrower ===
 MIN_CONFIRM_AGE = 2
@@ -183,6 +209,10 @@ class GlobalLitterTracker:
         self.trajectory_history_len = _scale_up(TRAJECTORY_HISTORY_LEN)
         self.max_missed_frames = _scale_up(MAX_MISSED_FRAMES)
         self.fast_drop_max_frame_gap = _scale_up(FAST_DROP_MAX_FRAME_GAP)
+        self.pending_motion_match_max_gap_frames = max(
+            1,
+            int(round(self.fps * PENDING_MOTION_MATCH_MAX_GAP_SEC)),
+        )
 
         # --- age / 成熟度門檻：以「偵測次數」計，與 fps 無關 ---
         # age 數的是「被配對到的偵測次數」而非經過幀數。小快物件偵測稀疏，
@@ -390,6 +420,12 @@ class GlobalLitterTracker:
         self._raw_prefix_enabled = (
             os.environ.get("SMART_BACKTRACK_RAW_PREFIX", "1") not in ("0", "")
         )
+        # Research-only visible-mask summaries. The resolver never reads these
+        # values and the default-off path adds no task/sidecar keys.
+        self._mask_diagnostics_enabled = (
+            os.environ.get("SMART_BACKTRACK_MASK_DIAGNOSTICS", "0")
+            not in ("0", "")
+        )
         self.backward_plate_roi_items = []
         self._actor_tracklet_epochs = {}
 
@@ -463,7 +499,178 @@ class GlobalLitterTracker:
         self._backward_thread.start()
 
         self._fallback_frame_index = 0
+        self._previous_gray_frame = None
+        self._visual_bridge_records = []
         self._debug = os.environ.get("LITTER_DEBUG", "0") not in ("0", "")   # LITTER_DEBUG=1 開啟 per-frame 印出
+
+    def _build_visual_bridge_candidates(self, detected_litters, actors, frame_index, frame):
+        """Return bounded motion observations anchored by a detector box.
+
+        These observations cannot create tracks.  The quarantine path provides
+        only the third same-carrier observation after two detector anchors.  A
+        large single seed may form a four-observation visual chain, but cannot
+        confirm before all four observations and the normal trajectory/holding
+        checks pass.
+        """
+        if frame is None or self._previous_gray_frame is None:
+            return [], {}
+        current_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if current_gray.shape != self._previous_gray_frame.shape:
+            return [], {}
+
+        observed_centers = []
+        for box in detected_litters or []:
+            try:
+                observed_centers.append((
+                    (float(box[0]) + float(box[2])) * 0.5,
+                    (float(box[1]) + float(box[3])) * 0.5,
+                ))
+            except (TypeError, ValueError, IndexError):
+                continue
+
+        bridges = []
+        target_by_object_id = {}
+        diff = cv2.absdiff(self._previous_gray_frame, current_gray)
+        diff = cv2.GaussianBlur(diff, (3, 3), 0)
+        height, width = current_gray.shape[:2]
+        for litter_id, data in self.active_litters.items():
+            if data.get('state', 'pending') != 'pending':
+                continue
+            quarantine_bridge = bool(data.get('vehicle_quarantine_active', False))
+            detector_observations = int(
+                data.get('detector_observation_count', data.get('age', 0))
+            )
+            sources = list(data.get('history_sources', []))
+            visual_observations = sum(
+                source == 'visual_bridge' for source in sources
+            )
+            single_seed_chain = (
+                detector_observations == 1 and
+                float(data.get('birth_frame_area_ratio', 0.0))
+                >= VISUAL_CHAIN_MIN_SEED_FRAME_AREA_RATIO and
+                visual_observations < VISUAL_CHAIN_REQUIRED_OBSERVATIONS
+            )
+            if quarantine_bridge:
+                regular_quarantine_bridge = (
+                    detector_observations >= 2 and
+                    (not sources or sources[-1] == 'detector')
+                )
+                if not regular_quarantine_bridge:
+                    continue
+            elif not single_seed_chain:
+                continue
+            history = list(data.get('history', []))
+            history_frames = list(data.get('history_frames', []))
+            if not history or not history_frames:
+                continue
+            if int(frame_index) - int(history_frames[-1]) != 1:
+                continue
+            if quarantine_bridge:
+                carrier_key = data.get('vehicle_quarantine_carrier_key')
+                if carrier_key is None or self._vehicle_quarantine_actor_center(
+                    carrier_key, actors,
+                ) is None:
+                    continue
+
+            vx = 0.0
+            vy = 0.0
+            if len(history) >= 2 and len(history_frames) >= 2:
+                prior_gap = max(
+                    int(history_frames[-1]) - int(history_frames[-2]), 1
+                )
+                vx = (
+                    float(history[-1][0]) - float(history[-2][0])
+                ) / float(prior_gap)
+                vy = (
+                    float(history[-1][1]) - float(history[-2][1])
+                ) / float(prior_gap)
+            predicted = (
+                float(history[-1][0]) + vx,
+                float(history[-1][1]) + vy,
+            )
+            previous_box = data.get('bbox')
+            box_w = max(float(previous_box[2]) - float(previous_box[0]), 1.0)
+            box_h = max(float(previous_box[3]) - float(previous_box[1]), 1.0)
+            diagonal = max(math.hypot(box_w, box_h), 1.0)
+            if any(
+                math.hypot(cx - predicted[0], cy - predicted[1]) <= diagonal
+                for cx, cy in observed_centers
+            ):
+                continue
+
+            search_radius = int(min(max(
+                2.0 * diagonal,
+                0.75 * math.hypot(vx, vy),
+                24.0,
+            ), VISUAL_BRIDGE_MAX_SEARCH_RADIUS))
+            sx1 = max(int(math.floor(predicted[0] - search_radius)), 0)
+            sy1 = max(int(math.floor(predicted[1] - search_radius)), 0)
+            sx2 = min(int(math.ceil(predicted[0] + search_radius + 1)), width)
+            sy2 = min(int(math.ceil(predicted[1] + search_radius + 1)), height)
+            if sx2 <= sx1 or sy2 <= sy1:
+                continue
+            binary = (diff[sy1:sy2, sx1:sx2] >= VISUAL_BRIDGE_DIFF_THRESHOLD).astype(np.uint8)
+            count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+                binary, connectivity=8,
+            )
+            previous_area = box_w * box_h
+            min_area = max(4.0, VISUAL_BRIDGE_MIN_AREA_RATIO * previous_area)
+            max_area = max(80.0, VISUAL_BRIDGE_MAX_AREA_RATIO * previous_area)
+            ranked = []
+            for component_index in range(1, count):
+                rx, ry, rw, rh, area = stats[component_index]
+                if not (min_area <= float(area) <= max_area):
+                    continue
+                x1 = float(sx1 + rx)
+                y1 = float(sy1 + ry)
+                x2 = x1 + float(rw)
+                y2 = y1 + float(rh)
+                error_x = max(x1 - predicted[0], 0.0, predicted[0] - x2)
+                error_y = max(y1 - predicted[1], 0.0, predicted[1] - y2)
+                prediction_error = math.hypot(error_x, error_y)
+                if (
+                    prediction_error / diagonal
+                    > VISUAL_BRIDGE_MAX_PREDICTION_ERROR_DIAGONALS
+                ):
+                    continue
+                area_error = abs(math.log(max(float(area), 1.0) / previous_area))
+                ranked.append((
+                    prediction_error / diagonal,
+                    area_error,
+                    component_index,
+                    (x1, y1, x2, y2),
+                ))
+            if not ranked:
+                continue
+            _error, _area_error, component_index, component_box = min(ranked)
+            if single_seed_chain:
+                # The first large-object step has no velocity estimate.  Its
+                # coherent change-component centroid supplies that estimate;
+                # later steps remain prediction-gated by the same component.
+                rx1, ry1, rx2, ry2 = component_box
+                component_crop = (labels[
+                    max(int(ry1 - sy1), 0):max(int(ry2 - sy1), 0),
+                    max(int(rx1 - sx1), 0):max(int(rx2 - sx1), 0),
+                ] == component_index).astype(np.uint8)
+                moments = cv2.moments(component_crop, binaryImage=True)
+                if moments['m00'] > 0.0:
+                    cx = rx1 + moments['m10'] / moments['m00']
+                    cy = ry1 + moments['m01'] / moments['m00']
+                else:
+                    cx, cy = predicted
+            else:
+                cx = min(max(predicted[0], component_box[0]), component_box[2])
+                cy = min(max(predicted[1], component_box[1]), component_box[3])
+            bridge = (
+                max(cx - box_w * 0.5, 0.0),
+                max(cy - box_h * 0.5, 0.0),
+                min(cx + box_w * 0.5, float(width)),
+                min(cy + box_h * 0.5, float(height)),
+                0.0,
+            )
+            bridges.append(bridge)
+            target_by_object_id[id(bridge)] = int(litter_id)
+        return bridges, target_by_object_id
 
     def _record_raw_litter_frame(self, raw_detected_litters, frame_index):
         """Keep detector outputs for confirmed-only trajectory recovery.
@@ -598,6 +805,13 @@ class GlobalLitterTracker:
             self._fallback_frame_index += 1
         frame_index = int(frame_index)
         self._current_frame_index = frame_index
+        self._visual_bridge_records = []
+
+        detected_litters = list(detected_litters or [])
+        visual_bridges, visual_bridge_targets = self._build_visual_bridge_candidates(
+            detected_litters, actors, frame_index, frame,
+        )
+        detected_litters.extend(visual_bridges)
 
         self._record_raw_litter_frame(raw_detected_litters, frame_index)
 
@@ -637,6 +851,13 @@ class GlobalLitterTracker:
         quarantined_object_ids = {
             id(litter_box) for litter_box in (quarantined_litters or [])
         }
+        quarantined_object_ids.update(
+            id(box)
+            for box in visual_bridges
+            if self.active_litters.get(
+                visual_bridge_targets.get(id(box)), {}
+            ).get('vehicle_quarantine_active', False)
+        )
 
         # 第一段：把每個 detected litter 與既有 active litter 做距離/尺寸配對。
         for litter_box in detected_litters:
@@ -652,27 +873,45 @@ class GlobalLitterTracker:
 
             # 找到目前仍在追蹤的 litter 相關資料。
             for l_id, l_data in self.active_litters.items():
+                visual_target = visual_bridge_targets.get(id(litter_box))
+                if visual_target is not None and int(l_id) != int(visual_target):
+                    continue
                 prev_state = l_data.get('state', 'pending')
-                if (
+                prev_box = l_data['bbox']
+                prev_centroid = (
+                    (prev_box[0] + prev_box[2]) / 2,
+                    (prev_box[1] + prev_box[3]) / 2,
+                )
+                prior_sources = list(l_data.get('history_sources', []))
+                containment_stream_changed = (
                     prev_state == 'pending'
                     and not l_data.get('vehicle_quarantine_released', False)
                     and bool(l_data.get('vehicle_quarantine_active', False))
                     != bool(is_contained_observation)
-                ):
+                )
+                quarantine_exit_evidence_ready = (
+                    containment_stream_changed and
+                    bool(l_data.get('vehicle_quarantine_active', False)) and
+                    not bool(is_contained_observation) and
+                    len(l_data.get('vehicle_quarantine_frames', []))
+                    >= self.vehicle_quarantine_min_observations and
+                    # A synthetic component is sufficient as the final
+                    # contained observation, but it must not authorize a later
+                    # containment→ordinary identity handoff.  That handoff
+                    # needs detector-only continuity and downward separation.
+                    'visual_bridge' not in prior_sources and
+                    float(centroid[1]) > float(prev_centroid[1])
+                )
+                if containment_stream_changed and not quarantine_exit_evidence_ready:
                     # Vehicle-contained observations are an evidence-only
                     # stream until their same-carrier motion releases them.
-                    # Never let that tentative history seed an ordinary track,
-                    # or let a one-frame containment classification quarantine
-                    # an already ordinary candidate.  A candidate that exits
-                    # containment starts a clean pending trajectory and must
-                    # independently satisfy the normal confirmation gates.
+                    # One/two tentative contained boxes cannot seed an ordinary
+                    # track, and containment jitter cannot quarantine an
+                    # ordinary track.  After the required three same-carrier
+                    # observations, however, the first box outside containment
+                    # is precisely the relative-separation evidence needed by
+                    # quarantine; allow it to compete for the same pending ID.
                     continue
-                prev_box = l_data['bbox']
-                prev_centroid = (
-                    (prev_box[0] + prev_box[2]) / 2, 
-                    (prev_box[1] + prev_box[3]) / 2
-                )
-
                 dist = distance.euclidean(centroid, prev_centroid)
                 ref_w, ref_h = l_data.get('ref_shape', l_data.get('init_shape', (curr_w, curr_h)))
                 w_diff_ratio = abs(curr_w - ref_w) / max(ref_w, 1e-6)
@@ -685,12 +924,88 @@ class GlobalLitterTracker:
                 )
                 is_shape_consistent = (w_diff_ratio <= shape_thr) and (h_diff_ratio <= shape_thr)
 
+                # A fixed aspect-ratio gate fragments small fast litter when
+                # one blurred observation becomes tall/wide.  For pending
+                # tracks, allow a shape-inconsistent match only over a short
+                # time gap and only when centre motion is continuous relative
+                # to the combined source/target box scale.  With >=2 points,
+                # constant-velocity prediction makes the test stricter than
+                # nearest-centre matching; with one point it is a bounded
+                # two-frame bootstrap and cannot itself confirm an event.
+                history_frames = list(l_data.get('history_frames', []))
+                last_frame = (
+                    int(history_frames[-1]) if history_frames
+                    else int(frame_index) - int(l_data.get('missed', 0)) - 1
+                )
+                frame_gap = max(int(frame_index) - last_frame, 1)
+                if (
+                    prev_state == 'pending' and
+                    bool(l_data.get('vehicle_quarantine_active', False)) and
+                    frame_gap >= self.max_missed_frames
+                ):
+                    # A tentative vehicle-contained blob at the very edge of
+                    # expiry must not absorb a new release at the same image
+                    # location. Preserve shorter sparse-detection continuity;
+                    # only a full missed-window gap starts a new identity.
+                    continue
+                pending_motion_consistent = False
+                if (
+                    prev_state == 'pending' and
+                    frame_gap <= self.pending_motion_match_max_gap_frames
+                ):
+                    predicted_x, predicted_y = prev_centroid
+                    history = list(l_data.get('history', []))
+                    if len(history) >= 2 and len(history_frames) >= 2:
+                        prior_gap = max(
+                            int(history_frames[-1]) - int(history_frames[-2]), 1
+                        )
+                        vx = (
+                            float(history[-1][0]) - float(history[-2][0])
+                        ) / float(prior_gap)
+                        vy = (
+                            float(history[-1][1]) - float(history[-2][1])
+                        ) / float(prior_gap)
+                        predicted_x += vx * frame_gap
+                        predicted_y += vy * frame_gap
+                    residual = math.hypot(
+                        float(centroid[0]) - float(predicted_x),
+                        float(centroid[1]) - float(predicted_y),
+                    )
+                    prev_diag = math.hypot(
+                        float(prev_box[2]) - float(prev_box[0]),
+                        float(prev_box[3]) - float(prev_box[1]),
+                    )
+                    curr_diag = math.hypot(curr_w, curr_h)
+                    residual_scale = max(
+                        (prev_diag + curr_diag) * float(frame_gap), 1.0
+                    )
+                    pending_motion_consistent = (
+                        residual / residual_scale
+                        <= PENDING_MOTION_MATCH_MAX_RESIDUAL_DIAGONALS
+                    )
+                motion_consistent_shape_override = (
+                    not is_shape_consistent and pending_motion_consistent
+                )
+
                 # confirmed 軌跡優先保持連續，避免尺寸波動導致 ID 斷裂。
                 allow_confirmed_dist_only = (
                     prev_state == 'confirmed' and dist < (self.distance_threshold * 0.7)
                 )
 
-                if dist < self.distance_threshold and (is_shape_consistent or allow_confirmed_dist_only) and dist < min_dist:
+                distance_limit = self.distance_threshold
+                if pending_motion_consistent and frame_gap > 1:
+                    distance_limit *= min(
+                        float(frame_gap),
+                        PENDING_MOTION_MATCH_DISTANCE_GAP_CAP,
+                    )
+                if (
+                    dist < distance_limit and
+                    (
+                        is_shape_consistent or allow_confirmed_dist_only or
+                        motion_consistent_shape_override
+                    ) and
+                    dist < min_dist
+                ):
                     # 靜止鎖定的 pending litter 不吸收新偵測：讓新的偵測另開新軌跡，
                     # 避免靜止舊垃圾鎖住真正丟棄的垃圾軌跡起點。
                     if l_data.get('stationary_locked', False) and prev_state == 'pending':
@@ -712,6 +1027,18 @@ class GlobalLitterTracker:
                 history_confidences = history_confidences[-self.trajectory_history_len:]
 
                 age = l_data.get('age', 1) + 1
+                is_visual_bridge = id(litter_box) in visual_bridge_targets
+                detector_observation_count = int(
+                    l_data.get('detector_observation_count', l_data.get('age', 1))
+                ) + (0 if is_visual_bridge else 1)
+                history_sources = list(l_data.get('history_sources', []))
+                history_sources.append(
+                    'visual_bridge' if is_visual_bridge else 'detector'
+                )
+                history_sources = history_sources[-self.trajectory_history_len:]
+                visual_bridge_count = sum(
+                    source == 'visual_bridge' for source in history_sources
+                )
                 state = l_data.get('state', 'pending')
                 backward_submitted = bool(l_data.get('backward_submitted', False))
                 vehicle_quarantine_active = self._update_vehicle_quarantine(
@@ -846,6 +1173,38 @@ class GlobalLitterTracker:
                             birth_thrower_key is not None
                         )
                     )
+                    visual_chain_confirmation_ready = True
+                    if is_visual_bridge and detector_observation_count < 2:
+                        is_still_holding, _holding_actor = litter_holding(
+                            litter_box,
+                            actors,
+                            prev_litter_center=l_data['history'][-2]
+                            if len(l_data['history']) >= 2 else None,
+                            prev_litter_missed=0,
+                            prev_litter_history=l_data['history'][:-1],
+                            vehicle_history=vehicle_history,
+                        )
+                        visual_chain_confirmation_ready = (
+                            float(l_data.get('birth_frame_area_ratio', 0.0))
+                            >= VISUAL_CHAIN_MIN_SEED_FRAME_AREA_RATIO and
+                            visual_bridge_count >= VISUAL_CHAIN_REQUIRED_OBSERVATIONS and
+                            not is_still_holding
+                        )
+                    # Event confirmation and attribution are separate evidence
+                    # levels.  A long, detector-observed gravity arc can prove
+                    # the object event even when no actor is reliably tracked;
+                    # Smart Backtrack must then retain its NULL route.  Require
+                    # five observations plus an observed apex/descent so this
+                    # cannot turn a short actorless detector streak into an
+                    # event.
+                    actorless_object_event_supported = (
+                        thrower_key is None and
+                        age >= 5 and
+                        is_physics_valid and
+                        is_moved_enough and
+                        has_arc_descent and
+                        not vehicle_quarantine_active
+                    )
                     # 若 thrower 為車輛，且水平位移遠大於向下位移（純水平滑動），則不 confirm。
                     is_horiz_ratio_ok = True
                     if is_vehicle_thrower and downward_disp > 0:
@@ -938,7 +1297,8 @@ class GlobalLitterTracker:
                         is_horiz_ratio_ok and
                         is_step_velocity_ok and
                         vehicle_relative_ok and
-                        release_actor_supported and
+                        (release_actor_supported or actorless_object_event_supported) and
+                        visual_chain_confirmation_ready and
                         not is_static_candidate and
                         not stationary_locked
                     )
@@ -951,6 +1311,7 @@ class GlobalLitterTracker:
                         is_step_velocity_ok and
                         vehicle_relative_ok and
                         release_actor_supported and
+                        visual_chain_confirmation_ready and
                         not is_static_candidate and
                         not stationary_locked
                     )
@@ -976,6 +1337,7 @@ class GlobalLitterTracker:
                         is_step_velocity_ok and
                         vehicle_relative_ok and
                         release_actor_supported and
+                        visual_chain_confirmation_ready and
                         not stationary_locked
                     )
 
@@ -1013,6 +1375,7 @@ class GlobalLitterTracker:
                         is_step_velocity_ok and
                         vehicle_relative_ok and
                         (release_actor_supported or actorless_fast_drop_supported) and
+                        visual_chain_confirmation_ready and
                         not is_static_candidate and
                         not stationary_locked
                     )
@@ -1073,7 +1436,14 @@ class GlobalLitterTracker:
                                 'bbox': [_lx1, _ly1, _lx2, _ly2],
                                 'center': [float(centroid[0]), float(centroid[1])],
                                 'detector_confidence': (
-                                    float(litter_box[4]) if len(litter_box) > 4 else None
+                                    max(
+                                        (
+                                            float(confidence)
+                                            for confidence in history_confidences
+                                            if float(confidence) > 0.0
+                                        ),
+                                        default=None,
+                                    )
                                 ),
                                 'thrower_key': list(thrower_key) if thrower_key is not None else None,
                                 'vehicle_key': None,
@@ -1097,6 +1467,10 @@ class GlobalLitterTracker:
                                 current_centroid=centroid,
                                 confirm_frame=frame_index,
                                 prev_thrower_key=thrower_key,
+                                current_source=(
+                                    'visual_bridge'
+                                    if is_visual_bridge else 'detector'
+                                ),
                             )
 
                         if (
@@ -1154,6 +1528,11 @@ class GlobalLitterTracker:
                     'history_frames': (l_data.get('history_frames', []) + [frame_index])[-TRAJECTORY_HISTORY_LEN:],
                     'history_boxes': history_boxes,
                     'history_confidences': history_confidences,
+                    'history_sources': history_sources,
+                    'detector_observation_count': detector_observation_count,
+                    'birth_frame_area_ratio': float(
+                        l_data.get('birth_frame_area_ratio', 0.0)
+                    ),
                     # Queue 滿或 worker 尚未接受時保持 False，下一次 update 可重試。
                     'backward_submitted': backward_submitted,
                     'backward_result': l_data.get('backward_result'),
@@ -1222,6 +1601,13 @@ class GlobalLitterTracker:
                     'history_frames': [frame_index],
                     'history_boxes': [tuple(map(float, litter_box[:4]))],
                     'history_confidences': [float(litter_box[4])],
+                    'history_sources': ['detector'],
+                    'detector_observation_count': 1,
+                    'birth_frame_area_ratio': (
+                        float(curr_w * curr_h) /
+                        max(float(frame.shape[0] * frame.shape[1]), 1.0)
+                        if frame is not None else 0.0
+                    ),
                     'backward_submitted': False,
                     'backward_result': None,
                     'stationary_locked': inherit_locked,
@@ -1244,6 +1630,28 @@ class GlobalLitterTracker:
                 new_active_litters[l_id] = l_data
         
         self.active_litters = new_active_litters
+        for bridge in visual_bridges:
+            target_id = visual_bridge_targets.get(id(bridge))
+            litter_data = self.active_litters.get(target_id)
+            if litter_data is None:
+                continue
+            self._visual_bridge_records.append({
+                'record_type': 'litter_visual_bridge',
+                'frame_index': int(frame_index),
+                'bbox': [float(value) for value in bridge[:4]],
+                'confidence': None,
+                'filter_outcome': 'passed',
+                'filter_reason': 'visual_motion_bridge',
+                'tracker_outcome': 'assigned',
+                'tracker_litter_id': int(target_id),
+                'tracker_state': str(litter_data.get('state', 'pending')),
+                'tracker_age': int(litter_data.get('age', 0)),
+                'evidence_source': (
+                    'bounded_large_seed_temporal_chain'
+                    if int(litter_data.get('detector_observation_count', 0)) == 1
+                    else 'temporal_component_after_two_detector_anchors'
+                ),
+            })
         self._drain_backward_results(vehicle_history=vehicle_history)
 
         # 第五段：僅回傳本幀中位置連續的違規者；允許短暫 miss 與同類別近距離 rebind。
@@ -1303,7 +1711,15 @@ class GlobalLitterTracker:
             if v_data['missed'] > VIOLATOR_MAX_MISSED:
                 del self.violators[violator_key]
 
+        if frame is not None:
+            self._previous_gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         return self.active_litters, active_violator_keys
+
+    def consume_visual_bridge_records(self):
+        """Return and clear research provenance for temporal bridge evidence."""
+        records = list(self._visual_bridge_records)
+        self._visual_bridge_records = []
+        return records
 
     def close(self, timeout=2.0):
         # idempotent：正常 EOF 會先 finalize；例外路徑則由 close 負責兜底。
@@ -1517,6 +1933,7 @@ class GlobalLitterTracker:
         frame_h = frame.shape[0] if frame is not None else 0
         frame_w = frame.shape[1] if frame is not None else 0
         bev_bottoms = []   # 本幀車輛/機車底邊中心 + 高度，供 BEV 穩定平面累積。
+        mask_diagnostic_actors = []
 
         for actor in actors:
             try:
@@ -1581,6 +1998,11 @@ class GlobalLitterTracker:
                 cls_name, track_id, int(uid_state['epoch'])
             )
 
+            if self._mask_diagnostics_enabled:
+                diagnostic_actor = dict(snapshot)
+                diagnostic_actor['mask_poly'] = actor.get('mask_poly')
+                mask_diagnostic_actors.append(diagnostic_actor)
+
             if frame is not None and cls_name in ('vehicle', 'scooter'):
                 roi = self._crop_actor_roi(frame, box, frame_w, frame_h)
                 if roi is not None:
@@ -1622,7 +2044,7 @@ class GlobalLitterTracker:
                 'frame_index': int(frame_index),
                 'actors': actor_snapshots,
             })
-            self._smart_actor_history.append({
+            smart_frame = {
                 'frame_index': int(frame_index),
                 'actors': [
                     {
@@ -1632,7 +2054,16 @@ class GlobalLitterTracker:
                     }
                     for snapshot in actor_snapshots
                 ],
-            })
+            }
+            if self._mask_diagnostics_enabled and dynamic_litters:
+                smart_frame['mask_litter_diagnostics'] = (
+                    build_mask_litter_diagnostics(
+                        mask_diagnostic_actors,
+                        dynamic_litters,
+                        frame_index,
+                    )
+                )
+            self._smart_actor_history.append(smart_frame)
 
         if self._pv_assoc_enabled:
             # 全片不截斷的輕量歷史(去 plate_roi 省記憶);主執行緒 only,finalize 在 join 後讀。
@@ -1707,8 +2138,70 @@ class GlobalLitterTracker:
         })
         return snapshot
 
+    @staticmethod
+    def _litter_observation_lineage(litter_id, frames, provenance):
+        """Build diagnostic lineage without changing resolver measurements."""
+        lineage = []
+        previous = None
+        seen_observation_ids = set()
+        first_accepted = next(
+            (
+                f"litter:{int(litter_id)}:frame:{int(frame)}:{source}"
+                for frame, source in zip(frames, provenance)
+                if source in ('detector', 'visual_bridge', 'legacy_unknown')
+            ),
+            None,
+        )
+        for frame, source in zip(frames, provenance):
+            observation_id = (
+                f"litter:{int(litter_id)}:frame:{int(frame)}:{source}"
+            )
+            duplicate = observation_id in seen_observation_ids
+            if duplicate:
+                parent_id = observation_id
+                independence_group_id = next(
+                    (
+                        item['independence_group_id'] for item in lineage
+                        if item['observation_id'] == observation_id
+                    ),
+                    observation_id,
+                )
+                independent = False
+            elif source == 'visual_bridge':
+                parent_id = previous
+                independence_group_id = (
+                    lineage[-1]['independence_group_id']
+                    if lineage else observation_id
+                )
+                independent = False
+            elif source == 'raw_rtdetr_recovered':
+                parent_id = first_accepted
+                independence_group_id = first_accepted or observation_id
+                independent = False
+            elif source == 'detector':
+                parent_id = None
+                independence_group_id = observation_id
+                independent = True
+            else:
+                parent_id = None
+                independence_group_id = observation_id
+                independent = False
+            lineage.append({
+                'observation_id': observation_id,
+                'source': source,
+                'parent_observation_id': parent_id,
+                'independence_group_id': independence_group_id,
+                'derived': not independent,
+                'independent_measurement': independent,
+            })
+            seen_observation_ids.add(observation_id)
+            previous = observation_id
+        return lineage
+
     def _submit_backward_resolution(self, litter_id, litter_data, current_bbox,
-                                    current_centroid, confirm_frame, prev_thrower_key=None):
+                                    current_centroid, confirm_frame,
+                                    prev_thrower_key=None,
+                                    current_source='detector'):
         # task 用 immutable snapshot，worker 不碰 main thread 追蹤狀態。
         if not self._backward_accepting:
             return False
@@ -1724,6 +2217,7 @@ class GlobalLitterTracker:
         history_confidences = [
             float(value) for value in litter_data.get('history_confidences', [])
         ]
+        source_values = list(litter_data.get('history_sources', []))
         if len(history_frames) == len(history) - 1:
             # confirm 發生在 update 迴圈中段:history 已 append 本幀質心(L343),但
             # history_frames 要到幀尾 dict 重建才補 → 這裡用 confirm_frame 補齊,
@@ -1739,9 +2233,59 @@ class GlobalLitterTracker:
                 float(current_bbox[4]) if len(current_bbox) > 4 else 1.0
             )
 
+        current_source = str(current_source)
+        if current_source not in ('detector', 'visual_bridge'):
+            return False
+        if len(source_values) == len(history) - 1:
+            source_values.append(current_source)
+        elif not source_values:
+            # Older callers did not expose provenance. Preserve replay while
+            # refusing to call these points independent detector evidence.
+            source_values = ['legacy_unknown'] * len(history)
+        source_values = [
+            str(source)
+            if str(source) in ('detector', 'visual_bridge')
+            else 'legacy_unknown'
+            for source in source_values
+        ]
+
+        if not history:
+            return False
+        if not history_boxes:
+            # Resolver ignores boxes. None keeps the arrays aligned without
+            # fabricating geometry or enabling raw-prefix recovery.
+            history_boxes = [None] * len(history)
+        if not history_confidences:
+            # Matches the resolver's historical missing-confidence fallback.
+            history_confidences = [1.0] * len(history)
+        expected = len(history)
+        if not all(
+            len(values) == expected
+            for values in (
+                history_frames, history_boxes, history_confidences,
+                source_values,
+            )
+        ):
+            return False
+
+        rows = sorted(
+            zip(
+                history_frames, history, history_boxes,
+                history_confidences, source_values,
+            ),
+            key=lambda row: int(row[0]),
+        )
+        history_frames = [int(row[0]) for row in rows]
+        history = [row[1] for row in rows]
+        history_boxes = [row[2] for row in rows]
+        history_confidences = [float(row[3]) for row in rows]
+        source_values = [str(row[4]) for row in rows]
+
         accepted_history_frames = list(history_frames)
         recovered_raw_frames = []
-        if self._raw_prefix_enabled:
+        if self._raw_prefix_enabled and all(
+            box is not None for box in history_boxes
+        ):
             (
                 history,
                 history_frames,
@@ -1754,6 +2298,22 @@ class GlobalLitterTracker:
                 history_boxes,
                 history_confidences,
             )
+
+        accepted_sources_by_frame = dict(zip(
+            accepted_history_frames, source_values
+        ))
+        recovered_raw_frame_set = set(recovered_raw_frames)
+        exact_provenance = [
+            (
+                'raw_rtdetr_recovered'
+                if int(frame) in recovered_raw_frame_set
+                else accepted_sources_by_frame.get(int(frame), 'legacy_unknown')
+            )
+            for frame in history_frames
+        ]
+        history_lineage = self._litter_observation_lineage(
+            litter_id, history_frames, exact_provenance
+        )
 
         with self._actor_history_lock:
             history_source = (
@@ -1770,6 +2330,14 @@ class GlobalLitterTracker:
                 {
                     'frame_index': item['frame_index'],
                     'actors': [dict(actor) for actor in item.get('actors', [])],
+                    **(
+                        {
+                            'mask_litter_diagnostics': dict(
+                                item['mask_litter_diagnostics']
+                            )
+                        }
+                        if 'mask_litter_diagnostics' in item else {}
+                    ),
                 }
                 for item in history_source
                 if (
@@ -1795,7 +2363,6 @@ class GlobalLitterTracker:
             return False
 
         revision = int(self._backtrack_revisions.get(int(litter_id), 0)) + 1
-        recovered_raw_frame_set = set(recovered_raw_frames)
         task = {
             'schema_version': 1,
             'litter_id': int(litter_id),
@@ -1819,6 +2386,8 @@ class GlobalLitterTracker:
                 )
                 for frame in history_frames
             ],
+            'history_provenance': exact_provenance,
+            'history_lineage': history_lineage,
             'accepted_history_frames': accepted_history_frames,
             'recovered_raw_history_frames': recovered_raw_frames,
             'prev_thrower_key': prev_thrower_key,
@@ -2809,9 +3378,6 @@ class GlobalLitterTracker:
         litter_data['vehicle_quarantine_relative_points'] = relative_points
         litter_data['vehicle_quarantine_frames'] = frames
 
-        if len(relative_points) < self.vehicle_quarantine_min_observations:
-            return True
-
         start = relative_points[0]
         end = relative_points[-1]
         rel_dx = float(end[0]) - float(start[0])
@@ -2848,6 +3414,16 @@ class GlobalLitterTracker:
             'required_displacement': required_displacement,
             'required_downward': required_downward,
         }
+        if getattr(self, '_debug', False) and len(relative_points) >= 2:
+            print(
+                f"  [QUARANTINE_EVIDENCE fi={frame_index} "
+                f"obs={len(relative_points)} rel={rel_displacement:.1f} "
+                f"down={rel_dy:.1f} steps={downward_steps} "
+                f"req_rel={required_displacement:.1f} "
+                f"req_down={required_downward:.1f}]"
+            )
+        if len(relative_points) < self.vehicle_quarantine_min_observations:
+            return True
         if release:
             litter_data['vehicle_quarantine_active'] = False
             litter_data['vehicle_quarantine_released'] = True

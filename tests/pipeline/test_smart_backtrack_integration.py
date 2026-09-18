@@ -2,6 +2,7 @@
 """GPU-free integration checks for the production smart backtrack path."""
 import os
 import sys
+import copy
 
 import numpy as np
 
@@ -70,6 +71,195 @@ def test_raw_prefix_has_explicit_runtime_rollback(monkeypatch):
         assert tracker._raw_prefix_enabled is False
     finally:
         tracker.close()
+
+
+def _submitted_lineage_task(monkeypatch, litter_data, current_source="detector"):
+    monkeypatch.setenv("SMART_BACKTRACK", "1")
+    tracker = GlobalLitterTracker(distance_threshold=250, fps=10)
+    tracker._record_actor_frame(
+        [_actor("person", 1, (0, 0, 20, 40))], frame_index=8
+    )
+    submitted = tracker._submit_backward_resolution(
+        litter_id=4,
+        litter_data=litter_data,
+        current_bbox=(28, 78, 32, 82, 0.9),
+        current_centroid=(30.0, 80.0),
+        confirm_frame=8,
+        current_source=current_source,
+    )
+    assert submitted is True
+    return tracker, tracker._smart_tasks[4]
+
+
+def test_detector_history_keeps_compatible_and_exact_sources(monkeypatch):
+    tracker, task = _submitted_lineage_task(monkeypatch, {
+        "birth_frame": 7,
+        "history": [(40.0, 70.0), (30.0, 80.0)],
+        "history_frames": [7, 8],
+        "history_boxes": [(38, 68, 42, 72), (28, 78, 32, 82)],
+        "history_confidences": [0.8, 0.9],
+        "history_sources": ["detector", "detector"],
+    })
+    try:
+        assert task["history_sources"] == ["accepted_tracker", "accepted_tracker"]
+        assert task["history_provenance"] == ["detector", "detector"]
+        assert all(
+            row["independent_measurement"] for row in task["history_lineage"]
+        )
+    finally:
+        tracker.close()
+
+
+def test_visual_bridge_and_raw_prefix_keep_aligned_lineage(monkeypatch):
+    tracker, task = _submitted_lineage_task(monkeypatch, {
+        "birth_frame": 7,
+        "history": [(40.0, 70.0), (30.0, 80.0)],
+        "history_frames": [7, 8],
+        "history_boxes": [(38, 68, 42, 72), (28, 78, 32, 82)],
+        "history_confidences": [0.8, 0.9],
+        # Confirmation happens before the current source is copied back into
+        # active_litters, so submission must append it in lockstep.
+        "history_sources": ["detector"],
+    }, current_source="visual_bridge")
+    try:
+        # Insert a raw detector prefix and resubmit as a new immutable snapshot.
+        tracker._record_raw_litter_frame([[48, 58, 52, 62, 0.7]], 6)
+        assert tracker._submit_backward_resolution(
+            litter_id=5,
+            litter_data={
+                "birth_frame": 7,
+                "history": [(40.0, 70.0), (30.0, 80.0)],
+                "history_frames": [7, 8],
+                "history_boxes": [(38, 68, 42, 72), (28, 78, 32, 82)],
+                "history_confidences": [0.8, 0.9],
+                "history_sources": ["detector"],
+            },
+            current_bbox=(28, 78, 32, 82, 0.9),
+            current_centroid=(30.0, 80.0),
+            confirm_frame=8,
+            current_source="visual_bridge",
+        ) is True
+        task = tracker._smart_tasks[5]
+        lengths = {
+            len(task[name]) for name in (
+                "history", "history_frames", "history_boxes",
+                "history_confidences", "history_sources",
+                "history_provenance", "history_lineage",
+            )
+        }
+        assert lengths == {3}
+        assert task["history_frames"] == [6, 7, 8]
+        assert task["history_sources"] == [
+            "raw_rtdetr_recovered", "accepted_tracker", "accepted_tracker"
+        ]
+        assert task["history_provenance"] == [
+            "raw_rtdetr_recovered", "detector", "visual_bridge"
+        ]
+        raw, detector, bridge = task["history_lineage"]
+        assert raw["independent_measurement"] is False
+        assert detector["independent_measurement"] is True
+        assert bridge["independent_measurement"] is False
+        assert bridge["parent_observation_id"] == detector["observation_id"]
+        assert bridge["independence_group_id"] == detector["independence_group_id"]
+    finally:
+        tracker.close()
+
+
+def test_legacy_missing_sources_are_not_claimed_as_detector_evidence(monkeypatch):
+    tracker, task = _submitted_lineage_task(monkeypatch, {
+        "birth_frame": 7,
+        "history": [(40.0, 70.0), (30.0, 80.0)],
+        "history_frames": [7, 8],
+        "history_boxes": [(38, 68, 42, 72), (28, 78, 32, 82)],
+        "history_confidences": [0.8, 0.9],
+    })
+    try:
+        assert task["history_sources"] == ["accepted_tracker", "accepted_tracker"]
+        assert task["history_provenance"] == ["legacy_unknown", "legacy_unknown"]
+        assert not any(
+            row["independent_measurement"] for row in task["history_lineage"]
+        )
+    finally:
+        tracker.close()
+
+
+def test_duplicate_detector_identity_is_not_counted_twice():
+    lineage = GlobalLitterTracker._litter_observation_lineage(
+        9, [4, 4], ["detector", "detector"]
+    )
+    assert lineage[0]["independent_measurement"] is True
+    assert lineage[1]["independent_measurement"] is False
+    assert lineage[1]["independence_group_id"] == lineage[0]["independence_group_id"]
+
+
+def test_partial_legacy_source_array_fails_closed(monkeypatch):
+    monkeypatch.setenv("SMART_BACKTRACK", "1")
+    tracker = GlobalLitterTracker(distance_threshold=250, fps=10)
+    try:
+        tracker._record_actor_frame(
+            [_actor("person", 1, (0, 0, 20, 40))], frame_index=8
+        )
+        assert tracker._submit_backward_resolution(
+            litter_id=4,
+            litter_data={
+                "birth_frame": 6,
+                "history": [(50, 60), (40, 70), (30, 80)],
+                "history_frames": [6, 7, 8],
+                "history_boxes": [
+                    (48, 58, 52, 62), (38, 68, 42, 72), (28, 78, 32, 82)
+                ],
+                "history_confidences": [0.7, 0.8, 0.9],
+                "history_sources": ["detector"],
+            },
+            current_bbox=(28, 78, 32, 82, 0.9),
+            current_centroid=(30, 80),
+            confirm_frame=8,
+        ) is False
+        assert 4 not in tracker._smart_tasks
+    finally:
+        tracker.close()
+
+
+def test_resolver_ignores_phase0_provenance_and_lineage_fields():
+    task = {
+        "litter_id": 2,
+        "fps": 10.0,
+        "birth_frame": 15,
+        "confirm_frame": 18,
+        "history": [(400, 150), (410, 160), (420, 175), (430, 195)],
+        "history_frames": [15, 16, 17, 18],
+        "history_confidences": [0.9, 0.8, 0.7, 0.6],
+        "actor_frames": [
+            {
+                "frame_index": frame,
+                "actors": [
+                    _actor("person", 1, (390, 80, 450, 220)),
+                    _actor("vehicle", 7, (350, 150, 500, 260)),
+                ],
+            }
+            for frame in range(10, 19)
+        ],
+    }
+    enriched = copy.deepcopy(task)
+    enriched["history_sources"] = ["accepted_tracker"] * 4
+    enriched["history_provenance"] = [
+        "detector", "visual_bridge", "visual_bridge", "detector"
+    ]
+    enriched["history_lineage"] = GlobalLitterTracker._litter_observation_lineage(
+        2, task["history_frames"], enriched["history_provenance"]
+    )
+
+    baseline = SmartBacktrackResolver(fps=10).resolve_task(task)
+    candidate = SmartBacktrackResolver(fps=10).resolve_task(enriched)
+
+    assert candidate.route_id == baseline.route_id
+    assert candidate.person_key == baseline.person_key
+    assert candidate.vehicle_key == baseline.vehicle_key
+    assert [
+        (route.route_id, route.cost) for route in candidate.routes
+    ] == [
+        (route.route_id, route.cost) for route in baseline.routes
+    ]
 
 
 def test_kalman_hungarian_only_keeps_cross_frame_identity():

@@ -259,8 +259,11 @@ def _litter_history(task: Mapping) -> List[dict]:
     frames = list(task.get("history_frames") or [])
     boxes = list(task.get("history_boxes") or [])
     confidences = list(task.get("history_confidences") or [])
+    provenance = list(task.get("history_provenance") or [])
+    lineage = list(task.get("history_lineage") or [])
     sample_count = max(
-        len(points), len(frames), len(boxes), len(confidences), 0
+        len(points), len(frames), len(boxes), len(confidences),
+        len(provenance), len(lineage), 0
     )
     samples = []
     for index in range(sample_count):
@@ -278,6 +281,14 @@ def _litter_history(task: Mapping) -> List[dict]:
                 _json_safe(confidences[index])
                 if index < len(confidences)
                 else None
+            ),
+            **(
+                {"provenance": _json_safe(provenance[index])}
+                if index < len(provenance) else {}
+            ),
+            **(
+                {"lineage": _json_safe(lineage[index])}
+                if index < len(lineage) else {}
             ),
         })
     return samples

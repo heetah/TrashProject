@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from scripts.evaluate_reviewed_readiness import evaluate
+from scripts.evaluate_reviewed_readiness import evaluate, write_outputs
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -99,9 +99,37 @@ def test_same_run_mapping_and_fail_closed_denominator(tmp_path: Path):
     assert by_clip["litter_case_2"]["outcome"] == "exploratory_event_match"
     assert by_clip["litter_case_3"]["outcome"] == "missed_event"
     assert report["event_detection_sensitivity"]["successes"] == 1
+    assert "not detector-only sensitivity" in report["event_match_metric_semantics"]
     assert report["provisional_end_to_end_route_correctness"]["successes"] == 1
     assert report["provisional_end_to_end_route_correctness"]["denominator"] == 3
     assert report["annotation_status"]["all_usable_event_labels_reviewed"] is False
     assert report["finable_case_correctness"]["rate"] is None
     assert report["release_gates"]["plate_ocr_gate"].startswith("BLOCKED_")
     assert report["release_gates"]["ready_for_enforcement"] is False
+
+
+def test_reviewed_labels_remove_stale_review_warning(tmp_path: Path):
+    report = {
+        "usable_positive_count": 1,
+        "event_detection_sensitivity": {"successes": 1, "denominator": 1, "rate": 1.0},
+        "provisional_end_to_end_route_correctness": {
+            "successes": 1,
+            "denominator": 1,
+            "rate": 1.0,
+        },
+        "route_correctness_given_accepted_event": {
+            "successes": 1,
+            "denominator": 1,
+            "rate": 1.0,
+        },
+        "annotation_status": {
+            "event_review_states": {"reviewed": 1},
+            "all_usable_event_labels_reviewed": True,
+        },
+    }
+
+    write_outputs(tmp_path, [], report)
+
+    text = (tmp_path / "REPORT.md").read_text(encoding="utf-8")
+    assert "Event labels are marked reviewed" in text
+    assert "Event labels are not fully reviewed" not in text

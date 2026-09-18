@@ -82,3 +82,20 @@ def test_clip_summary_does_not_treat_candidates_as_samples(tmp_path):
     )
     assert summary["clip_count"] == 1
     assert summary["confirmed_clip_count"] == 1
+
+
+def test_clip_summary_discovers_isolated_case_directory(tmp_path):
+    case_dir = tmp_path / "case_1"
+    case_dir.mkdir()
+    (case_dir / "litter_case_1_annotated_litter_candidates.jsonl").write_text(
+        '{"record_type":"litter_candidate","tracker_litter_id":2,'
+        '"tracker_state":"confirmed"}\n',
+        encoding="utf-8",
+    )
+
+    summary = summarize_clip_outputs(
+        [{"video_filename": "litter_case_1_annotated.mp4", "video_usable": True}],
+        tmp_path,
+    )
+
+    assert summary["confirmed_usable_clip_count"] == 1

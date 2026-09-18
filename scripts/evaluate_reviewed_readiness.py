@@ -206,6 +206,10 @@ def evaluate(
             "numeric tracker IDs are never compared across runs."
         ),
         "accepted_event_match_tiers": sorted(ACCEPTED_MATCH_TIERS),
+        "event_match_metric_semantics": (
+            "Assignment-conditioned event match: match_events uses the selected "
+            "route's release frame and point. This is not detector-only sensitivity."
+        ),
         "usable_positive_count": total,
         "confirmed_candidate_record_count": len(records),
         "event_match_tiers": dict(Counter(
@@ -260,8 +264,9 @@ def evaluate(
                 if replay_config else None
             ),
         },
-        "limitations": [
-            "The reported correctness is provisional until event annotations are independently reviewed.",
+        "limitations": ([
+            "The event annotations are not yet marked as human reviewed.",
+        ] if not labels_reviewed else []) + [
             "Positive-only data cannot measure false-positive rate or precision.",
             "No independent camera-group holdout is encoded, so generalization is unverified.",
             "Plate OCR and finable-case correctness are not evaluated by this positive route set.",
@@ -290,11 +295,19 @@ def write_outputs(output: Path, cases: Sequence[Mapping[str, Any]], report: Mapp
     detection = report["event_detection_sensitivity"]
     e2e = report["provisional_end_to_end_route_correctness"]
     conditional = report["route_correctness_given_accepted_event"]
+    reviewed = report["annotation_status"]["all_usable_event_labels_reviewed"]
+    review_sentence = (
+        "Event labels are marked reviewed, but reviewed negative and independent "
+        "cross-camera holdout sets are absent."
+        if reviewed
+        else "Event labels are not fully reviewed, and reviewed negative and independent "
+        "cross-camera holdout sets are absent."
+    )
     lines = [
         "# Fail-closed product readiness evaluation",
         "",
         f"- Fixed positive denominator: {report['usable_positive_count']} clips",
-        f"- Strict/moderate event sensitivity: {detection['successes']}/{detection['denominator']} = {_pct(detection['rate'])}",
+        f"- Assignment-conditioned strict/moderate event match: {detection['successes']}/{detection['denominator']} = {_pct(detection['rate'])}",
         f"- Provisional end-to-end route correctness: {e2e['successes']}/{e2e['denominator']} = {_pct(e2e['rate'])}",
         f"- Route correctness given an accepted event: {conditional['successes']}/{conditional['denominator']} = {_pct(conditional['rate'])}",
         f"- Event annotation states: {report['annotation_status']['event_review_states']}",
@@ -303,7 +316,7 @@ def write_outputs(output: Path, cases: Sequence[Mapping[str, Any]], report: Mapp
         "",
         "**BLOCKED — not ready for enforcement use.**",
         "",
-        "The 85% point estimate and Wilson lower-bound gates fail. Event labels are not fully reviewed, and reviewed negative and independent cross-camera holdout sets are absent.",
+        f"The 85% point estimate and Wilson lower-bound gates fail. {review_sentence}",
         "",
         "Tracker IDs were remapped from manual boxes against this exact run; historical numeric IDs were not reused.",
     ]
