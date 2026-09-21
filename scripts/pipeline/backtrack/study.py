@@ -64,7 +64,7 @@ class StudyConfig:
     release_window_prior_weight: float = 0.35
     max_release_back_seconds: Optional[float] = None
     release_soft_seconds: float = 0.25
-    release_time_weight: float = 1.0
+    release_time_weight: float = 0.0
     # Observation-time scales default to production soft-penalty bend points;
     # ``hard`` reproduces the former AND gate for controlled replay.
     max_observation_gap_seconds: float = 0.25

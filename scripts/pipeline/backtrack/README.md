@@ -35,7 +35,9 @@ Semantics:
 - `C_BA` uses a predicted person upper-body release zone plus an
   uncertainty-independent physical-distance gate. Larger covariance can only
   weaken a match; it cannot make a distant person valid.
-- `C_AC` uses person/vehicle endpoint, time, quality and uncertainty evidence.
+- `C_AC` uses person/vehicle endpoint, quality, uncertainty and continuity
+  evidence. Its person/vehicle synchronization-time feature remains recorded
+  for replay diagnostics but has zero production weight.
   Bbox overlap is still recorded for ablation but has zero production weight:
   a wrong-depth vehicle bbox can cover the person. It requires sustained
   support or a strong enter/exit endpoint, and does not reuse the litter anchor.
@@ -645,23 +647,23 @@ expanding NumPy crops into JSON would make sidecars several GB. Actor geometry,
 track IDs, confidence, observation flags and litter history remain replayable.
 
 
-### Release time / vehicle cost policy (promoted 2026-09-19)
+### Freshness-only production time cost (updated 2026-09-21)
 
 An explicit research configuration supports `normalize_bc_distance_time_by_gate=true`
 with `normalized_distance_gate_vehicle=0.4`. In the full stage this normalizes
 the BC distance term to `w_D * D/0.4`; its time term follows the selected
 observation-time mode. Production soft mode uses `w_T*rho(max(z_s,z_f))`, while
 `observation_time_cost_mode=hard` reproduces the former `T_E/0.25` feature and
-AND gate. Other BC terms and BA/AC weights remain unchanged.
+AND gate. Research stages may still restore historical weights explicitly.
 
 Production sets `max_release_back_seconds=1.0`,
-`release_soft_seconds=0.25` and `release_time_weight=1.0`, replacing the
-backward B0/B1 window prior with:
+`release_soft_seconds=0.25` and `release_time_weight=0.0`. Release time remains
+a bounded latent search dimension, but the former backward prior no longer
+contributes to production route ranking:
 
 ```text
 T_RB = max(0, (resolver_birth_frame - release_frame) / FPS)
-R = 0                                 for T_RB <= 0.25
-R = ((T_RB - 0.25) / 0.75)^2           for 0.25 < T_RB <= 1.0
+R = 0                                 for 0 <= T_RB <= 1.0
 reject hypothesis                     for T_RB > 1.0
 ```
 
@@ -670,9 +672,16 @@ confirm frame. The physical limit is applied before hypothesis enumeration,
 using `floor(FPS * max_release_back_seconds)`. Video-start bounds prevent
 negative release frames. A tighter computational limit still sets
 `search_truncated`; reaching the physical boundary alone does not. One-point
-fallback and two-point model priors remain intact. Post-birth hypotheses are
-still bounded by the observed airborne path and retain their existing forward
-penalty. Every event retains its full NULL route.
+fallback and two-point model priors remain active because they describe model
+reliability rather than elapsed time. Post-birth hypotheses are still bounded
+by the observed airborne path, but their former forward-time penalty is also
+zero. Every event retains its full NULL route.
+
+The only production time cost used for route ranking is BA/BC actor-observation
+freshness, `rho(max((gap_frames/FPS)/0.25, gap_frames/3))`. `C_AC` still
+requires spatial support plus sustained dwell or a strong endpoint transition,
+but its synchronization-time feature has zero production weight. Raw time and
+prior fields remain in sidecars so historical research replays stay auditable.
 
 The seconds values are production environment controls. A blank
 `SMART_BACKTRACK_MAX_BACK_FRAMES` derives `floor(FPS*T_max)`; a smaller explicit

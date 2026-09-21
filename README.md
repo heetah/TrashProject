@@ -201,6 +201,10 @@ point 為 `p`、vehicle bbox 為 `B`、bbox 寬高為 `w,h`，距離定義為
 是 soft boundary，不再直接刪除超界候選；固定秒數保留跨 FPS 的物理意義，
 frame尺度限制逐幀 detector observation 的陳舊程度。距離／不確定性 hard gate、
 有界 Kalman horizon 及完整 `NULL` route 仍保留，避免 forced match。
+Production 的時間排序項只保留這個 BA／BC actor-observation freshness
+cost；release time 仍作為一秒內的 latent search dimension，但不再加入
+quadratic prior，`C_AC` 的 person–vehicle observation synchronization 權重也為 0。
+AC dwell／continuity 結構證據、release model uncertainty、spatial gates 與 NULL 不變。
 
 Backtrack sidecar 用於標註、成本校正與 gate 分析。沒有人工 reviewed ground truth 時，只能報告 candidate coverage/resolved/dustbin，不能宣稱歸因準確率。
 
@@ -509,9 +513,9 @@ MP4 片段，並附一份列出違規、關聯車輛、車牌與審核資料的 
 | `SMART_BACKTRACK_TWO_POINT_MAX_BACK_SEC` | `0.4` | 舊 replay 相容欄位；新版不再作為兩點軌跡的物理截止 |
 | `SMART_BACKTRACK_TWO_POINT_PRIOR_COST` | `1.0` | 兩點常速 release hypothesis 基礎 prior cost |
 | `SMART_BACKTRACK_MAX_FORWARD_RELEASE_SEC` | `0.5` | ballistic release window 可晚於 detector birth 的上限；仍受已觀測 airborne 軌跡限制 |
-| `SMART_BACKTRACK_RELEASE_WINDOW_WEIGHT` | `0.35` | 超出 B0/B1 零成本窗後，每一個 observation-gap 的軟性 prior 增量 |
+| `SMART_BACKTRACK_RELEASE_WINDOW_WEIGHT` | `0.35` | 舊 replay 相容參數；production release-time cost 已關閉 |
 | `SMART_BACKTRACK_MAX_RELEASE_BACK_SEC` | `1.0` | production release hypothesis 的 seconds hard bound；51 筆有效 reviewed timing 的最大值為 0.9 秒，既有 1 秒 replay 為 2 gains / 0 losses |
-| `SMART_BACKTRACK_RELEASE_SOFT_SEC` | `0.25` | release-back quadratic prior 的零成本區上限；必須小於 1.0 秒 hard bound |
+| `SMART_BACKTRACK_RELEASE_SOFT_SEC` | `0.25` | 舊 replay／sidecar 相容參數；production 只保留 1.0 秒 hard bound，不計 release-time cost |
 | `SMART_BACKTRACK_MAX_BACK_FRAMES` | 空白 | 計算 guard；空白時以 `floor(FPS × MAX_RELEASE_BACK_SEC)` 推導，若人工設得更小會明確記錄 `search_truncated` |
 | `SMART_BACKTRACK_BC_BOUNDARY_DEPTH_WEIGHT` | `0.0` | `full/reverse` 中 release 點位於 vehicle bbox 深處的軟成本；`0` 關閉，須經 reviewed replay 後才啟用 |
 | `SMART_BACKTRACK_DIRECT_VEHICLE_COST` | `1.1` | direct-vehicle route penalty；與升版所用 frozen development replay 一致 |

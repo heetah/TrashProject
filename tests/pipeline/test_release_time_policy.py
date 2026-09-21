@@ -118,7 +118,23 @@ def test_config_roundtrip_null_and_sidecar_policy():
     assert result.route_type == 'null'
     assert len([r for r in result.routes if r.is_null]) == 1
     diag = next(r.metadata['candidate_diagnostics'] for r in result.routes if r.is_null)
-    assert diag['resolver_config']['release_window_semantics'] == 'seconds_quadratic'
-    assert all(r['time_prior_policy']=='seconds_quadratic' for r in diag['release_hypotheses'])
+    assert diag['resolver_config']['release_window_semantics'] == 'seconds_bound_only'
+    assert all(r['time_prior_policy']=='seconds_bound_only' for r in diag['release_hypotheses'])
     assert SmartBacktrackConfig().max_release_back_seconds == 1.0
     assert SmartBacktrackConfig().release_soft_seconds == 0.25
+    assert SmartBacktrackConfig().release_time_weight == 0.0
+
+
+def test_production_release_search_has_no_backward_time_cost():
+    config = SmartBacktrackConfig()
+    items = build_release_hypotheses(
+        [(100, 100), (110, 110)], [20, 21], 20,
+        config.max_back_frames, 10,
+        max_release_back_seconds=config.max_release_back_seconds,
+        release_soft_seconds=config.release_soft_seconds,
+        release_time_weight=config.release_time_weight,
+    )
+
+    assert items
+    assert all(item.time_prior_policy == "seconds_bound_only" for item in items)
+    assert all(item.window_prior_cost == pytest.approx(0.0) for item in items)

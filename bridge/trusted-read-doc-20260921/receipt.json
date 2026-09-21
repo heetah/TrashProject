@@ -1,0 +1,31 @@
+{
+  "bridgeVersion": "3.6",
+  "kind": "google-docs-trusted-read-receipt",
+  "status": "complete",
+  "target": {
+    "documentId": "1NxMLiXVmdF1IsxHXSJ_VLtgyyES7edLc3HX0W-Fn3VY",
+    "title": "專題彙報",
+    "revisionId": "ANLCKQmEB3H2lWJ8870dw5F_CE-KAZpXVYPPKZwoFQSC-fe6qCFPLzAIFDSbBf99XMX893nnVB6Je-nGmEEORXrRMtI2qZOsizWtLlpID0Y",
+    "documentUrl": "https://docs.google.com/document/d/1NxMLiXVmdF1IsxHXSJ_VLtgyyES7edLc3HX0W-Fn3VY",
+    "selectedTabId": null
+  },
+  "dropdownMetadata": {
+    "status": "unavailable",
+    "resolvedTool": null,
+    "authoritative": false,
+    "count": 0
+  },
+  "controlAwareness": {
+    "hasProtectedControls": false,
+    "authoritativeDropdownCount": 0,
+    "opaqueControlCount": 0,
+    "affectedParagraphCount": 0,
+    "nativeElementCounts": {
+      "inlineObjectElement": 5
+    },
+    "preservationRequired": false,
+    "recommendedBehavior": "No protected controls were detected in the scanned scope."
+  },
+  "warnings": [],
+  "error": null
+}

@@ -1,0 +1,59 @@
+{
+  "bridgeVersion": "3.6",
+  "kind": "google-docs-trusted-read",
+  "status": "complete",
+  "outputDir": "/home/under115a/under115a/trashProject/bridge/trusted-read-doc-20260921",
+  "target": {
+    "documentId": "1NxMLiXVmdF1IsxHXSJ_VLtgyyES7edLc3HX0W-Fn3VY",
+    "title": "專題彙報",
+    "revisionId": "ANLCKQmEB3H2lWJ8870dw5F_CE-KAZpXVYPPKZwoFQSC-fe6qCFPLzAIFDSbBf99XMX893nnVB6Je-nGmEEORXrRMtI2qZOsizWtLlpID0Y",
+    "documentUrl": "https://docs.google.com/document/d/1NxMLiXVmdF1IsxHXSJ_VLtgyyES7edLc3HX0W-Fn3VY",
+    "selectedTabId": null
+  },
+  "dropdownMetadata": {
+    "status": "unavailable",
+    "resolvedTool": null,
+    "authoritative": false,
+    "count": 0
+  },
+  "controlAwareness": {
+    "hasProtectedControls": false,
+    "authoritativeDropdownCount": 0,
+    "opaqueControlCount": 0,
+    "affectedParagraphCount": 0,
+    "nativeElementCounts": {
+      "inlineObjectElement": 5
+    },
+    "preservationRequired": false,
+    "recommendedBehavior": "No protected controls were detected in the scanned scope."
+  },
+  "warnings": [],
+  "files": {
+    "document_result": {
+      "path": "/home/under115a/under115a/trashProject/bridge/trusted-read-doc-20260921/document-result.json",
+      "bytes": 561002,
+      "sha256": "3aa584b5858983a53f1dd00310d26cfd9132debf32cdba81a01fcdba2e1ba587"
+    },
+    "control_inventory": {
+      "path": "/home/under115a/under115a/trashProject/bridge/trusted-read-doc-20260921/control-inventory.json",
+      "bytes": 5340,
+      "sha256": "59a9bcc3a0e842795dedea84a69fdcd2e2aa31a9ec426147370d552a293f11bc"
+    },
+    "document_outline": {
+      "path": "/home/under115a/under115a/trashProject/bridge/trusted-read-doc-20260921/document-outline.json",
+      "bytes": 129536,
+      "sha256": "2c7e1bbf8a6cf026c5b15130e6f52e3c0af7855bd40c7b02593c72fb92ed824e"
+    },
+    "document_text": {
+      "path": "/home/under115a/under115a/trashProject/bridge/trusted-read-doc-20260921/document-text.md",
+      "bytes": 36845,
+      "sha256": "fe8d574e359000f01f6362230acf6a37d86752e5dc79a6b392c70a7cb083945d"
+    },
+    "receipt": {
+      "path": "/home/under115a/under115a/trashProject/bridge/trusted-read-doc-20260921/receipt.json",
+      "bytes": 984,
+      "sha256": "72f5d1374703be0cf489d9dfac60280c9cac347584b895957fa272fe22436a23"
+    }
+  },
+  "error": null
+}

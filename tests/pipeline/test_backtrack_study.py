@@ -96,6 +96,12 @@ def test_production_defaults_are_no_expansion_d04_and_hybrid_time_soft_penalty()
         assert actual.vehicle_bbox_expand_y_ratio == pytest.approx(0.0)
         assert actual.cost_config.observation_time_cost_mode == "soft"
         assert actual.cost_config.observation_time_soft_kappa == pytest.approx(4.0)
+        assert actual.release_time_weight == pytest.approx(0.0)
+        assert actual.cost_config.ba_weights["time"] == pytest.approx(0.4)
+        assert actual.cost_config.bc_weights["time"] == pytest.approx(0.35)
+        assert actual.cost_config.ba_weights["release_prior"] == pytest.approx(1.0)
+        assert actual.cost_config.bc_weights["release_prior"] == pytest.approx(1.0)
+        assert actual.cost_config.ac_weights["time"] == pytest.approx(0.0)
 
 
 def test_study_can_replay_legacy_vehicle_gate():

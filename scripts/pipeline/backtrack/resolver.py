@@ -73,10 +73,13 @@ class SmartBacktrackConfig:
     release_window_prior_weight: float = 0.35
     max_release_back_seconds: Optional[float] = 1.0
     release_soft_seconds: float = 0.25
-    release_time_weight: float = 1.0
+    # Release time remains a bounded latent search dimension, but production
+    # does not score its former quadratic prior.  Historical replays may
+    # explicitly restore a positive weight.
+    release_time_weight: float = 0.0
     # Production time scales: 0.25 seconds and 3 frames are the bend points of
-    # the hybrid soft penalty. Direct-vehicle distance remains a physical hard
-    # gate on the unexpanded bbox. Research replays may override every value.
+    # the retained actor-observation freshness penalty. Direct-vehicle
+    # distance remains a physical hard gate on the unexpanded bbox.
     max_observation_gap_seconds: float = 0.25
     max_observation_gap_frames: Optional[int] = 3
     normalized_distance_gate_person: float = 0.85
@@ -1100,7 +1103,12 @@ class SmartBacktrackResolver:
                     self.config.release_window_prior_weight
                 ),
                 "release_window_semantics": (
-                    "seconds_quadratic" if self.config.max_release_back_seconds is not None
+                    (
+                        "seconds_bound_only"
+                        if self.config.release_time_weight == 0.0
+                        else "seconds_quadratic"
+                    )
+                    if self.config.max_release_back_seconds is not None
                     else "B0_B1_observation_gap_soft_prior"
                 ),
                 "max_release_back_seconds": self.config.max_release_back_seconds,

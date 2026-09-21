@@ -687,9 +687,13 @@ def build_release_hypotheses(
         backward_seconds = max(0.0, (birth_frame - item.frame_index) / fps)
         if backward_seconds > max_release_back_seconds:
             continue
-        # Forward hypotheses retain their explicit existing penalty.
         window_cost = item.window_prior_cost
-        if item.frame_index <= birth_frame:
+        if release_time_weight == 0.0:
+            # Production keeps release time as a bounded search dimension but
+            # charges no backward or forward release-time cost. Model-quality
+            # priors (two-point/fallback) remain separate in ``prior_cost``.
+            window_cost = 0.0
+        elif item.frame_index <= birth_frame:
             fraction = max(0.0, backward_seconds - release_soft_seconds) / (
                 max_release_back_seconds - release_soft_seconds
             )
@@ -703,7 +707,10 @@ def build_release_hypotheses(
                 0, birth_frame - int(math.floor(release_soft_seconds * fps))
             ),
             zero_cost_window_end_frame=birth_frame,
-            time_prior_policy="seconds_quadratic",
+            time_prior_policy=(
+                "seconds_bound_only"
+                if release_time_weight == 0.0 else "seconds_quadratic"
+            ),
             release_back_seconds=backward_seconds,
             max_release_back_seconds=max_release_back_seconds,
             search_truncated=truncated,

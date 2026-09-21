@@ -337,6 +337,10 @@ def test_observation_time_soft_penalty_uses_stricter_seconds_or_frames_scale():
     assert hybrid.raw_features["time"] == pytest.approx(
         4 / 3 + 4 * (1 / 3) ** 2
     )
+    assert hybrid.components["time"] == pytest.approx(
+        0.35 * hybrid.raw_features["time"]
+    )
+    assert hybrid.components["release_prior"] == pytest.approx(0.0)
     assert seconds_only.raw_features["time"] == pytest.approx((4 / 30) / .25)
 
     low_fps_vehicle = [ActorObservation(
@@ -586,6 +590,30 @@ def test_c_ac_accepts_sustained_near_vehicle_evidence():
     cost = compute_c_ac(people, vehicles, fps=10)
 
     assert cost.valid
+
+
+def test_c_ac_records_sync_gap_without_charging_a_time_cost():
+    people = [
+        ActorObservation(
+            "person", 1, frame, (40.0, 30.0, 80.0, 150.0),
+            evidence_frame_index=frame,
+        )
+        for frame in (0, 2)
+    ]
+    vehicles = [
+        ActorObservation(
+            "vehicle", 2, frame, (0.0, 60.0, 180.0, 170.0),
+            evidence_frame_index=frame + 1,
+        )
+        for frame in (0, 2)
+    ]
+
+    cost = compute_c_ac(people, vehicles, fps=10)
+
+    assert cost.valid
+    assert cost.raw_features["time"] > 0.0
+    assert cost.weights["time"] == pytest.approx(0.0)
+    assert cost.components["time"] == pytest.approx(0.0)
 
 
 def test_c_ac_dwell_must_be_contiguous_not_two_distant_points():

@@ -40,7 +40,7 @@ class BacktrackCostConfig:
     ac_weights: Mapping[str, float] = field(default_factory=lambda: {
         # Wrong-depth vehicle boxes often cover a nearby person. Footpoint
         # distance is primary; overlap remains recorded but has zero weight.
-        "endpoint_proximity": 1.0, "overlap": 0.0, "time": .2,
+        "endpoint_proximity": 1.0, "overlap": 0.0, "time": 0.0,
         "quality": .3, "uncertainty": .15, "continuity": .25,
     })
     # Production/full keeps the historical feature values. Research D+T
