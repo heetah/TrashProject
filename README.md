@@ -20,6 +20,10 @@ trashProject/
 │   │   ├── calibration/         # Online pseudo-homography calibration
 │   │   ├── infra/               # model、motion、video I/O、worker
 │   │   ├── litter/              # litter trajectory helpers
+│   │   ├── actor_gate.py        # fresh YOLO-Seg observation TTL gate
+│   │   ├── event_confirmation.py # litter confirmation reason/evidence
+│   │   ├── quarantine_evidence.py # vehicle-contained release reasons
+│   │   ├── confirmation_sampling.py # deterministic case-result sampling
 │   │   └── backtrack/           # Kalman/RTS/cost/flow/sidecar
 │   ├── frontend/                # analysis JSON 靜態 dashboard
 │   └── *.py                     # compatibility shims 與工具入口
@@ -93,6 +97,7 @@ RT-DETR 或 STGCN 的 CUDA kernels 同時執行。主模型同幀順序及所有
 YOLO-Seg 負責 vehicle/scooter detection 與 tracking，並提供 vehicle gate、person association、反追蹤及 OCR 的車輛候選。它不負責 STGCN action 或直接確認垃圾事件。
 
 `VEHICLE_GATE` 預設開啟；最近出現車輛的 TTL 預設為 3 秒。沒有近期車輛時，系統可略過昂貴的 pose、STGCN、RT-DETR 與 OCR 路徑。
+TTL 只由 YOLO-Seg fresh observation (`observed=true`) 更新；跳幀 cache、prediction 或其他 stale state 不會延長閘門。source FPS 保留原始浮點值，不以四捨五入值換算時間。
 
 ### Person action
 
@@ -126,6 +131,25 @@ batch、batch repair 與 TensorRT smoke test 共用同一個 input builder。
 6. 幾乎完全位於 vehicle/scooter 內的候選進入 tracker-only quarantine，不可直接 confirmation。
 7. Quarantine 只能由同一載體座標系中連續下落軌跡解除；離開載體的普通候選改建獨立 pending 軌跡，禁止隔離歷史污染正常確認。
 8. `GlobalLitterTracker` trajectory、displacement、temporal confirmation。
+
+Confirmation path 由 `scripts/pipeline/event_confirmation.py` 統一記錄
+`by_trajectory`、`by_motion`、`vehicle_fast_drop`、`fall_then_stable` 與
+`vehicle_quarantine` veto。它只整理既有 gates，不降低 threshold；每條 active litter
+保留 `confirmation_evidence` reason，供抽樣 failure triage。
+首次 confirmed event 會將 `confirmation_evidence` 與
+`vehicle_quarantine_evidence` 一併寫入事件 JSON；欄位是 runtime gate provenance，
+不是人工標註、accuracy 或自動開罰依據。
+
+Vehicle quarantine 另由 `scripts/pipeline/quarantine_evidence.py` 分類
+`insufficient_observations`、`relative_displacement_insufficient`、
+`relative_downward_insufficient`、`downward_steps_insufficient` 與 `released`；
+這些 reason 是影像像素／觀測次數的診斷，不是機率或 accuracy。
+
+抽樣驗證使用 `scripts/pipeline/confirmation_sampling.py`：先依 `clip_id` 排序，
+再取固定間距 sample，保留每案的 stage、candidate count、confirmed count 與明確
+reason。舊 artifact 沒有 reason 欄位時一律標記
+`unavailable_legacy_artifact`，不從 aggregate count 反推原因；因此抽樣報告是
+failure triage 證據，不是 accuracy 或 ground truth。
 
 稀疏 detector observation 可使用兩種有界 temporal evidence，但都不能自行建立軌跡：
 
@@ -423,7 +447,12 @@ MP4 片段，並附一份列出違規、關聯車輛、車牌與審核資料的 
 | `MOTION_MIN_COMPONENT_AREA` | `4` | Litter motion evidence 的最小 component 面積 |
 | `SMART_BACKTRACK` | `1` | Smart attribution enable |
 | `SMART_BACKTRACK_SIDECAR` | `0` | Research candidate sidecar；需明確設 `1` 啟用 |
-| `SMART_BACKTRACK_MASK_DIAGNOSTICS` | `0` | 只記錄 observed YOLO-Seg mask 與 raw litter bbox 的純量關係；不進入成本、route 或 NULL 判定 |
+| `SMART_BACKTRACK_MASK_DIAGNOSTICS` | `0` | 額外輸出 raw litter bbox 與 observed mask 的研究診斷；不影響決策 |
+| `SMART_BACKTRACK_GUARDED_RESELECT` | `1` | 在既有 valid routes 中依凍結的五項多證據 guards 重選；不新增 route、不移除 NULL |
+| `SMART_BACKTRACK_MASK_RESELECT` | `1` | 保存 observed YOLO-Seg bounded contour，使用 seconds-based temporal signed-mask crossing guard；缺資料維持原 route |
+| `SMART_BACKTRACK_MASK_PRE_SEC` / `MASK_POST_SEC` | `0.20` / `0.10` | release 前後 mask 時間窗；以影片 FPS 離散化，不再使用固定 raw-frame offsets |
+| `SMART_BACKTRACK_MASK_MIN_PRE_OBS` / `MIN_RELEASE_OBS` | `1` / `1` | crossing rule 所需的最低 fresh YOLO-Seg observation 數 |
+| `SMART_BACKTRACK_MASK_MAX_PRE_OBS` / `MAX_RELEASE_OBS` | `2` / `2` | 每個時間窗最多保留最接近 release 的 fresh observations，限制高 FPS 重複證據與計算量 |
 | `SMART_BACKTRACK_STUDY_STAGE` | `full` | Research ablation stage；production 預設不變 |
 | `SMART_BACKTRACK_RAW_PREFIX` | `1` | confirmed event 才能使用 pre-postprocessing RT-DETR bbox 補 release trajectory；不參與 event confirmation |
 | `SMART_BACKTRACK_DT_DISTANCE_WEIGHT` | `1.0` | D+T stage 的 gate-normalized distance weight |
@@ -481,7 +510,11 @@ MP4 片段，並附一份列出違規、關聯車輛、車牌與審核資料的 
 | `SMART_BACKTRACK_TWO_POINT_PRIOR_COST` | `1.0` | 兩點常速 release hypothesis 基礎 prior cost |
 | `SMART_BACKTRACK_MAX_FORWARD_RELEASE_SEC` | `0.5` | ballistic release window 可晚於 detector birth 的上限；仍受已觀測 airborne 軌跡限制 |
 | `SMART_BACKTRACK_RELEASE_WINDOW_WEIGHT` | `0.35` | 超出 B0/B1 零成本窗後，每一個 observation-gap 的軟性 prior 增量 |
+| `SMART_BACKTRACK_MAX_RELEASE_BACK_SEC` | `1.0` | production release hypothesis 的 seconds hard bound；51 筆有效 reviewed timing 的最大值為 0.9 秒，既有 1 秒 replay 為 2 gains / 0 losses |
+| `SMART_BACKTRACK_RELEASE_SOFT_SEC` | `0.25` | release-back quadratic prior 的零成本區上限；必須小於 1.0 秒 hard bound |
+| `SMART_BACKTRACK_MAX_BACK_FRAMES` | 空白 | 計算 guard；空白時以 `floor(FPS × MAX_RELEASE_BACK_SEC)` 推導，若人工設得更小會明確記錄 `search_truncated` |
 | `SMART_BACKTRACK_BC_BOUNDARY_DEPTH_WEIGHT` | `0.0` | `full/reverse` 中 release 點位於 vehicle bbox 深處的軟成本；`0` 關閉，須經 reviewed replay 後才啟用 |
+| `SMART_BACKTRACK_DIRECT_VEHICLE_COST` | `1.1` | direct-vehicle route penalty；與升版所用 frozen development replay 一致 |
 | `LITTER_DEBUG` | `0` | 設為 `1` 時輸出逐幀診斷；annotated video 顯示 actor track ID，並以洋紅框顯示 RT-DETR 通過 class/confidence、但尚未經 geometry/motion/holding/tracker 後處理的 litter bbox 與 confidence |
 | `LITTER_FP_CONTAINMENT_THR` | `0.999` | 車輛容納判定門檻；命中時不丟棄候選，而是進入無法直接 confirmation 的 tracker-only quarantine |
 | `LITTER_VEHICLE_QUARANTINE_MIN_OBSERVATIONS` | `3` | 同載體相對軌跡至少 observation 數，不足時保持 pending |
@@ -687,13 +720,19 @@ loss 1（破壞 case 25）。
 同日後續研究加入預設關閉的 `SMART_BACKTRACK_MASK_DIAGNOSTICS`。它只在原始
 YOLO-Seg polygon 被丟棄前，計算 mask overlap、bbox containment、mask fill ratio 與
 尺度正規化 signed distance；只接受 `observed=True` 的 `seg_track/seg_predict`，不使用
-cache/Kalman，也不保存 polygon 或 bitmap。診斷資料完全不進 resolver。case 9 顯示錯車
+cache/Kalman。case 9 顯示錯車
 bbox 可覆蓋垃圾約 90%，但 visible mask overlap 為 0，確認 bbox proximity 會產生假支持；
 case 168 則顯示垃圾在人工正確背景車之前的另一車 visible mask 內，證明單幀 mask 不能
 直接當「深度」或加權來源。case 67 在每幀 actor inference 的獨立 run 中改為正確 route，
 但 mask overlap 仍為 0，改善來源是 detection cadence/release evidence，不是 mask。
-目前沒有獨立 reviewed ordinal front/behind 標註，因此 temporal occlusion 仍只具研究潛力，
-尚未提升或重新宣稱 58 案準確率。
+2026-09-18 依使用者要求，凍結的 `{release,+1}` temporal signed-mask crossing 與五項
+guarded route comparisons 已接入 production resolver。線上 task 只多保存 observed mask
+的 bounded contour（每個 contour 最多 512 點），resolver 只在既有 valid routes 間重選；
+不改 event confirmation、hard gates、route costs 或完整 `NULL` route。缺 contour 或任一
+必要證據時 fail closed 維持原 route。凍結 58 部 development 正片結果為 48/58
+（82.76%），不是 85%（至少 50/58），且尚無 camera/source-disjoint holdout 或 reviewed
+negative-set 驗證，因此不得對外宣稱 production accuracy 已達 85%。dynamic
+pseudo-homography 仍預設關閉，未包含在本次升版。
 
 已完成的 RT-DETR intermediate 研究使用預設不接入 production 的 `.pt` 中間張量
 驗證器；一次性 `analyze_rtdetr_intermediates.py` 與其輔助模組已封存。該研究攔截

@@ -15,6 +15,7 @@ from ultralytics import YOLO
 from ultralytics import RTDETR
 
 from pipeline.detect import detect_batch
+from pipeline.timebase import resolve_source_fps
 from pipeline.litter_tracker import GlobalLitterTracker
 from pipeline.action import STGCNActionModule
 from pipeline.plate import (
@@ -256,7 +257,7 @@ if __name__ == "__main__":
                 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
                 raw_fps = cap.get(cv2.CAP_PROP_FPS)
-                fps = round(raw_fps) if raw_fps > 0 else 30
+                fps = resolve_source_fps(raw_fps, fallback=30.0)
             if not cap.isOpened():
                 raise FileNotFoundError(f"Unable to open video: {video_path}")
             if width <= 0 or height <= 0:

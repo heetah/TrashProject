@@ -78,6 +78,7 @@ def test_mask_litter_summary_rejects_cached_missing_and_invalid_masks():
 
 def test_tracker_flag_off_adds_no_diagnostic_key(monkeypatch):
     monkeypatch.delenv("SMART_BACKTRACK_MASK_DIAGNOSTICS", raising=False)
+    monkeypatch.setenv("SMART_BACKTRACK_MASK_RESELECT", "1")
     tracker = GlobalLitterTracker(fps=10)
     try:
         tracker._record_actor_frame(
@@ -87,12 +88,14 @@ def test_tracker_flag_off_adds_no_diagnostic_key(monkeypatch):
         )
         row = tracker._smart_actor_history[-1]
         assert list(row) == ["frame_index", "actors"]
+        assert len(row["actors"][0]["mask_contour_xy"]) == 4
+        assert "mask_contour_xy" not in tracker.actor_frame_history[-1]["actors"][0]
         assert "mask_poly" not in json.dumps(row, allow_nan=False)
     finally:
         tracker.close()
 
 
-def test_tracker_flag_on_records_scalars_but_never_polygon(monkeypatch):
+def test_tracker_diagnostics_records_scalars_but_never_raw_polygon(monkeypatch):
     monkeypatch.setenv("SMART_BACKTRACK_MASK_DIAGNOSTICS", "1")
     tracker = GlobalLitterTracker(fps=10)
     try:
@@ -107,6 +110,18 @@ def test_tracker_flag_on_records_scalars_but_never_polygon(monkeypatch):
         encoded = json.dumps(row, allow_nan=False)
         assert "mask_poly" not in encoded
         assert len(encoded) < 3_000
+    finally:
+        tracker.close()
+
+
+def test_tracker_mask_reselection_rejects_cached_mask(monkeypatch):
+    monkeypatch.setenv("SMART_BACKTRACK_MASK_RESELECT", "1")
+    tracker = GlobalLitterTracker(fps=10)
+    try:
+        tracker._record_actor_frame(
+            [_vehicle(source="cache", observed=False)], frame_index=3
+        )
+        assert "mask_contour_xy" not in tracker._smart_actor_history[-1]["actors"][0]
     finally:
         tracker.close()
 

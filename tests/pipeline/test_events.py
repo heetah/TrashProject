@@ -60,6 +60,15 @@ def test_litter_event_has_time_segment_and_normalized_plate_confidence():
             "vehicle_key": ["vehicle", 9],
             "detector_confidence": 0.87654,
             "escalated": True,
+            "confirmation_evidence": {
+                "confirmed": True,
+                "rule": "by_trajectory",
+                "reason": "supported",
+            },
+            "vehicle_quarantine_evidence": {
+                "status": "inactive",
+                "reason": "not_contained",
+            },
             "backtrack": {"release_frame": 42, "confirm_frame": 60},
         }],
         {9: {"license_plate": {"number": "ABC1234", "conf": 0.91234}}},
@@ -70,6 +79,8 @@ def test_litter_event_has_time_segment_and_normalized_plate_confidence():
     assert event["license_plate_confidence"] == 0.9123
     assert event["license_plate_status"] == "recognized"
     assert event["detector_confidence"] == 0.8765
+    assert event["confirmation_evidence"]["rule"] == "by_trajectory"
+    assert event["vehicle_quarantine_evidence"]["reason"] == "not_contained"
     assert event["time_segment"] == {
         "start_frame": 42,
         "end_frame": 60,
@@ -408,6 +419,32 @@ def test_analysis_counts_direct_vehicle_thrower_and_missing_plate():
         "attribution_status": None,
         "review_required": True,
     }
+
+
+def test_analysis_keeps_confirmation_gate_provenance_when_present():
+    report = build_analysis_report(
+        {"processed_frames": 10},
+        [{
+            "type": "litter",
+            "litter_id": 4,
+            "frame_index": 8,
+            "bbox": [1, 2, 3, 4],
+            "confirmation_evidence": {
+                "confirmed": True,
+                "rule": "by_motion",
+                "reason": "supported",
+            },
+            "vehicle_quarantine_evidence": {
+                "status": "inactive",
+                "reason": "not_contained",
+            },
+        }],
+        {},
+        fps=10,
+    )
+    event = report["events"][0]
+    assert event["confirmation_evidence"]["rule"] == "by_motion"
+    assert event["vehicle_quarantine_evidence"]["reason"] == "not_contained"
 
 
 def test_tracker_captures_confirmed_litter_event():

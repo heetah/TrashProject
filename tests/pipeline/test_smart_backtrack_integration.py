@@ -633,15 +633,12 @@ def test_finalize_flushes_last_task_and_rewrites_authoritative_event(monkeypatch
         assert len(sidecar["release_hypotheses"]) >= 1
         release_diagnostic = sidecar["release_hypotheses"][0]
         assert release_diagnostic["observation_gap_frames"] == 1
-        assert release_diagnostic["zero_cost_window_start_frame"] == 9
+        assert release_diagnostic["zero_cost_window_start_frame"] == 8
         assert release_diagnostic["zero_cost_window_end_frame"] == 10
         assert "window_prior_cost" in release_diagnostic
         assert "direction_consistency" in release_diagnostic
-        assert release_diagnostic["search_truncated"] is True
-        assert (
-            release_diagnostic["truncation_reason"]
-            == "max_back_frames_computational_guard"
-        )
+        assert release_diagnostic["search_truncated"] is False
+        assert release_diagnostic["truncation_reason"] is None
         assert set(sidecar["pair_costs"]) == {
             "BA", "BA_by_release", "AC", "BC", "BC_by_release"
         }

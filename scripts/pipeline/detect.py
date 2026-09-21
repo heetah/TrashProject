@@ -5,6 +5,12 @@ import numpy as np
 import math
 import os
 from pipeline.plate import detect_license_plates, dispatch_license_plate_rois, get_plate_number
+from pipeline.actor_gate import (
+    batch_has_active_gate,
+    has_fresh_observation,
+    is_within_ttl,
+    refresh_last_observation_frame,
+)
 from pipeline.profiling import profile_block
 from pipeline.devices import BBOX_DEVICE, BBOX_HALF, TRASH_DEVICE, TRASH_HALF
 from pipeline.litter.input4c import build_litter_model_input, compute_pixel_change_map
@@ -80,13 +86,12 @@ def _vehicle_gate_any_active(actor_pairs, frame_indices, yolo_seg_cache, fps):
     if not _vehicle_gate_enabled():
         return True
     ttl = _vehicle_gate_ttl_frames(fps)
-    last_fi = yolo_seg_cache.get('last_vehicle_frame_index')
-    for (_persons, vehicles), frame_index in zip(actor_pairs, frame_indices):
-        if vehicles:
-            last_fi = frame_index
-        if last_fi is not None and (frame_index - int(last_fi)) <= ttl:
-            return True
-    return False
+    return batch_has_active_gate(
+        actor_pairs,
+        frame_indices,
+        yolo_seg_cache.get('last_vehicle_frame_index'),
+        ttl,
+    )
 
 
 def _model_class_name(model, cls_id):
@@ -387,15 +392,21 @@ def _stage_resolve_actor_sources(frame, model_bbox, precomputed_persons, precomp
 
 def _stage_vehicle_gate(vehicles, yolo_seg_cache, frame_index, fps, stats):
     # 車輛閘門:記錄最近看到 vehicle/scooter 的幀,判斷是否在 TTL 秒數窗內。
-    if vehicles:
-        yolo_seg_cache['last_vehicle_frame_index'] = frame_index
+    fresh_vehicle = has_fresh_observation(vehicles)
+    if fresh_vehicle:
+        yolo_seg_cache['last_vehicle_frame_index'] = refresh_last_observation_frame(
+            yolo_seg_cache.get('last_vehicle_frame_index'),
+            vehicles,
+            frame_index,
+        )
     if not _vehicle_gate_enabled():
         vehicle_active = True
     else:
         last_vehicle_fi = yolo_seg_cache.get('last_vehicle_frame_index')
-        vehicle_active = (
-            last_vehicle_fi is not None and
-            (frame_index - int(last_vehicle_fi)) <= _vehicle_gate_ttl_frames(fps)
+        vehicle_active = is_within_ttl(
+            frame_index,
+            last_vehicle_fi,
+            _vehicle_gate_ttl_frames(fps),
         )
     if stats is not None and not vehicle_active:
         stats['vehicle_gate_skipped_frames'] = stats.get('vehicle_gate_skipped_frames', 0) + 1

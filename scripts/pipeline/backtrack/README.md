@@ -72,8 +72,10 @@ Semantics:
 
 ### Ordinal occlusion feasibility boundary
 
-`SMART_BACKTRACK_MASK_DIAGNOSTICS` only exports bounded mask/litter scalars for
-research. The resolver does not read them and their production weight is zero.
+`SMART_BACKTRACK_MASK_DIAGNOSTICS` only exports extra bounded mask/litter
+scalars for research, and the resolver still ignores that diagnostic field.
+Separately, `SMART_BACKTRACK_MASK_RESELECT=1` retains a bounded observed contour
+for the temporal crossing guard; it is a hard comparison, not a cost weight.
 Visible segmentation-mask containment is not metric depth and does not identify
 the litter source; a foreground vehicle may contain the litter pixel while being
 the wrong thrower.
@@ -100,17 +102,27 @@ Production entrypoint 會從 repository root `.env` 載入以下控制項；shel
 
 ```text
 SMART_BACKTRACK=1
-SMART_BACKTRACK_MAX_BACK_FRAMES=<2.4 seconds worth of frames; 24 at 10 FPS; computational guard>
+SMART_BACKTRACK_MAX_RELEASE_BACK_SEC=1.0
+SMART_BACKTRACK_RELEASE_SOFT_SEC=0.25
+SMART_BACKTRACK_MAX_BACK_FRAMES=<blank derives floor(FPS * 1.0 s); computational guard>
 SMART_BACKTRACK_CONTEXT_SEC=10.0
 SMART_BACKTRACK_RAW_PREFIX=1
 SMART_BACKTRACK_TOPK_PERSON=5
 SMART_BACKTRACK_TOPK_VEHICLE=5
 SMART_BACKTRACK_DUSTBIN_COST=7.0
 SMART_BACKTRACK_NULL_VEHICLE_COST=1.4
-SMART_BACKTRACK_DIRECT_VEHICLE_COST=0.9
+SMART_BACKTRACK_DIRECT_VEHICLE_COST=1.1
 SMART_BACKTRACK_AC_WEIGHT=0.75
 SMART_BACKTRACK_BC_SUPPORT_BONUS=0.25
 SMART_BACKTRACK_BC_BOUNDARY_DEPTH_WEIGHT=0.0
+SMART_BACKTRACK_GUARDED_RESELECT=1
+SMART_BACKTRACK_MASK_RESELECT=1
+SMART_BACKTRACK_MASK_PRE_SEC=0.20
+SMART_BACKTRACK_MASK_POST_SEC=0.10
+SMART_BACKTRACK_MASK_MIN_PRE_OBS=1
+SMART_BACKTRACK_MASK_MIN_RELEASE_OBS=1
+SMART_BACKTRACK_MASK_MAX_PRE_OBS=2
+SMART_BACKTRACK_MASK_MAX_RELEASE_OBS=2
 SMART_BACKTRACK_SIGMA_FLOOR=2.0
 SMART_BACKTRACK_TWO_POINT_MAX_BACK_SEC=0.4
 SMART_BACKTRACK_TWO_POINT_PRIOR_COST=1.0
@@ -214,18 +226,19 @@ The module does not read `history_lineage`, multiply observation likelihoods,
 construct identity/visibility states, choose top-1, or write resolver output.
 Its posterior is conditional on explicitly supplied priors and likelihoods; it
 is not calibrated attribution accuracy. Release windows, bandwidths, gates and
-weights remain entirely caller-supplied. Production `trajectory.py`,
-`costs.py`, `resolver.py`, flow routes and schemas are unchanged.
+weights remain entirely caller-supplied. Phase 1A itself does not call or alter
+production `trajectory.py`, `costs.py`, `resolver.py`, flow routes or schemas;
+the later guarded promotion below is a separate implementation.
 
-### Target-48 guarded route composition (research only)
+### Target-48 guarded route composition (promoted 2026-09-18)
 
-The frozen 58-clip development sidecar was also evaluated with a research-only
+The frozen 58-clip development sidecar was evaluated with a research
 composition of five guarded comparisons: a ballistic boundary-ambiguity check,
 same-vehicle person disambiguation from `C_AC` endpoint distance, a high/low
 `C_BC` quality consistency check, a weak person-to-vehicle association check,
 and a same-model motion-consistency check. Each comparison uses only existing
 dimensionless sidecar features and an explicit route-cost-difference bound; it
-does not add a production weight, alter event confirmation, or remove the
+does not add a cost weight, alter event confirmation, or remove the
 complete `NULL` route. `boundary_depth` remains a normalized image-box edge
 diagnostic, not metric depth or a pseudo-homography reconstruction.
 
@@ -237,10 +250,29 @@ diagnostic is `p=0.0625`; the point estimate reaches the interim 48/58 target,
 but the 85% gate requires 50/58 and the Wilson lower bound is only 0.711.
 Nine existing confidence/scale/compression sidecars reproduce 48/58 with no
 losses. This is decision-stability evidence on the same development cohort,
-not calibrated accuracy or cross-camera generalization. The candidate has no
-production caller; thresholds must be preregistered and re-evaluated on a
-reviewed camera/source-recording-disjoint holdout and a reviewed negative set
-before any promotion.
+not calibrated accuracy or cross-camera generalization. At the user's explicit
+request, this frozen policy now runs after Min-Cost Flow through
+`route_reselection.py`. It only selects an already valid route. Missing or
+non-finite rule evidence keeps the current route, NULL is immutable, and every
+change records its rule/from/to audit trail. The promotion is reversible with
+`SMART_BACKTRACK_GUARDED_RESELECT=0`; temporal mask use can be disabled alone
+with `SMART_BACKTRACK_MASK_RESELECT=0`.
+
+The online mask path retains only observed `seg_track`/`seg_predict` contours,
+bounded to 512 vertices; cached/Kalman boxes are not treated as fresh mask
+measurements. Signed distance is `tanh(d_polygon / bbox_diagonal)`. Production
+uses `[-0.20,0)` seconds for pre-release evidence and `[0,+0.10]` seconds for
+release evidence. Each interval keeps at most the two fresh observations nearest
+release and requires at least one; insufficient evidence leaves the Min-Cost
+Flow route unchanged. For constant-FPS inputs the frame spans are
+`floor(FPS*T_pre)` and `floor(FPS*T_post)`. This is a visible-silhouette
+relation, not metric depth. The prior 48/58 point estimate belongs to the
+fixed-offset predecessor and must not be transferred to this seconds-based
+online policy without an end-to-end paired rerun.
+
+This promotion does not satisfy the release gate: 48/58 is 82.76%, while 85%
+requires at least 50/58. A reviewed camera/source-recording-disjoint holdout and
+reviewed negative set remain required before an external accuracy claim.
 
 The complete rule equations, hashes, case-level gains, temporal-offset
 sensitivity and rollback boundary are recorded in
@@ -613,7 +645,7 @@ expanding NumPy crops into JSON would make sidecars several GB. Actor geometry,
 track IDs, confidence, observation flags and litter history remain replayable.
 
 
-### Release time / vehicle cost proposal (2026-09-05)
+### Release time / vehicle cost policy (promoted 2026-09-19)
 
 An explicit research configuration supports `normalize_bc_distance_time_by_gate=true`
 with `normalized_distance_gate_vehicle=0.4`. In the full stage this normalizes
@@ -622,8 +654,9 @@ observation-time mode. Production soft mode uses `w_T*rho(max(z_s,z_f))`, while
 `observation_time_cost_mode=hard` reproduces the former `T_E/0.25` feature and
 AND gate. Other BC terms and BA/AC weights remain unchanged.
 
-Set `max_release_back_seconds=1.0`, `release_soft_seconds=0.25` and
-`release_time_weight=1.0` to replace the backward B0/B1 window prior with:
+Production sets `max_release_back_seconds=1.0`,
+`release_soft_seconds=0.25` and `release_time_weight=1.0`, replacing the
+backward B0/B1 window prior with:
 
 ```text
 T_RB = max(0, (resolver_birth_frame - release_frame) / FPS)
@@ -641,9 +674,14 @@ fallback and two-point model priors remain intact. Post-birth hypotheses are
 still bounded by the observed airborne path and retain their existing forward
 penalty. Every event retains its full NULL route.
 
-These fields are constructor/StudyConfig options, not new production environment
-switches. Production defaults use D=0.4 and the observation-gap prior. Run
-the four controlled proposals against the same frozen confirmed detections:
+The seconds values are production environment controls. A blank
+`SMART_BACKTRACK_MAX_BACK_FRAMES` derives `floor(FPS*T_max)`; a smaller explicit
+frame guard is allowed only as a computational truncation and is reported in
+the sidecar. The 51 usable reviewed timing rows have P90 0.5 s, P95 0.7 s and
+maximum 0.9 s; seven sentinel rows are excluded. The earlier 1-second replay
+gained two clips and lost none, but this repeatedly examined positive set is
+not cross-camera validation. Run controlled replays against identical confirmed
+detections with:
 
 ```bash
 OPENBLAS_NUM_THREADS=1 conda run -n rtdetr python scripts/replay_release_policy.py \
@@ -690,6 +728,9 @@ Schema `smart-backtrack-candidates/v1` contains:
 - every actor tracklet observation, including `tracklet_uid`;
 - `C_BA`, `C_AC`, `C_BC`, per-release cells, valid/rejected state and hard-gate
   reason;
+- with `SMART_BACKTRACK_MASK_RESELECT=1`, observed vehicle/scooter rows may also
+  contain `mask_contour_xy`, capped at 512 vertices; no bitmap or model feature
+  tensor is retained;
 - for valid cells, `raw_features`, `weights`, weighted `components`, and
   `feature_details` showing all three together;
 - routes before top-K pruning, pruning reason, final ranked routes and exactly

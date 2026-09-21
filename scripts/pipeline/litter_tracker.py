@@ -20,6 +20,9 @@ from pipeline.geometry import (
     litter_holding,
 )
 from pipeline.backtrack.mask_diagnostics import build_mask_litter_diagnostics
+from pipeline.backtrack.route_reselection import compact_mask_polygon
+from pipeline.event_confirmation import evaluate_litter_confirmation
+from pipeline.quarantine_evidence import classify_quarantine_release
 
 
 from pipeline.litter.trajfit import (
@@ -426,6 +429,10 @@ class GlobalLitterTracker:
             os.environ.get("SMART_BACKTRACK_MASK_DIAGNOSTICS", "0")
             not in ("0", "")
         )
+        self._mask_reselection_enabled = (
+            os.environ.get("SMART_BACKTRACK_MASK_RESELECT", "1")
+            not in ("0", "")
+        )
         self.backward_plate_roi_items = []
         self._actor_tracklet_epochs = {}
 
@@ -491,6 +498,9 @@ class GlobalLitterTracker:
             except Exception as exc:  # noqa: BLE001 - legacy resolver remains safe fallback
                 self._smart_backtrack_enabled = False
                 print(f"[SMART_BACKTRACK] initialization failed; legacy fallback: {exc}")
+        self._mask_reselection_enabled = (
+            self._mask_reselection_enabled and self._smart_backtrack_enabled
+        )
         self._backward_thread = threading.Thread(
             target=self._backward_worker,
             name="litter-backward-resolver",
@@ -1041,6 +1051,7 @@ class GlobalLitterTracker:
                 )
                 state = l_data.get('state', 'pending')
                 backward_submitted = bool(l_data.get('backward_submitted', False))
+                confirmation_evidence = l_data.get('confirmation_evidence')
                 vehicle_quarantine_active = self._update_vehicle_quarantine(
                     l_data,
                     litter_box,
@@ -1380,6 +1391,15 @@ class GlobalLitterTracker:
                         not stationary_locked
                     )
 
+                    confirmation_decision = evaluate_litter_confirmation(
+                        vehicle_quarantine_active=vehicle_quarantine_active,
+                        by_trajectory=can_confirm_by_trajectory,
+                        by_motion=can_confirm_by_motion,
+                        vehicle_fast_drop=can_confirm_vehicle_fast_drop,
+                        fall_then_stable=can_confirm_fall_then_stable,
+                    )
+                    confirmation_evidence = confirmation_decision.as_dict()
+
                     # 隨車部件 / 純水平條紋 / 共動 等 FP 篩選已移至 detect 前處理
                     # （litter_candidate_is_vehicle_fp）。tracker 只負責追蹤與軌跡確認，
                     # 不再對候選做 FP「懷疑」；能進到這裡的都是前處理放行的候選。
@@ -1401,13 +1421,7 @@ class GlobalLitterTracker:
                             f"can_fs={can_confirm_fall_then_stable} fall={fall_disp_history:.0f}"
                         )
 
-                    if (
-                        not vehicle_quarantine_active and
-                        (
-                            can_confirm_by_trajectory or can_confirm_by_motion or
-                            can_confirm_vehicle_fast_drop or can_confirm_fall_then_stable
-                        )
-                    ):
+                    if confirmation_decision.confirmed:
                         state = 'confirmed' # 確認為垃圾！
                         if self._pv_assoc_enabled and best_id not in self._pv_litter_seen_ids:
                             # offline 關聯的硬錨定:confirmed litter 當幀中心(每 litter id 記一次)。
@@ -1448,6 +1462,15 @@ class GlobalLitterTracker:
                                 'thrower_key': list(thrower_key) if thrower_key is not None else None,
                                 'vehicle_key': None,
                                 'escalated': bool(escalate_violation),
+                                # Freeze the confirmation/quarantine evidence at
+                                # the first confirmed frame.  This is diagnostic
+                                # provenance, not a reviewed label.
+                                'confirmation_evidence': dict(
+                                    confirmation_evidence or {}
+                                ),
+                                'vehicle_quarantine_evidence': dict(
+                                    l_data.get('vehicle_quarantine_evidence') or {}
+                                ),
                                 'backtrack_status': (
                                     'pending' if self._smart_backtrack_enabled else 'legacy'
                                 ),
@@ -1558,6 +1581,7 @@ class GlobalLitterTracker:
                     'vehicle_quarantine_evidence': l_data.get(
                         'vehicle_quarantine_evidence'
                     ),
+                    'confirmation_evidence': confirmation_evidence,
                     'ref_shape': (
                         0.7 * float(l_data.get('ref_shape', l_data['init_shape'])[0]) + 0.3 * float(curr_w),
                         0.7 * float(l_data.get('ref_shape', l_data['init_shape'])[1]) + 0.3 * float(curr_h),
@@ -1611,6 +1635,17 @@ class GlobalLitterTracker:
                     'backward_submitted': False,
                     'backward_result': None,
                     'stationary_locked': inherit_locked,
+                    'confirmation_evidence': {
+                        'confirmed': False,
+                        'rule': None,
+                        'reason': 'insufficient_history',
+                        'evidence': {
+                            'by_trajectory': False,
+                            'by_motion': False,
+                            'vehicle_fast_drop': False,
+                            'fall_then_stable': False,
+                        },
+                    },
                 }
                 self._update_vehicle_quarantine(
                     new_litter_data,
@@ -1998,6 +2033,16 @@ class GlobalLitterTracker:
                 cls_name, track_id, int(uid_state['epoch'])
             )
 
+            if (
+                self._mask_reselection_enabled
+                and cls_name in ('vehicle', 'scooter')
+                and snapshot['observed']
+                and snapshot['source'] in ('seg_track', 'seg_predict')
+            ):
+                mask_contour = compact_mask_polygon(actor.get('mask_poly'))
+                if mask_contour is not None:
+                    snapshot['mask_contour_xy'] = mask_contour
+
             if self._mask_diagnostics_enabled:
                 diagnostic_actor = dict(snapshot)
                 diagnostic_actor['mask_poly'] = actor.get('mask_poly')
@@ -2042,7 +2087,14 @@ class GlobalLitterTracker:
         with self._actor_history_lock:
             self.actor_frame_history.append({
                 'frame_index': int(frame_index),
-                'actors': actor_snapshots,
+                'actors': [
+                    {
+                        key: value
+                        for key, value in snapshot.items()
+                        if key != 'mask_contour_xy'
+                    }
+                    for snapshot in actor_snapshots
+                ],
             })
             smart_frame = {
                 'frame_index': int(frame_index),
@@ -3319,11 +3371,19 @@ class GlobalLitterTracker:
         path to a confirmed event.
         """
         if litter_data.get('state', 'pending') != 'pending':
+            litter_data['vehicle_quarantine_evidence'] = {
+                'status': 'inactive',
+                'reason': 'not_pending',
+            }
             return False
         if litter_data.get('vehicle_quarantine_released', False):
             # Release is based on the accumulated same-carrier trajectory and
             # remains valid for this litter track; a still-overlapping bbox on
             # the next sampled frame must not restart the quarantine.
+            litter_data['vehicle_quarantine_evidence'] = {
+                'status': 'released',
+                'reason': 'already_released',
+            }
             return False
 
         active = bool(litter_data.get('vehicle_quarantine_active', False))
@@ -3334,6 +3394,14 @@ class GlobalLitterTracker:
 
         if not active:
             if not is_contained_observation or overlap_carrier is None:
+                litter_data['vehicle_quarantine_evidence'] = {
+                    'status': 'inactive',
+                    'reason': (
+                        'not_contained'
+                        if not is_contained_observation
+                        else 'carrier_missing'
+                    ),
+                }
                 return False
             active = True
             saved_carrier = overlap_carrier
@@ -3351,12 +3419,18 @@ class GlobalLitterTracker:
                 saved_carrier, actors,
             )
         if carrier_center is None:
+            litter_data['vehicle_quarantine_evidence'] = {
+                'status': 'active',
+                'reason': 'carrier_missing',
+                'observations': len(litter_data.get('vehicle_quarantine_frames', [])),
+            }
             return True
 
         frames = list(litter_data.get('vehicle_quarantine_frames', []))
         relative_points = list(
             litter_data.get('vehicle_quarantine_relative_points', [])
         )
+        observation_segment_reset = False
         if (
             frames
             and int(frame_index) - int(frames[-1])
@@ -3367,6 +3441,7 @@ class GlobalLitterTracker:
             # unrelated box cannot turn prior vehicle-part jitter into release.
             relative_points = []
             frames = []
+            observation_segment_reset = True
         if not frames or int(frames[-1]) != int(frame_index):
             relative_points.append((
                 float(centroid[0]) - float(carrier_center[0]),
@@ -3401,18 +3476,27 @@ class GlobalLitterTracker:
             for previous, current in zip(relative_points, relative_points[1:])
             if float(current[1]) - float(previous[1]) >= 2.0
         )
-        release = (
-            rel_displacement >= required_displacement
-            and rel_dy >= required_downward
-            and downward_steps >= self.vehicle_quarantine_min_downward_steps
+        release_decision = classify_quarantine_release(
+            observations=len(relative_points),
+            required_observations=self.vehicle_quarantine_min_observations,
+            relative_displacement=rel_displacement,
+            required_displacement=required_displacement,
+            relative_downward=rel_dy,
+            required_downward=required_downward,
+            downward_steps=downward_steps,
+            required_downward_steps=self.vehicle_quarantine_min_downward_steps,
         )
         litter_data['vehicle_quarantine_evidence'] = {
+            'status': 'released' if release_decision.release_ready else 'active',
+            'reason': release_decision.reason,
             'observations': len(relative_points),
             'relative_displacement': rel_displacement,
             'relative_downward': rel_dy,
             'downward_steps': downward_steps,
             'required_displacement': required_displacement,
             'required_downward': required_downward,
+            'required_downward_steps': self.vehicle_quarantine_min_downward_steps,
+            'observation_segment_reset': observation_segment_reset,
         }
         if getattr(self, '_debug', False) and len(relative_points) >= 2:
             print(
@@ -3422,14 +3506,12 @@ class GlobalLitterTracker:
                 f"req_rel={required_displacement:.1f} "
                 f"req_down={required_downward:.1f}]"
             )
-        if len(relative_points) < self.vehicle_quarantine_min_observations:
+        if not release_decision.release_ready:
             return True
-        if release:
-            litter_data['vehicle_quarantine_active'] = False
-            litter_data['vehicle_quarantine_released'] = True
-            litter_data['vehicle_quarantine_release_frame'] = int(frame_index)
-            return False
-        return True
+        litter_data['vehicle_quarantine_active'] = False
+        litter_data['vehicle_quarantine_released'] = True
+        litter_data['vehicle_quarantine_release_frame'] = int(frame_index)
+        return False
 
     def _actor_center_near_frame(self, actor_key, target_frame):
         # actor ring buffer 中最接近 target_frame 的中心點 (YOLO-seg 可能隔幀執行，就近取值)。

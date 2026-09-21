@@ -20,6 +20,11 @@ from .costs import (
 )
 from .flow import COST_SCALE, Assignment, RouteCandidate, solve_event_routes
 from .kalman import KalmanConfig, TrackMeasurement, smooth_tracklet
+from .route_reselection import (
+    GuardedReselectionConfig,
+    apply_guarded_reselection,
+    attach_mask_temporal_evidence,
+)
 from .spatial import (
     EventSpatialTransform,
     image_space_metadata,
@@ -51,12 +56,14 @@ def _int_env(name, default):
 
 @dataclass(frozen=True)
 class SmartBacktrackConfig:
-    max_back_frames: int = 24
+    # One second at the historical 10 FPS reference. Production ``from_env``
+    # derives this computational frame span from the actual video FPS.
+    max_back_frames: int = 10
     top_k_people: int = 5
     top_k_vehicles: int = 5
     dustbin_cost: float = 7.0
     null_vehicle_penalty: float = 1.4
-    direct_vehicle_penalty: float = 0.9
+    direct_vehicle_penalty: float = 1.1
     ac_weight: float = 0.75
     bc_support_bonus: float = 0.25
     sigma_floor_px: float = 2.0
@@ -64,7 +71,7 @@ class SmartBacktrackConfig:
     two_point_prior_cost: float = 1.0
     max_forward_release_seconds: float = 0.5
     release_window_prior_weight: float = 0.35
-    max_release_back_seconds: Optional[float] = None
+    max_release_back_seconds: Optional[float] = 1.0
     release_soft_seconds: float = 0.25
     release_time_weight: float = 1.0
     # Production time scales: 0.25 seconds and 3 frames are the bend points of
@@ -95,12 +102,55 @@ class SmartBacktrackConfig:
     # eligible transform or records an explicit image-space fallback.
     use_event_homography: bool = False
     event_homography_min_confidence: float = 0.65
+    # Frozen 58-case development-set policy. It only re-selects an already
+    # valid route when every rule-specific guard is present and satisfied.
+    use_guarded_route_reselection: bool = True
+    use_mask_temporal_reselection: bool = True
+    mask_pre_seconds: float = 0.20
+    mask_post_seconds: float = 0.10
+    mask_pre_min_observations: int = 1
+    mask_release_min_observations: int = 1
+    mask_pre_max_observations: int = 2
+    mask_release_max_observations: int = 2
 
     @classmethod
     def from_env(cls, fps=10.0):
-        # 24 frames was the original 10 FPS research search span (=2.4 s).
-        # Scale the computational guard with FPS; it is not a physical gate.
-        default_max_back = max(1, int(round(float(fps or 10.0) * 2.4)))
+        resolved_fps = float(fps or 10.0)
+        release_max_seconds = _float_env(
+            "SMART_BACKTRACK_MAX_RELEASE_BACK_SEC", 1.0
+        )
+        release_soft_seconds = _float_env(
+            "SMART_BACKTRACK_RELEASE_SOFT_SEC", 0.25
+        )
+        if not (
+            math.isfinite(release_max_seconds)
+            and math.isfinite(release_soft_seconds)
+            and 0.0 <= release_soft_seconds < release_max_seconds
+        ):
+            raise ValueError(
+                "require 0 <= SMART_BACKTRACK_RELEASE_SOFT_SEC < "
+                "SMART_BACKTRACK_MAX_RELEASE_BACK_SEC"
+            )
+        # Seconds define the physical horizon. Frames are only its CFR
+        # discretization and an explicit computational guard.
+        default_max_back = max(
+            1, int(math.floor(resolved_fps * release_max_seconds))
+        )
+        mask_pre_seconds = _float_env("SMART_BACKTRACK_MASK_PRE_SEC", 0.20)
+        mask_post_seconds = _float_env("SMART_BACKTRACK_MASK_POST_SEC", 0.10)
+        mask_pre_min = _int_env("SMART_BACKTRACK_MASK_MIN_PRE_OBS", 1)
+        mask_release_min = _int_env("SMART_BACKTRACK_MASK_MIN_RELEASE_OBS", 1)
+        mask_pre_max = _int_env("SMART_BACKTRACK_MASK_MAX_PRE_OBS", 2)
+        mask_release_max = _int_env("SMART_BACKTRACK_MASK_MAX_RELEASE_OBS", 2)
+        if not (
+            math.isfinite(mask_pre_seconds)
+            and math.isfinite(mask_post_seconds)
+            and mask_pre_seconds >= 0.0
+            and mask_post_seconds >= 0.0
+            and 0 < mask_pre_min <= mask_pre_max
+            and 0 < mask_release_min <= mask_release_max
+        ):
+            raise ValueError("invalid Smart Backtrack mask time/observation window")
         study_stage = str(
             os.environ.get("SMART_BACKTRACK_STUDY_STAGE", "full")
         ).strip().lower()
@@ -159,7 +209,7 @@ class SmartBacktrackConfig:
                 0.0, _float_env("SMART_BACKTRACK_NULL_VEHICLE_COST", 1.4)
             ),
             direct_vehicle_penalty=max(
-                0.0, _float_env("SMART_BACKTRACK_DIRECT_VEHICLE_COST", 0.9)
+                0.0, _float_env("SMART_BACKTRACK_DIRECT_VEHICLE_COST", 1.1)
             ),
             ac_weight=max(0.0, _float_env("SMART_BACKTRACK_AC_WEIGHT", 0.75)),
             bc_support_bonus=max(
@@ -184,6 +234,8 @@ class SmartBacktrackConfig:
                 0.0,
                 _float_env("SMART_BACKTRACK_RELEASE_WINDOW_WEIGHT", 0.35),
             ),
+            max_release_back_seconds=release_max_seconds,
+            release_soft_seconds=release_soft_seconds,
             cost_config=cost_config,
             use_kalman_rts=study_stage in {
                 "kalman_rts", "uncertainty", "reverse", "full"
@@ -203,6 +255,20 @@ class SmartBacktrackConfig:
                 0.0,
                 1.0,
             )),
+            use_guarded_route_reselection=(
+                os.environ.get("SMART_BACKTRACK_GUARDED_RESELECT", "1")
+                not in ("0", "")
+            ),
+            use_mask_temporal_reselection=(
+                os.environ.get("SMART_BACKTRACK_MASK_RESELECT", "1")
+                not in ("0", "")
+            ),
+            mask_pre_seconds=mask_pre_seconds,
+            mask_post_seconds=mask_post_seconds,
+            mask_pre_min_observations=mask_pre_min,
+            mask_release_min_observations=mask_release_min,
+            mask_pre_max_observations=mask_pre_max,
+            mask_release_max_observations=mask_release_max,
         )
 
 
@@ -438,6 +504,20 @@ class SmartBacktrackResolver:
     def __init__(self, fps=30.0, config=None):
         self.fps = float(fps) if fps and float(fps) > 0.0 else 30.0
         self.config = config or SmartBacktrackConfig.from_env(fps=self.fps)
+        self._reselection_config = GuardedReselectionConfig(
+            enabled=self.config.use_guarded_route_reselection,
+            mask_temporal_enabled=self.config.use_mask_temporal_reselection,
+            mask_pre_seconds=self.config.mask_pre_seconds,
+            mask_post_seconds=self.config.mask_post_seconds,
+            mask_pre_min_observations=self.config.mask_pre_min_observations,
+            mask_release_min_observations=(
+                self.config.mask_release_min_observations
+            ),
+            mask_pre_max_observations=self.config.mask_pre_max_observations,
+            mask_release_max_observations=(
+                self.config.mask_release_max_observations
+            ),
+        )
 
     def _kalman_max_extrapolation_frames(self, fps: float) -> int:
         if self.config.kalman_max_extrapolation_seconds is None:
@@ -1068,6 +1148,26 @@ class SmartBacktrackResolver:
                 "event_homography_min_confidence": float(
                     self.config.event_homography_min_confidence
                 ),
+                "use_guarded_route_reselection": bool(
+                    self.config.use_guarded_route_reselection
+                ),
+                "use_mask_temporal_reselection": bool(
+                    self.config.use_mask_temporal_reselection
+                ),
+                "mask_pre_seconds": float(self.config.mask_pre_seconds),
+                "mask_post_seconds": float(self.config.mask_post_seconds),
+                "mask_pre_min_observations": int(
+                    self.config.mask_pre_min_observations
+                ),
+                "mask_release_min_observations": int(
+                    self.config.mask_release_min_observations
+                ),
+                "mask_pre_max_observations": int(
+                    self.config.mask_pre_max_observations
+                ),
+                "mask_release_max_observations": int(
+                    self.config.mask_release_max_observations
+                ),
             },
             "spatial_calibration": spatial_metadata,
             "release_hypotheses": [
@@ -1174,6 +1274,10 @@ class SmartBacktrackResolver:
                 metadata=null_metadata,
             )
         )
+        if self.config.use_mask_temporal_reselection:
+            routes = attach_mask_temporal_evidence(
+                routes, task, releases, self._reselection_config
+            )
         return routes
 
     @staticmethod
@@ -1215,18 +1319,25 @@ class SmartBacktrackResolver:
         assignment = solve_event_routes(
             {litter_id: routes}, null_cost=self.config.dustbin_cost
         )[litter_id]
+        assignment, routes = apply_guarded_reselection(
+            litter_id, assignment, routes, self._reselection_config
+        )
         return self._resolution(litter_id, assignment, routes)
 
     def solve_routes(self, routes_by_litter):
         assignments = solve_event_routes(
             routes_by_litter, null_cost=self.config.dustbin_cost
         )
-        return {
-            int(litter_id): self._resolution(
-                litter_id, assignment, routes_by_litter[litter_id]
+        resolutions = {}
+        for litter_id, assignment in assignments.items():
+            routes = routes_by_litter[litter_id]
+            assignment, routes = apply_guarded_reselection(
+                litter_id, assignment, routes, self._reselection_config
             )
-            for litter_id, assignment in assignments.items()
-        }
+            resolutions[int(litter_id)] = self._resolution(
+                litter_id, assignment, routes
+            )
+        return resolutions
 
 
 __all__ = [

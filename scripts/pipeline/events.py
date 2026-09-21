@@ -178,6 +178,12 @@ def build_litter_events(litter_events, vehicle_history, fps):
             "detector_confidence": _rounded(ev.get("detector_confidence")),
             "escalated": bool(ev.get("escalated", False)),
             "backtrack_status": ev.get("backtrack_status"),
+            # Explicit runtime gate provenance; never interpreted as reviewed
+            # ground truth or accuracy.
+            "confirmation_evidence": ev.get("confirmation_evidence"),
+            "vehicle_quarantine_evidence": ev.get(
+                "vehicle_quarantine_evidence"
+            ),
         }
         if ev.get("backtrack") is not None:
             item["backtrack"] = ev["backtrack"]
@@ -316,7 +322,7 @@ def _compact_analysis_event(event):
         vehicle_id = (
             f"{vehicle['cls']}:{int(vehicle['track_id'])}" if vehicle else None
         )
-        return {
+        compact = {
             "type": "litter",
             "id": int(event.get("litter_id", -1)),
             "start_sec": segment.get("start_sec", event.get("time_sec")),
@@ -329,6 +335,11 @@ def _compact_analysis_event(event):
             "attribution_status": event.get("backtrack_status"),
             "review_required": True,
         }
+        for key in ("confirmation_evidence", "vehicle_quarantine_evidence"):
+            value = event.get(key)
+            if value is not None:
+                compact[key] = value
+        return compact
 
     segment = event.get("time_segment") or {}
     vehicle = event.get("vehicle")

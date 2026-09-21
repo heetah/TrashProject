@@ -120,4 +120,5 @@ def test_config_roundtrip_null_and_sidecar_policy():
     diag = next(r.metadata['candidate_diagnostics'] for r in result.routes if r.is_null)
     assert diag['resolver_config']['release_window_semantics'] == 'seconds_quadratic'
     assert all(r['time_prior_policy']=='seconds_quadratic' for r in diag['release_hypotheses'])
-    assert SmartBacktrackConfig().max_release_back_seconds is None
+    assert SmartBacktrackConfig().max_release_back_seconds == 1.0
+    assert SmartBacktrackConfig().release_soft_seconds == 0.25

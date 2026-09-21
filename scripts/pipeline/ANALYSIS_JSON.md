@@ -139,6 +139,8 @@ Production 不再另外產生 `summary.json` 或 `events.jsonl`。JSON 先寫入
 | `plate_confidence` | number / null | OCR confidence |
 | `plate_status` | string | `recognized`、`pending`、`attempted_no_result`、`not_requested` 或 `not_applicable` |
 | `attribution_status` | string / null | Smart Backtrack 狀態，例如 `resolved`、`dustbin`、`pending` |
+| `confirmation_evidence` | object / null | Tracker confirmation rule/reason 與 gate booleans；診斷 provenance，不是 ground truth |
+| `vehicle_quarantine_evidence` | object / null | Vehicle-contained release gate 的觀測次數／影像像素 reason；不是 accuracy |
 | `review_required` | boolean | 固定為 `true` |
 
 Urinate 事件欄位：
