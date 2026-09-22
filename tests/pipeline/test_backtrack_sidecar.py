@@ -3,6 +3,9 @@ import math
 import os
 import sys
 
+import numpy as np
+import pytest
+
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
 
@@ -112,7 +115,7 @@ def test_candidate_routes_are_ranked_scaled_selected_and_diagnostics_extracted()
     assert [route["rank"] for route in record["routes"]] == [1, 2, 3, None]
     selected = next(route for route in record["routes"] if route["selected"])
     assert selected["route_id"] == "selected"
-    assert selected["scaled_cost"] == 1235
+    assert selected["scaled_cost"] == 1234500
     invalid = record["routes"][-1]
     assert invalid["valid"] is False
     assert invalid["cost"] is None
@@ -132,7 +135,15 @@ def test_candidate_routes_are_ranked_scaled_selected_and_diagnostics_extracted()
         "candidate_diagnostics"
         not in record["event"]["backtrack"]["components"]
     )
-    assert record["assignment"]["scaled_cost"] == 1235
+    assert record["assignment"]["scaled_cost"] == 1234500
+    assert record["assignment"]["actor_margins"]["person"] == {
+        "best_key": ["person", 2],
+        "best_cost": 1.2344,
+        "second_key": ["person", 1],
+        "second_cost": 1.2345,
+        "margin": pytest.approx(0.0001),
+        "tie_count": 1,
+    }
 
 
 def test_candidate_contains_litter_history_and_allowed_raw_actor_tracklets():
@@ -206,6 +217,33 @@ def test_candidate_contains_litter_history_and_allowed_raw_actor_tracklets():
     assert record["routes"][0]["selected"] is True
 
 
+def test_candidate_litter_history_adds_provenance_without_changing_old_shape():
+    task = {
+        "history": [(10.0, 20.0)],
+        "history_frames": [5],
+        "history_boxes": [(8, 18, 12, 22)],
+        "history_confidences": [0.8],
+        "history_sources": ["accepted_tracker"],
+        "history_provenance": ["visual_bridge"],
+        "history_lineage": [{
+            "observation_id": "litter:2:frame:5:visual_bridge",
+            "source": "visual_bridge",
+            "parent_observation_id": "litter:2:frame:4:detector",
+            "independence_group_id": "litter:2:frame:4:detector",
+            "derived": True,
+            "independent_measurement": False,
+        }],
+    }
+    event = {"litter_id": 2, "backtrack": {"route_id": "null"}}
+    record = build_candidate_record(
+        task, event, [RouteCandidate("null", 7.0, route_type="null")], "case.mp4"
+    )
+
+    assert record["litter_history"][0]["provenance"] == "visual_bridge"
+    assert record["litter_history"][0]["lineage"]["independent_measurement"] is False
+    assert record["resolver_input"]["history_sources"] == ["accepted_tracker"]
+
+
 def test_jsonl_roundtrip_and_half_away_from_zero(tmp_path):
     records = [
         build_run_record("a.mp4", None, 10, 3),
@@ -224,5 +262,54 @@ def test_jsonl_roundtrip_and_half_away_from_zero(tmp_path):
     loaded = read_jsonl(path)
 
     assert loaded[0]["schema"] == SCHEMA_NAME
-    assert loaded[1]["routes"][0]["scaled_cost"] == -1235
+    assert loaded[1]["routes"][0]["scaled_cost"] == -1234500
     assert loaded == records
+
+
+def test_candidate_sidecar_excludes_plate_roi_pixels_but_remains_replayable():
+    task = {
+        "litter_id": 3,
+        "fps": 10.0,
+        "birth_frame": 10,
+        "confirm_frame": 11,
+        "history": [(20.0, 30.0), (21.0, 32.0)],
+        "history_frames": [10, 11],
+        "actor_frames": [{
+            "frame_index": 10,
+            "actors": [{
+                "cls": "vehicle",
+                "track_id": 2,
+                "box": [0, 0, 40, 40],
+                "plate_roi": np.full((48, 160, 3), 255, dtype=np.uint8),
+            }],
+        }],
+        "plate_actor_frames": [{
+            "frame_index": 10,
+            "actors": [{
+                "cls": "vehicle",
+                "track_id": 2,
+                "box": [0, 0, 40, 40],
+                "plate_roi": np.full((48, 160, 3), 255, dtype=np.uint8),
+            }],
+        }],
+    }
+    event = {
+        "litter_id": 3,
+        "backtrack_status": "dustbin",
+        "backtrack": {"route_id": "null", "route_type": "null"},
+    }
+
+    record = build_candidate_record(
+        task,
+        event,
+        [RouteCandidate("null", 7.0, route_type="null")],
+        "case.mp4",
+    )
+    encoded = json.dumps(record, allow_nan=False)
+
+    assert "plate_actor_frames" not in record["resolver_input"]
+    assert "plate_roi" not in encoded
+    assert record["resolver_input"]["actor_frames"][0]["actors"][0]["box"] == [
+        0, 0, 40, 40
+    ]
+    assert len(encoded) < 10_000

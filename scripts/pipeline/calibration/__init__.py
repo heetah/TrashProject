@@ -1,0 +1,105 @@
+"""Lightweight online camera-calibration building blocks."""
+
+from .homography_phase1 import (
+    CalibrationBuffer,
+    CalibrationPhase1Config,
+    LocalMotionObservation,
+    VehicleTrackPoint,
+    VehicleTrajectoryCollector,
+    extract_vehicle_ground_point,
+)
+from .motion_field import (
+    FlowClusteringConfig,
+    MotionFieldCell,
+    MotionFieldConfig,
+    TrafficFlowCluster,
+    TrafficMotionField,
+    cluster_traffic_flows,
+    render_motion_debug,
+    robust_direction_summary,
+)
+from .losses import (
+    CalibrationLossConfig,
+    CalibrationLossReport,
+    evaluate_calibration_losses,
+)
+from .optimizer import (
+    CandidateScore,
+    HomographyOptimizationResult,
+    HomographyOptimizerConfig,
+    compose_candidate_homography,
+    estimate_candidate_homography,
+)
+from .state import (
+    CalibrationStateConfig,
+    CalibrationStatus,
+    DynamicHomographyCalibrator,
+    EventHomographySnapshot,
+    MotionGeometrySignature,
+    detect_calibration_drift,
+)
+from .stabilization import (
+    BackgroundStabilizerConfig,
+    StabilizationResult,
+    StaticBackgroundStabilizer,
+    build_dynamic_exclusion_mask,
+    compose_runtime_homography,
+)
+from .debug import render_calibration_debug
+from .transform import (
+    HomographyValidationConfig,
+    HomographyValidationReport,
+    ProjectionResult,
+    image_to_ground,
+    initial_homography_snapshot,
+    initial_normalized_image_homography,
+    normalize_homography,
+    project_image_points,
+    validate_homography,
+)
+
+__all__ = [
+    "CalibrationBuffer",
+    "CalibrationPhase1Config",
+    "LocalMotionObservation",
+    "VehicleTrackPoint",
+    "VehicleTrajectoryCollector",
+    "extract_vehicle_ground_point",
+    "FlowClusteringConfig",
+    "MotionFieldCell",
+    "MotionFieldConfig",
+    "TrafficFlowCluster",
+    "TrafficMotionField",
+    "cluster_traffic_flows",
+    "render_motion_debug",
+    "robust_direction_summary",
+    "CalibrationLossConfig",
+    "CalibrationLossReport",
+    "evaluate_calibration_losses",
+    "CandidateScore",
+    "HomographyOptimizationResult",
+    "HomographyOptimizerConfig",
+    "compose_candidate_homography",
+    "estimate_candidate_homography",
+    "CalibrationStateConfig",
+    "CalibrationStatus",
+    "DynamicHomographyCalibrator",
+    "EventHomographySnapshot",
+    "MotionGeometrySignature",
+    "detect_calibration_drift",
+    "BackgroundStabilizerConfig",
+    "StabilizationResult",
+    "StaticBackgroundStabilizer",
+    "build_dynamic_exclusion_mask",
+    "compose_runtime_homography",
+    "render_calibration_debug",
+    "HomographyValidationConfig",
+    "HomographyValidationReport",
+    "ProjectionResult",
+    "image_to_ground",
+    "initial_homography_snapshot",
+    "initial_normalized_image_homography",
+    "normalize_homography",
+    "project_image_points",
+    "validate_homography",
+]

@@ -54,10 +54,6 @@
   .ev .meta{font-size:12px;color:var(--text-3);margin-top:2px}
   .mono{font-family:var(--mono)}
   .plate{font-family:var(--mono);background:var(--surface-1);padding:1px 6px;border-radius:4px}
-  .branches{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
-  .branch{display:flex;align-items:center;gap:8px;font-size:14px}
-  .dot{width:8px;height:8px;border-radius:50%;flex:none}
-  .on{background:var(--success)} .off{background:var(--text-3)}
   .empty{color:var(--text-3);font-size:14px;padding:8px 0}
   footer{color:var(--text-3);font-size:12px;margin-top:20px}
 </style>
@@ -67,11 +63,10 @@
   <header>
     <div>
       <h1>違規事件監測台</h1>
-      <div class="sub">scripts 管線 · 讀取 summary.json 與 events.jsonl</div>
+      <div class="sub">scripts 管線 · 單一 analysis.json</div>
     </div>
     <div class="loaders">
-      <label class="file" id="l-sum">選擇 summary.json<input type="file" accept=".json" id="f-sum"></label>
-      <label class="file" id="l-ev">選擇 events.jsonl<input type="file" accept=".jsonl,.json" id="f-ev"></label>
+      <label class="file" id="l-analysis">選擇 analysis.json<input type="file" accept=".json" id="f-analysis"></label>
       <label class="file" id="l-vid">選擇標註影片<input type="file" accept="video/*" id="f-vid"></label>
     </div>
   </header>
@@ -85,19 +80,14 @@
 
   <div class="panel">
     <h2>違規事件 <span style="color:var(--text-3);font-weight:400;font-size:13px">(僅已確認)</span></h2>
-    <div id="events"><div class="empty">尚未載入 events.jsonl。</div></div>
+    <div id="events"><div class="empty">尚未載入 analysis.json。</div></div>
   </div>
 
-  <div class="panel">
-    <h2>管線分支狀態</h2>
-    <div class="branches" id="branches"><div class="empty">尚未載入 summary.json。</div></div>
-  </div>
-
-  <footer>一行一事件的 events.jsonl 由 pipeline.events 於每次 run 結束時寫出;本頁純前端,不上傳任何檔案。</footer>
+  <footer>每支影片一份 analysis.json。本頁純前端，不上傳檔案。</footer>
 </div>
 
 <script>
-const S = { summary:null, events:null };
+const S = { analysis:null };
 
 function fmtTime(sec){
   if(sec==null) return "—";
@@ -108,12 +98,16 @@ function el(tag, cls, html){ const e=document.createElement(tag); if(cls)e.class
 
 function renderCards(){
   const c=document.getElementById("cards"); c.innerHTML="";
-  const s=S.summary||{};
+  const summary=S.analysis?.summary||{};
   const items=[
-    ["確認亂丟", s.confirmed_litter_ids ?? "—", "danger"],
-    ["確認便溺", s.stgcn_urinate_confirmed ?? "—", "warning"],
-    ["回溯丟擲者", s.backtracked_thrower_ids ?? "—", "text"],
-    ["處理幀數", (s.processed_frames!=null? s.processed_frames+"/"+(s.total_frames??"?") : "—"), "text"],
+    ["確認亂丟", summary.litter_event_count ?? "—", "danger"],
+    ["確認便溺", summary.urinate_event_count ?? "—", "warning"],
+    ["經過車輛", summary.passed_vehicle_count ?? "—", "text"],
+    ["影片長度", S.analysis?.video?.duration_sec!=null ? fmtTime(S.analysis.video.duration_sec) : "—", "text"],
+    ["平均信心", summary.average_litter_confidence!=null ? summary.average_litter_confidence.toFixed(2) : "—", "text"],
+    ["違規車牌", summary.littering_plates?.length ? summary.littering_plates.join(", ") : "—", "text"],
+    ["準確度", summary.accuracy_status==="not_evaluated" ? "未評估" : (summary.detection_accuracy ?? "—"), "text"],
+    ["人工複核", summary.review_required===true ? "需要" : (summary.review_required===false ? "無事件" : "—"), "warning"],
   ];
   for(const [k,v,role] of items){
     const card=el("div","card");
@@ -126,54 +120,34 @@ function renderCards(){
 
 function renderEvents(){
   const box=document.getElementById("events"); box.innerHTML="";
-  if(!S.events){ box.appendChild(el("div","empty","尚未載入 events.jsonl。")); return; }
-  if(S.events.length===0){ box.appendChild(el("div","empty","此 run 沒有已確認的違規事件。")); return; }
-  for(const ev of S.events){
+  if(!S.analysis){ box.appendChild(el("div","empty","尚未載入 analysis.json。")); return; }
+  const events=Array.isArray(S.analysis.events) ? S.analysis.events : [];
+  if(events.length===0){ box.appendChild(el("div","empty","此影片沒有已確認的違規事件。")); return; }
+  for(const ev of events){
     const row=el("div","ev");
     if(ev.type==="litter"){
       row.appendChild(el("span","badge b-litter","亂丟垃圾"));
       const body=el("div","body");
-      const thrower = ev.thrower ? `${ev.thrower.cls} #${ev.thrower.track_id}` : "未關聯丟擲者";
-      body.appendChild(el("div","title",`Litter #${ev.litter_id} 確認 · 回溯 ${thrower}`));
-      const plate = ev.license_plate ? `車牌 <span class="plate">${ev.license_plate}</span>`
-                    : (ev.escalated ? "車牌辨識中…" : "未升級為違規");
-      body.appendChild(el("div","meta",`${fmtTime(ev.time_sec)} · frame ${ev.frame_index} · ${plate}`));
+      const vehicle=ev.vehicle || "未關聯車輛";
+      body.appendChild(el("div","title",`Litter #${ev.id} · ${vehicle}`));
+      const plate=ev.plate ? `車牌 <span class="plate">${ev.plate}</span>`
+                  : (ev.plate_status==="pending" ? "車牌辨識中…" : "無可靠車牌／人工複核");
+      const confidence=ev.confidence!=null ? ev.confidence.toFixed(2) : "—";
+      body.appendChild(el("div","meta",`${fmtTime(ev.start_sec)}–${fmtTime(ev.end_sec)} · 信心 ${confidence} · ${plate}`));
       row.appendChild(body);
     }else if(ev.type==="urinate"){
       row.appendChild(el("span","badge b-urinate","隨地便溺"));
       const body=el("div","body");
-      if(ev.track_id!=null){
-        body.appendChild(el("div","title",`person #${ev.track_id} · STGCN 信心 ${(ev.conf??0).toFixed(2)}`));
-        body.appendChild(el("div","meta",`${fmtTime(ev.time_sec)} · frame ${ev.frame_index} · 證據累積 ${ev.evidence_sec} 秒`));
-      }else{
-        body.appendChild(el("div","title",`STGCN 確認便溺`));
-        body.appendChild(el("div","meta",`確認幀數 ${ev.confirmed_count}`));
-      }
+      const confidence=ev.confidence!=null ? ev.confidence.toFixed(2) : "—";
+      body.appendChild(el("div","title",ev.track_id!=null ? `person #${ev.track_id}` : "STGCN 確認便溺"));
+      body.appendChild(el("div","meta",`${fmtTime(ev.time_sec)} · 信心 ${confidence}`));
       row.appendChild(body);
     }
     box.appendChild(row);
   }
 }
 
-function renderBranches(){
-  const box=document.getElementById("branches"); box.innerHTML="";
-  if(!S.summary){ box.appendChild(el("div","empty","尚未載入 summary.json。")); return; }
-  const s=S.summary;
-  const items=[
-    ["YOLO-Pose + STGCN", s.stgcn_pose_enabled],
-    ["RTDETR 垃圾偵測", s.rtdetr_enabled],
-    ["PaddleOCR 車牌", s.plate_enabled],
-    ["確認亂丟事件", s.has_confirm_litter],
-  ];
-  for(const [name,on] of items){
-    const b=el("div","branch");
-    b.appendChild(el("span","dot "+(on?"on":"off")));
-    b.appendChild(el("span",null,name));
-    box.appendChild(b);
-  }
-}
-
-function refresh(){ renderCards(); renderEvents(); renderBranches(); }
+function refresh(){ renderCards(); renderEvents(); }
 
 function bindFile(inputId,labelId,onLoad){
   document.getElementById(inputId).addEventListener("change",e=>{
@@ -184,9 +158,8 @@ function bindFile(inputId,labelId,onLoad){
     r.readAsText(file);
   });
 }
-bindFile("f-sum","l-sum",(txt)=>{ S.summary=JSON.parse(txt); });
-bindFile("f-ev","l-ev",(txt)=>{
-  S.events=txt.split(/\r?\n/).filter(l=>l.trim()).map(l=>JSON.parse(l));
+bindFile("f-analysis","l-analysis",(txt)=>{
+  S.analysis=JSON.parse(txt);
 });
 document.getElementById("f-vid").addEventListener("change",e=>{
   const file=e.target.files[0]; if(!file) return;

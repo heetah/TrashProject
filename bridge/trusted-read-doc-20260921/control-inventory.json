@@ -1,0 +1,198 @@
+{
+  "version": 1,
+  "kind": "google-docs-trusted-read-context",
+  "target": {
+    "documentId": "1NxMLiXVmdF1IsxHXSJ_VLtgyyES7edLc3HX0W-Fn3VY",
+    "title": "專題彙報",
+    "revisionId": "ANLCKQmEB3H2lWJ8870dw5F_CE-KAZpXVYPPKZwoFQSC-fe6qCFPLzAIFDSbBf99XMX893nnVB6Je-nGmEEORXrRMtI2qZOsizWtLlpID0Y",
+    "documentUrl": "https://docs.google.com/document/d/1NxMLiXVmdF1IsxHXSJ_VLtgyyES7edLc3HX0W-Fn3VY",
+    "selectedTabId": null
+  },
+  "dropdownMetadata": {
+    "status": "unavailable",
+    "resolvedTool": null,
+    "authoritative": false,
+    "count": 0
+  },
+  "derivedControlInventory": {
+    "hasProtectedControls": false,
+    "authoritativeDropdownCount": 0,
+    "opaqueControlCount": 0,
+    "nativeElementCounts": {
+      "inlineObjectElement": 5
+    },
+    "tabsScanned": [
+      "t.0"
+    ],
+    "controls": [],
+    "nativeElements": [
+      {
+        "type": "inlineObjectElement",
+        "startIndex": 1399,
+        "endIndex": 1400,
+        "tabId": "t.0",
+        "segmentId": null,
+        "container": {
+          "kind": "paragraph",
+          "path": "root.tabs[0].body.content[40]",
+          "tabId": "t.0",
+          "segmentId": null,
+          "startIndex": 1399,
+          "endIndex": 1401,
+          "namedStyleType": "NORMAL_TEXT",
+          "listId": null,
+          "nestingLevel": null,
+          "table": null
+        },
+        "properties": {
+          "inlineObjectId": "kix.uodr4h5sr91x",
+          "textStyle": {
+            "fontSize": {
+              "magnitude": 12,
+              "unit": "PT"
+            },
+            "weightedFontFamily": {
+              "fontFamily": "DFKai-SB",
+              "weight": 400
+            }
+          }
+        }
+      },
+      {
+        "type": "inlineObjectElement",
+        "startIndex": 1745,
+        "endIndex": 1746,
+        "tabId": "t.0",
+        "segmentId": null,
+        "container": {
+          "kind": "paragraph",
+          "path": "root.tabs[0].body.content[52]",
+          "tabId": "t.0",
+          "segmentId": null,
+          "startIndex": 1745,
+          "endIndex": 1747,
+          "namedStyleType": "NORMAL_TEXT",
+          "listId": null,
+          "nestingLevel": null,
+          "table": null
+        },
+        "properties": {
+          "inlineObjectId": "kix.2vfihkocgctg",
+          "textStyle": {
+            "fontSize": {
+              "magnitude": 12,
+              "unit": "PT"
+            },
+            "weightedFontFamily": {
+              "fontFamily": "DFKai-SB",
+              "weight": 400
+            }
+          }
+        }
+      },
+      {
+        "type": "inlineObjectElement",
+        "startIndex": 2650,
+        "endIndex": 2651,
+        "tabId": "t.0",
+        "segmentId": null,
+        "container": {
+          "kind": "paragraph",
+          "path": "root.tabs[0].body.content[64]",
+          "tabId": "t.0",
+          "segmentId": null,
+          "startIndex": 2650,
+          "endIndex": 2652,
+          "namedStyleType": "NORMAL_TEXT",
+          "listId": null,
+          "nestingLevel": null,
+          "table": null
+        },
+        "properties": {
+          "inlineObjectId": "kix.9zwioudwzblx",
+          "textStyle": {
+            "bold": true,
+            "fontSize": {
+              "magnitude": 12,
+              "unit": "PT"
+            },
+            "weightedFontFamily": {
+              "fontFamily": "DFKai-SB",
+              "weight": 400
+            }
+          }
+        }
+      },
+      {
+        "type": "inlineObjectElement",
+        "startIndex": 9089,
+        "endIndex": 9090,
+        "tabId": "t.0",
+        "segmentId": null,
+        "container": {
+          "kind": "paragraph",
+          "path": "root.tabs[0].body.content[121]",
+          "tabId": "t.0",
+          "segmentId": null,
+          "startIndex": 9089,
+          "endIndex": 9091,
+          "namedStyleType": "NORMAL_TEXT",
+          "listId": null,
+          "nestingLevel": null,
+          "table": null
+        },
+        "properties": {
+          "inlineObjectId": "kix.q41iwt1nt7w0",
+          "textStyle": {
+            "fontSize": {
+              "magnitude": 12,
+              "unit": "PT"
+            },
+            "weightedFontFamily": {
+              "fontFamily": "DFKai-SB",
+              "weight": 400
+            }
+          }
+        }
+      },
+      {
+        "type": "inlineObjectElement",
+        "startIndex": 9849,
+        "endIndex": 9850,
+        "tabId": "t.0",
+        "segmentId": null,
+        "container": {
+          "kind": "paragraph",
+          "path": "root.tabs[0].body.content[136]",
+          "tabId": "t.0",
+          "segmentId": null,
+          "startIndex": 9849,
+          "endIndex": 9851,
+          "namedStyleType": "NORMAL_TEXT",
+          "listId": null,
+          "nestingLevel": null,
+          "table": null
+        },
+        "properties": {
+          "inlineObjectId": "kix.2em3n4m9jp4k",
+          "textStyle": {
+            "fontSize": {
+              "magnitude": 12,
+              "unit": "PT"
+            },
+            "weightedFontFamily": {
+              "fontFamily": "DFKai-SB",
+              "weight": 400
+            }
+          }
+        }
+      }
+    ]
+  },
+  "editGuidance": {
+    "advisoryOnly": true,
+    "requiresTargetedPreservation": false,
+    "recommendedBehavior": "No protected controls were detected in the scanned scope.",
+    "warnings": []
+  }
+}

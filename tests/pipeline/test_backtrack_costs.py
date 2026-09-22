@@ -1,7 +1,9 @@
 import numpy as np
+import pytest
 
 from pipeline.backtrack.costs import (
     ActorObservation,
+    BacktrackCostConfig,
     compute_c_ac,
     compute_c_ba,
     compute_c_bc,
@@ -98,6 +100,275 @@ def test_release_hypotheses_fall_back_to_birth_when_fit_is_impossible():
     assert hypotheses[0].model == "birth_fallback"
     assert hypotheses[0].prior_cost >= 6.0
     np.testing.assert_allclose(hypotheses[0].mean_uv, [12.0, 34.0])
+
+
+def test_two_point_release_uses_gap_window_and_computational_guard():
+    hypotheses = build_release_hypotheses(
+        points_uv=[(100.0, 200.0), (110.0, 220.0)],
+        frame_indices=[20, 22],
+        birth_frame=20,
+        max_back_frames=10,
+        fps=10,
+        two_point_max_back_seconds=0.3,
+        two_point_prior_cost=1.0,
+    )
+
+    # The legacy 0.3-second value is no longer a physical cutoff. The 10-frame
+    # max_back guard keeps all hypotheses available for later cost comparison.
+    assert [item.frame_index for item in hypotheses] == list(range(10, 21))
+    assert all(item.model == "constant_velocity_2point" for item in hypotheses)
+    np.testing.assert_allclose(hypotheses[-1].mean_uv, [100.0, 200.0])
+    np.testing.assert_allclose(hypotheses[0].mean_uv, [50.0, 100.0])
+    np.testing.assert_allclose(hypotheses[-1].velocity_uv, [50.0, 100.0])
+    assert np.trace(hypotheses[0].covariance_uv) > np.trace(
+        hypotheses[-1].covariance_uv
+    )
+    by_frame = {item.frame_index: item for item in hypotheses}
+    assert by_frame[18].prior_cost == by_frame[20].prior_cost == 1.0
+    assert by_frame[17].prior_cost > 1.0
+    assert by_frame[17].window_prior_cost > 0.0
+    assert by_frame[20].observation_gap_frames == 2
+    assert by_frame[20].zero_cost_window_start_frame == 18
+    assert by_frame[20].zero_cost_window_end_frame == 20
+    assert by_frame[20].source_direction_uv == pytest.approx(
+        (-1.0 / np.sqrt(5.0), -2.0 / np.sqrt(5.0))
+    )
+    assert by_frame[20].search_truncated is True
+    assert by_frame[20].truncation_reason == "max_back_frames_computational_guard"
+
+
+def test_two_point_release_is_fps_invariant_in_seconds():
+    low = build_release_hypotheses(
+        [(100.0, 200.0), (110.0, 220.0)], [20, 22],
+        birth_frame=20, max_back_frames=30, fps=10,
+    )
+    high = build_release_hypotheses(
+        [(100.0, 200.0), (110.0, 220.0)], [60, 66],
+        birth_frame=60, max_back_frames=90, fps=30,
+    )
+
+    np.testing.assert_allclose(low[0].mean_uv, high[0].mean_uv)
+    np.testing.assert_allclose(low[0].velocity_uv, high[0].velocity_uv)
+    np.testing.assert_allclose(low[0].covariance_uv, high[0].covariance_uv)
+
+
+def test_ballistic_release_window_may_extend_after_detector_birth():
+    hypotheses = build_release_hypotheses(
+        points_uv=[(100.0, 200.0), (105.0, 180.0), (110.0, 190.0), (115.0, 220.0)],
+        frame_indices=[20, 21, 22, 23],
+        birth_frame=20,
+        max_back_frames=2,
+        fps=10,
+        max_forward_release_seconds=0.5,
+    )
+
+    assert [item.frame_index for item in hypotheses] == [18, 19, 20, 21, 22, 23]
+    assert hypotheses[2].prior_cost == 0.0
+    # Forward frames are observed-airborne candidates, so they keep the
+    # seconds-based prior rather than the reverse observation-gap denominator.
+    assert hypotheses[-1].prior_cost == pytest.approx(0.35 * 0.3)
+
+
+def test_three_point_direction_uses_b0_b1_b2_and_reports_consistency():
+    hypotheses = build_release_hypotheses(
+        points_uv=[(10.0, 10.0), (12.0, 10.0), (14.0, 10.0)],
+        frame_indices=[20, 22, 24],
+        birth_frame=20,
+        max_back_frames=4,
+        fps=10,
+    )
+
+    assert hypotheses
+    assert hypotheses[0].direction_consistency == pytest.approx(1.0)
+    assert hypotheses[0].source_direction_uv == pytest.approx((-1.0, 0.0))
+    assert hypotheses[0].zero_cost_window_start_frame == 18
+
+
+def test_release_window_uses_earliest_recovered_observation_not_tracker_birth():
+    hypotheses = build_release_hypotheses(
+        points_uv=[(10.0, 10.0), (12.0, 10.0), (14.0, 11.0)],
+        frame_indices=[18, 20, 22],
+        birth_frame=20,
+        max_back_frames=4,
+        fps=10,
+    )
+
+    assert hypotheses
+    assert hypotheses[0].observation_gap_frames == 2
+    assert hypotheses[0].zero_cost_window_start_frame == 16
+    assert hypotheses[0].zero_cost_window_end_frame == 18
+
+
+def test_gap_window_keeps_older_release_with_soft_penalty():
+    hypotheses = build_release_hypotheses(
+        points_uv=[(100.0, 100.0), (110.0, 100.0)],
+        frame_indices=[20, 21],
+        birth_frame=20,
+        max_back_frames=12,
+        fps=10,
+        window_prior_weight=0.5,
+    )
+    by_frame = {item.frame_index: item for item in hypotheses}
+
+    assert 10 in by_frame  # B0 - 1 second is retained at 10 FPS.
+    assert by_frame[19].window_prior_cost == 0.0
+    assert by_frame[20].window_prior_cost == 0.0
+    assert by_frame[18].window_prior_cost == pytest.approx(0.5)
+    assert by_frame[10].window_prior_cost == pytest.approx(4.5)
+
+
+def test_c_bc_emits_zero_weight_causality_diagnostics_without_changing_total():
+    vehicle = [ActorObservation(
+        cls_name="vehicle",
+        track_id=2,
+        frame_index=10,
+        bbox=(80.0, 80.0, 140.0, 140.0),
+    )]
+    release = _release(10, (110.0, 110.0))
+
+    without = compute_c_bc([release], vehicle, fps=10)
+    with_context = compute_c_bc(
+        [release], vehicle, fps=10,
+        litter_last_point=(180.0, 180.0),
+        litter_last_frame=11,
+    )
+
+    assert with_context.total == pytest.approx(without.total)
+    assert with_context.weights["reverse_direction"] == 0.0
+    assert with_context.weights["exit_deficit"] == 0.0
+    assert with_context.weights["relative_motion_deficit"] == 0.0
+    assert set((
+        "reverse_direction", "exit_deficit", "relative_motion_deficit"
+    )).issubset(with_context.raw_features)
+
+
+def test_c_bc_boundary_depth_penalizes_deep_bbox_containment_only_when_enabled():
+    vehicle = [ActorObservation(
+        cls_name="vehicle",
+        track_id=2,
+        frame_index=10,
+        bbox=(0.0, 0.0, 200.0, 100.0),
+    )]
+    deep_release = _release(10, (100.0, 50.0))
+    edge_release = _release(10, (-5.0, 50.0))
+    baseline_deep = compute_c_bc([deep_release], vehicle, fps=10)
+    baseline_edge = compute_c_bc([edge_release], vehicle, fps=10)
+    weighted_config = BacktrackCostConfig(
+        bc_weights={
+            **BacktrackCostConfig().bc_weights,
+            "boundary_depth": 0.5,
+        }
+    )
+    weighted_deep = compute_c_bc(
+        [deep_release], vehicle, fps=10, cost_config=weighted_config
+    )
+    weighted_edge = compute_c_bc(
+        [edge_release], vehicle, fps=10, cost_config=weighted_config
+    )
+
+    assert baseline_deep.raw_features["boundary_depth"] == pytest.approx(1.0)
+    assert baseline_edge.raw_features["boundary_depth"] == pytest.approx(0.0)
+    assert baseline_deep.weights["boundary_depth"] == pytest.approx(0.0)
+    assert weighted_deep.total == pytest.approx(baseline_deep.total + 0.5)
+    assert weighted_edge.total == pytest.approx(baseline_edge.total)
+
+
+def test_c_bc_production_gate_uses_unexpanded_bbox_and_diagonal_scale():
+    vehicle = [ActorObservation(
+        cls_name="vehicle",
+        track_id=2,
+        frame_index=10,
+        bbox=(0.0, 0.0, 80.0, 60.0),  # diagonal = 100 px
+    )]
+
+    at_039 = compute_c_bc([_release(10, (119.0, 30.0))], vehicle, fps=10)
+    at_041 = compute_c_bc([_release(10, (121.0, 30.0))], vehicle, fps=10)
+
+    assert at_039.valid
+    assert at_039.raw_features["direct_distance"] == pytest.approx(0.39)
+    assert not at_041.valid
+    assert at_041.components["minimum_normalized_distance"] == pytest.approx(0.41)
+
+
+def test_c_bc_legacy_bbox_expansion_is_an_explicit_research_override():
+    vehicle = [ActorObservation(
+        cls_name="vehicle",
+        track_id=2,
+        frame_index=10,
+        bbox=(0.0, 0.0, 80.0, 60.0),
+    )]
+    release = _release(10, (95.0, 30.0))
+
+    production = compute_c_bc(
+        [release], vehicle, fps=10, normalized_distance_gate=0.10
+    )
+    legacy = compute_c_bc(
+        [release],
+        vehicle,
+        fps=10,
+        normalized_distance_gate=0.10,
+        vehicle_bbox_expand_x_ratio=0.18,
+        vehicle_bbox_expand_y_ratio=0.15,
+    )
+
+    assert not production.valid
+    assert legacy.valid
+    assert legacy.raw_features["direct_distance"] == pytest.approx(0.006)
+
+
+def test_observation_time_soft_penalty_uses_stricter_seconds_or_frames_scale():
+    vehicle = [ActorObservation(
+        cls_name="vehicle",
+        track_id=2,
+        frame_index=14,
+        bbox=(0.0, 0.0, 80.0, 60.0),
+    )]
+    release = _release(10, (40.0, 30.0))
+
+    hybrid = compute_c_bc([release], vehicle, fps=30)
+    seconds_only = compute_c_bc(
+        [release], vehicle, fps=30, max_observation_gap_frames=None
+    )
+
+    assert hybrid.valid
+    assert seconds_only.valid
+    # At 30 FPS, 4 frames is 0.133 s: seconds fraction=.533, frame
+    # fraction=1.333. max() chooses frames, then kappa=4 penalizes excess.
+    assert hybrid.raw_features["time"] == pytest.approx(
+        4 / 3 + 4 * (1 / 3) ** 2
+    )
+    assert hybrid.components["time"] == pytest.approx(
+        0.35 * hybrid.raw_features["time"]
+    )
+    assert hybrid.components["release_prior"] == pytest.approx(0.0)
+    assert seconds_only.raw_features["time"] == pytest.approx((4 / 30) / .25)
+
+    low_fps_vehicle = [ActorObservation(
+        cls_name="vehicle",
+        track_id=2,
+        frame_index=13,
+        bbox=(0.0, 0.0, 80.0, 60.0),
+    )]
+    low_fps = compute_c_bc([release], low_fps_vehicle, fps=10)
+    assert low_fps.valid
+    # At 10 FPS, seconds is stricter: z=max(.30/.25, 3/3)=1.2.
+    assert low_fps.raw_features["time"] == pytest.approx(1.2 + 4 * .2 ** 2)
+
+
+def test_legacy_observation_time_hard_gate_remains_replayable():
+    vehicle = [ActorObservation(
+        cls_name="vehicle",
+        track_id=2,
+        frame_index=14,
+        bbox=(0.0, 0.0, 80.0, 60.0),
+    )]
+    release = _release(10, (40.0, 30.0))
+    legacy = BacktrackCostConfig(observation_time_cost_mode="hard")
+
+    hybrid = compute_c_bc([release], vehicle, fps=30, cost_config=legacy)
+
+    assert not hybrid.valid
+    assert hybrid.reject_reason == "direct_vehicle_gate_failed"
 
 
 def test_c_ba_uses_upper_body_release_zone_not_person_footpoint():
@@ -319,6 +590,30 @@ def test_c_ac_accepts_sustained_near_vehicle_evidence():
     cost = compute_c_ac(people, vehicles, fps=10)
 
     assert cost.valid
+
+
+def test_c_ac_records_sync_gap_without_charging_a_time_cost():
+    people = [
+        ActorObservation(
+            "person", 1, frame, (40.0, 30.0, 80.0, 150.0),
+            evidence_frame_index=frame,
+        )
+        for frame in (0, 2)
+    ]
+    vehicles = [
+        ActorObservation(
+            "vehicle", 2, frame, (0.0, 60.0, 180.0, 170.0),
+            evidence_frame_index=frame + 1,
+        )
+        for frame in (0, 2)
+    ]
+
+    cost = compute_c_ac(people, vehicles, fps=10)
+
+    assert cost.valid
+    assert cost.raw_features["time"] > 0.0
+    assert cost.weights["time"] == pytest.approx(0.0)
+    assert cost.components["time"] == pytest.approx(0.0)
 
 
 def test_c_ac_dwell_must_be_contiguous_not_two_distant_points():

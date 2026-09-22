@@ -14,6 +14,7 @@ from .constants import (
     DEFAULT_READER_QUEUE_SIZE,
     LEGACY_RESOURCE_ROOT,
 )
+from .contracts import PreparedFrame
 
 
 def _resolve_video_path(file_arg):
@@ -344,11 +345,13 @@ class AsyncFFmpegVideoWriter:
 
 
 class AsyncVideoFrameReader:
-    # 背景讀取/解碼/前景 mask thread：主流程跑推理時，下一批 frame 已先準備好。
-    def __init__(self, cap, motion_masker, profiler, queue_size=DEFAULT_READER_QUEUE_SIZE):
+    # 背景讀取/解碼/前景 mask/4-channel 前處理：主流程推理時，下一批已先準備好。
+    def __init__(self, cap, motion_masker, profiler, queue_size=DEFAULT_READER_QUEUE_SIZE,
+                 litter_input_builder=None):
         self.cap = cap
         self.motion_masker = motion_masker
         self.profiler = profiler
+        self.litter_input_builder = litter_input_builder
         self._queue = queue.Queue(maxsize=max(int(queue_size or 1), 1))
         self._stop_event = threading.Event()
         self._sentinel = object()
@@ -357,30 +360,34 @@ class AsyncVideoFrameReader:
         self._thread = threading.Thread(target=self._worker, name="video-reader", daemon=True)
         self._thread.start()
 
-    def read_batch(self, batch_size):
+    def read_prepared_batch(self, batch_size):
         if self._done:
             if self._error is not None:
                 raise RuntimeError("Async video reader failed.") from self._error
-            return [], []
+            return []
 
-        frames = []
-        fg_masks = []
+        packets = []
         target = max(int(batch_size or 1), 1)
-        while len(frames) < target:
+        while len(packets) < target:
             with self.profiler.time_block("frame.reader_dequeue"):
                 item = self._queue.get()
             try:
                 if item is self._sentinel:
                     self._done = True
                     break
-                frame, fg_mask = item
-                frames.append(frame)
-                fg_masks.append(fg_mask)
+                packets.append(item)
             finally:
                 self._queue.task_done()
 
-        if self._done and self._error is not None and not frames:
+        if self._done and self._error is not None and not packets:
             raise RuntimeError("Async video reader failed.") from self._error
+        return packets
+
+    def read_batch(self, batch_size):
+        """舊兩欄介面；新主流程使用 ``read_prepared_batch`` 取得完整契約。"""
+        packets = self.read_prepared_batch(batch_size)
+        frames = [packet.source_bgr for packet in packets]
+        fg_masks = [packet.foreground_mask for packet in packets]
         return frames, fg_masks
 
     def close(self):
@@ -397,6 +404,8 @@ class AsyncVideoFrameReader:
         return False
 
     def _worker(self):
+        frame_index = 0
+        previous_frame = None
         try:
             while not self._stop_event.is_set():
                 with self.profiler.time_block("frame.read"):
@@ -406,8 +415,22 @@ class AsyncVideoFrameReader:
 
                 with self.profiler.time_block("frame.foreground_mask"):
                     fg_mask = self.motion_masker.build(frame, self.profiler)
-                if not self._put((frame, fg_mask)):
+
+                litter_model_input = None
+                if self.litter_input_builder is not None:
+                    with self.profiler.time_block("frame.litter_input_prepare"):
+                        litter_model_input = self.litter_input_builder(previous_frame, frame)
+
+                packet = PreparedFrame(
+                    index=frame_index,
+                    source_bgr=frame,
+                    foreground_mask=fg_mask,
+                    litter_model_input=litter_model_input,
+                )
+                if not self._put(packet):
                     break
+                previous_frame = frame
+                frame_index += 1
         except Exception as exc:
             self._error = exc
         finally:

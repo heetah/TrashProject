@@ -1,0 +1,63 @@
+{
+  "schema_version": "2.1.0",
+  "video": {
+    "file": "resize_annotated.mp4",
+    "duration_sec": 135.0
+  },
+  "litter_detection": {
+    "rtdetr_4channel": {
+      "enabled": true,
+      "confidence_threshold": 0.4,
+      "evaluated_frame_count": 4020,
+      "vehicle_gate_skipped_frame_count": 30,
+      "candidate_count": 3,
+      "detected_frame_count": 2,
+      "detected_frames": [
+        {"frame_index": 870, "candidate_count": 1},
+        {"frame_index": 871, "candidate_count": 2}
+      ]
+    },
+    "geometry_passed": {
+      "candidate_count": 2,
+      "detected_frame_count": 2,
+      "detected_frames": [
+        {"frame_index": 870, "candidate_count": 1},
+        {"frame_index": 871, "candidate_count": 1}
+      ]
+    },
+    "motion_holding_passed": {
+      "candidate_count": 2,
+      "detected_frame_count": 2,
+      "detected_frames": [
+        {"frame_index": 870, "candidate_count": 1},
+        {"frame_index": 871, "candidate_count": 1}
+      ]
+    },
+    "confirmed_event_count": 1
+  },
+  "summary": {
+    "litter_event_count": 1,
+    "urinate_event_count": 0,
+    "passed_vehicle_count": 4,
+    "average_litter_confidence": 0.88,
+    "detection_accuracy": null,
+    "accuracy_status": "not_evaluated",
+    "littering_plates": ["ABC1234"],
+    "review_required": true
+  },
+  "events": [
+    {
+      "type": "litter",
+      "id": 1,
+      "start_sec": 29.0,
+      "end_sec": 30.0,
+      "confidence": 0.88,
+      "vehicle": "vehicle:7",
+      "plate": "ABC1234",
+      "plate_confidence": 0.91,
+      "plate_status": "recognized",
+      "attribution_status": "resolved",
+      "review_required": true
+    }
+  ]
+}

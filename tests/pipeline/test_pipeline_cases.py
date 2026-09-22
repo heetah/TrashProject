@@ -191,37 +191,39 @@ class TestFalseNegativeRecovery:
 class TestTrackerThresholds:
     """Guard the tracker parameters that were changed for 4c pipeline."""
 
-    def test_vehicle_thrower_min_confirm_age(self):
-        """Vehicle-thrower confirmations require age >= 3 (not default 2)."""
+    def test_vehicle_thrower_min_confirm_age(self, monkeypatch):
+        """Production uses the manually reviewed 8/27 age=2 recovery profile."""
         import sys, os
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'scripts'))
         from litterTracker import GlobalLitterTracker
+        monkeypatch.delenv('LITTER_MIN_CONFIRM_AGE_VEHICLE', raising=False)
         t = GlobalLitterTracker()
         try:
             assert hasattr(t, 'min_confirm_age_vehicle'), (
                 "GlobalLitterTracker must have 'min_confirm_age_vehicle' attribute. "
                 "Add it to suppress vehicle-artifact FP confirmations."
             )
-            assert t.min_confirm_age_vehicle >= 3, (
-                f"min_confirm_age_vehicle={t.min_confirm_age_vehicle}, must be >= 3. "
-                "Vehicle-thrower litters confirmed at age=2 are mostly vehicle artifacts."
+            assert t.min_confirm_age_vehicle == 2, (
+                f"min_confirm_age_vehicle={t.min_confirm_age_vehicle}, expected 2. "
+                "Production must reproduce the manually reviewed 8/27 profile."
             )
         finally:
             t.close()
 
-    def test_vehicle_thrower_downward_displacement(self):
-        """Vehicle-thrower confirmations require stronger downward displacement."""
+    def test_vehicle_thrower_downward_displacement(self, monkeypatch):
+        """Production uses the manually reviewed 8/27 downward threshold."""
         import sys, os
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'scripts'))
         from litterTracker import GlobalLitterTracker
+        monkeypatch.delenv('LITTER_MIN_CONFIRM_DOWNWARD_VEHICLE', raising=False)
         t = GlobalLitterTracker()
         try:
             assert hasattr(t, 'min_confirm_downward_displacement_vehicle'), (
                 "GlobalLitterTracker must have 'min_confirm_downward_displacement_vehicle' attribute."
             )
-            assert t.min_confirm_downward_displacement_vehicle >= 12.0, (
+            assert t.min_confirm_downward_displacement_vehicle == 7.0, (
                 f"min_confirm_downward_displacement_vehicle={t.min_confirm_downward_displacement_vehicle}, "
-                "must be >= 12.0. Small downward displacement with vehicle thrower is a FP pattern."
+                "expected 7.0 for the production 8/27 profile."
             )
         finally:
             t.close()

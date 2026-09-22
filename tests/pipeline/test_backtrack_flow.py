@@ -75,8 +75,8 @@ def test_explicit_null_can_win_and_margin_uses_scaled_objective():
     assignment = solve_event_routes(routes)[1]
 
     assert assignment.route.route_id == "dustbin"
-    assert assignment.scaled_cost == 1000
-    assert assignment.margin_to_second == 0.234
+    assert assignment.scaled_cost == 1_000_000
+    assert assignment.margin_to_second == 0.2344
 
 
 def test_equal_cost_tie_is_deterministic_independent_of_input_order():
@@ -89,3 +89,17 @@ def test_equal_cost_tie_is_deterministic_independent_of_input_order():
     assert first["event"].route.route_id == "a-route"
     assert second["event"].route.route_id == "a-route"
     assert first["event"].margin_to_second == 0.0
+
+
+def test_sub_milliscale_cost_difference_selects_the_true_minimum():
+    routes = {
+        "event": [
+            RouteCandidate("vehicle-5", 1.942131736, vehicle_key=5),
+            RouteCandidate("vehicle-9", 1.942051425, vehicle_key=9),
+        ]
+    }
+
+    assignment = solve_event_routes(routes, null_cost=7.0)["event"]
+
+    assert assignment.route.route_id == "vehicle-9"
+    assert assignment.margin_to_second == 0.000081

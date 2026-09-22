@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # 共用幾何與判斷工具：前景 motion、IoU、mask overlap、holding 判斷、物理軌跡驗證。
 import math
+import os
 import cv2
 import numpy as np
 
@@ -48,12 +49,20 @@ def estimate_global_shift(prev_frame, curr_frame, downscale=SHAKE_DOWNSCALE):
 
 # === 前處理 litter 候選 FP 篩選參數（集中在 detect 前處理，tracker 只負責追蹤）===
 # 隨車部件（車燈/後照鏡/車身）與純水平條紋（橫越畫面的車/機車被拉成條）不該進 tracker。
-LITTER_FP_CONTAINMENT_THR = 0.85       # 候選與某車輛 bbox 重疊達此值 → 隨車部件
-LITTER_FP_STREAK_RATIO = 5.0           # horizontal 位移 > 此倍率 × downward → 純水平條紋（非重力下墜）
+# Validated replay default: only boxes that are (within pixel rounding) fully
+# contained by a vehicle are rejected at this early gate.  A stricter 0.85
+# override remains available for rollback/A-B via LITTER_FP_CONTAINMENT_THR.
+LITTER_FP_CONTAINMENT_THR = 0.999      # 候選與某車輛 bbox 幾乎完全重疊 → 隨車部件
+LITTER_FP_STREAK_RATIO = 10.0          # 8/27 recovery profile；仍排除極端純水平條紋
+LITTER_FP_STREAK_MIN_OBSERVATIONS = 2  # 包含本幀；2 保持既有 production 行為
+LITTER_FP_STREAK_DEFER_MAX_STEP_DIAGONALS_PER_FRAME = 1.1
+LITTER_FP_ARC_MIN_DESCENT = 7.0        # 最高點後至少下降此像素，才視為重力下降證據
 LITTER_FP_NEAREST_VEHICLE_DIST = 40.0  # 候選距車輛 bbox 此值內才做共動判斷（像素）
 LITTER_FP_COMOTION_MIN_VEH_STEP = 4.0  # 該步車輛位移 ≥ 此值才足以判斷共動（px/frame）
 LITTER_FP_COMOTION_MAX_REL = 4.0       # 該步 litter 相對車輛位移 ≤ 此值視為隨車（px/frame）
 LITTER_FP_COMOTION_MIN_COS = 0.85      # litter 與車輛速度向量夾角餘弦門檻
+LITTER_FP_RELEASE_MIN_SEPARATION = 40.0  # 車框邊緣出生後至少離車此距離，才可略過水平條紋 gate
+LITTER_FP_RELEASE_MAX_HISTORY = 3        # 僅保留剛釋放的前幾個 observation，避免放寬長軌跡雜訊
 
 # === litter_holding 參數常數（皆為固定調校值，不從呼叫端覆寫）===
 
@@ -106,6 +115,23 @@ VEHICLE_LOWER_EDGE_RATIO = 0.75
 VEHICLE_BOTTOM_GAP_RATIO = 0.95
 
 ALLOW_DISTANCE_HOLDING = True
+
+
+def _float_env(name, default):
+    """Read an optional numeric research override without changing defaults."""
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _int_env(name, default):
+    """Read an optional integer research override without changing defaults."""
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return int(default)
+
 
 def _motion_crop(fg_mask, coords, mask_scale=1.0):
     # 依 mask scale 裁出 bbox 對應區域；check_motion 與 motion_evidence 共用。
@@ -802,7 +828,8 @@ def litter_holding(litter_box, actors,
 
 
 def litter_candidate_is_vehicle_fp(litter_box, actors, vehicle_history=None,
-                                   prev_litter_history=None):
+                                   prev_litter_history=None,
+                                   prev_litter_missed=None):
     """前處理 FP 篩選：判斷此 litter 候選是否為『隨車部件』或『純水平條紋』。
 
     依使用者架構決策：垃圾辨識的篩選動作集中在 detect 前處理，tracker 只負責追蹤、
@@ -849,18 +876,122 @@ def litter_candidate_is_vehicle_fp(litter_box, actors, vehicle_history=None,
                 nearest_veh_id = None
 
     # 1) containment（per-frame，新生候選也適用）
-    if best_overlap >= LITTER_FP_CONTAINMENT_THR:
+    containment_threshold = min(
+        max(_float_env("LITTER_FP_CONTAINMENT_THR", LITTER_FP_CONTAINMENT_THR), 0.0),
+        1.0,
+    )
+    if best_overlap >= containment_threshold:
         return True, 'vehicle_contained'
 
     hist = list(prev_litter_history or [])
+    streak_ratio = max(
+        _float_env("LITTER_FP_STREAK_RATIO", LITTER_FP_STREAK_RATIO), 0.0
+    )
+    streak_min_observations = max(
+        _int_env(
+            "LITTER_FP_STREAK_MIN_OBSERVATIONS",
+            LITTER_FP_STREAK_MIN_OBSERVATIONS,
+        ),
+        2,
+    )
 
     # 2) horizontal streak（需軌跡）
+    # A two-point ratio is ill-conditioned while a real throw is still rising:
+    # down <= 0 collapses the denominator to epsilon, so any horizontal motion
+    # appears infinitely non-ballistic before an apex/descent can be observed.
+    # The production default (2) preserves existing behaviour.  A larger
+    # opt-in minimum defers rejection; it does not confirm the candidate, which
+    # must still satisfy holding and tracker physical-evidence gates.
     if hist:
         x0, y0 = float(hist[0][0]), float(hist[0][1])
         down = lcy - y0
         horiz = abs(lcx - x0)
-        if horiz > LITTER_FP_STREAK_RATIO * max(down, 1e-6):
-            return True, 'horizontal_streak'
+        # An airborne throw may first rise (smaller image y) and then descend.
+        # A clear descent from the observed apex is independent evidence of
+        # gravity-driven motion even before it falls below release height.
+        arc_points = [
+            (float(point[0]), float(point[1])) for point in hist
+        ] + [(lcx, lcy)]
+        apex_index = min(
+            range(len(arc_points)), key=lambda index: arc_points[index][1]
+        )
+        apex_x, apex_y = arc_points[apex_index]
+        descent_from_apex = lcy - apex_y
+        descent_horiz = abs(lcx - apex_x)
+        has_gravity_descent = (
+            apex_index < len(arc_points) - 1 and
+            descent_from_apex >= LITTER_FP_ARC_MIN_DESCENT and
+            descent_horiz <= streak_ratio * descent_from_apex
+        )
+        is_horizontal_streak = (
+            horiz > streak_ratio * max(down, 1e-6)
+            and not has_gravity_descent
+        )
+        if is_horizontal_streak:
+            # 真正從車窗/車斗邊緣拋出的輕物，一開始可能幾乎水平飛行。
+            # 只有軌跡剛出生、起點在車框內且本幀已明顯離開同一車框時，
+            # 才不在此前處理 gate 丟棄；後續仍需通過 holding、vehicle-relative
+            # separation 與 tracker 的車輛拋擲 confirmation，不能直接確認事件。
+            released_from_vehicle_edge = False
+            if len(hist) <= LITTER_FP_RELEASE_MAX_HISTORY:
+                for actor in actors or []:
+                    if str(actor.get('cls', '')).lower() not in VEHICLE_LIKE_CLASSES:
+                        continue
+                    box = actor.get('box')
+                    if box is None:
+                        continue
+                    ax1, ay1, ax2, ay2 = map(float, box[:4])
+                    start_dist = math.hypot(
+                        max(ax1 - x0, 0.0, x0 - ax2),
+                        max(ay1 - y0, 0.0, y0 - ay2),
+                    )
+                    current_dist = math.hypot(
+                        max(ax1 - lcx, 0.0, lcx - ax2),
+                        max(ay1 - lcy, 0.0, lcy - ay2),
+                    )
+                    if start_dist == 0.0 and current_dist >= LITTER_FP_RELEASE_MIN_SEPARATION:
+                        released_from_vehicle_edge = True
+                        break
+            if not released_from_vehicle_edge:
+                total_observations = len(hist) + 1
+                defer_until_more_evidence = (
+                    total_observations < streak_min_observations
+                )
+                if defer_until_more_evidence:
+                    # Do not let a deferred observation bridge to a different
+                    # object. Normalize the latest centroid jump by source-frame
+                    # gap and current box diagonal: px / (frame * px).
+                    # The 1.1 bound is an explicit development hypothesis, not
+                    # a calibrated physical speed or a production accuracy claim.
+                    px, py = float(hist[-1][0]), float(hist[-1][1])
+                    frame_gap = max(int(prev_litter_missed or 0) + 1, 1)
+                    bbox_diagonal = max(math.hypot(lx2 - lx1, ly2 - ly1), 1.0)
+                    residual_x = lcx - px
+                    residual_y = lcy - py
+                    if len(hist) >= 2:
+                        # A fast airborne object may move several own box
+                        # diagonals per frame.  Once two observations exist,
+                        # judge continuity against constant-velocity
+                        # prediction instead of raw displacement.  This only
+                        # postpones the streak rejection; it cannot confirm.
+                        prior_x, prior_y = map(float, hist[-2])
+                        residual_x -= px - prior_x
+                        residual_y -= py - prior_y
+                    normalized_step = (
+                        math.hypot(residual_x, residual_y)
+                        / (float(frame_gap) * bbox_diagonal)
+                    )
+                    max_normalized_step = max(
+                        _float_env(
+                            "LITTER_FP_STREAK_DEFER_MAX_STEP_DIAGONALS_PER_FRAME",
+                            LITTER_FP_STREAK_DEFER_MAX_STEP_DIAGONALS_PER_FRAME,
+                        ),
+                        0.0,
+                    )
+                    if normalized_step <= max_normalized_step:
+                        is_horizontal_streak = False
+                if is_horizontal_streak:
+                    return True, 'horizontal_streak'
 
     # 3) co-motion（需軌跡 + 鄰近移動車輛的逐幀 centroid）
     if (nearest_veh_id is not None and nearest_dist <= LITTER_FP_NEAREST_VEHICLE_DIST
@@ -917,7 +1048,7 @@ def validate_trajectory(centroid_history):
 
     # 拋物線（先升後降）識別：上升段 downward_ratio 必然偏低，但落下段應清楚向下。
     # 條件：終點低於起點（is_falling）、有明顯高點（peak 不在兩端）、落下段夠長且向下。
-    if not is_valid and is_falling and len(pts) >= 4:
+    if not is_valid and len(pts) >= 4:
         ys = pts[:, 1]
         peak_idx = int(np.argmin(ys))  # 最高點（Y 最小）
         if 1 <= peak_idx < len(pts) - 1:
@@ -925,8 +1056,15 @@ def validate_trajectory(centroid_history):
             descent_steps = np.diff(descent)
             descent_ratio = np.count_nonzero(descent_steps >= -2.0) / max(len(descent_steps), 1)
             descent_disp = float(ys[-1] - ys[peak_idx])
-            # 落下段向下明確、下降幅度夠大、整體軌跡不雜亂
-            if descent_ratio >= 0.8 and descent_disp >= 10.0 and straightness > 0.65:
+            # Release and landing may have similar image y.  Require at least
+            # two descent steps after an internal apex instead of requiring the
+            # final point to lie below the birth point.
+            if (
+                len(descent_steps) >= 2 and
+                descent_ratio >= 0.8 and
+                descent_disp >= 10.0 and
+                straightness > 0.50
+            ):
                 is_valid = True
 
     return is_valid, straightness

@@ -1,15 +1,21 @@
-import cv2
-import json
 import os
 import argparse
 from pathlib import Path
 from collections import defaultdict, deque
+
+from pipeline.config import PipelineConfig, load_project_env
+
+# 必須早於 Torch/Ultralytics 與 pipeline.devices import，device/model 設定才會完整生效。
+LOADED_ENV_PATH = load_project_env()
+
+import cv2
 from tqdm import tqdm
 
 from ultralytics import YOLO
 from ultralytics import RTDETR
 
 from pipeline.detect import detect_batch
+from pipeline.timebase import resolve_source_fps
 from pipeline.litter_tracker import GlobalLitterTracker
 from pipeline.action import STGCNActionModule
 from pipeline.plate import (
@@ -19,27 +25,19 @@ from pipeline.plate import (
     wait_for_plate_jobs,
 )
 from pipeline.profiling import PipelineProfiler
-from pipeline.events import build_run_events, write_events_jsonl
+from pipeline.events import (
+    build_analysis_report,
+    build_run_events,
+    write_analysis_json,
+)
 from pipeline.backtrack.sidecar import (
     build_run_record as build_backtrack_run_record,
     write_jsonl as write_backtrack_jsonl,
 )
-from pipeline.config import PipelineConfig
+from pipeline.litter.input4c import build_litter_model_input
 
 from pipeline.infra import (
     SUPPORTED_BATCH_SIZES,
-    DEFAULT_FG_MASK_SCALE,
-    DEFAULT_MOTION_DIFF_THRESHOLD,
-    DEFAULT_MOTION_DILATE_ITERATIONS,
-    DEFAULT_MOTION_BLUR_KERNEL,
-    DEFAULT_MOTION_OPEN_KERNEL,
-    DEFAULT_MOTION_OPEN_ITERATIONS,
-    DEFAULT_MOTION_CLOSE_KERNEL,
-    DEFAULT_MOTION_CLOSE_ITERATIONS,
-    DEFAULT_MOTION_MIN_COMPONENT_AREA,
-    DEFAULT_MOTION_MIN_LARGEST_COMPONENT_RATIO,
-    DEFAULT_READER_QUEUE_SIZE,
-    DEFAULT_CAPTURE_BUFFER_SIZE,
     MotionMaskBuilder,
     AsyncFFmpegVideoWriter,
     AsyncVideoFrameReader,
@@ -68,33 +66,22 @@ COLORS = {
     'scooter': (0, 255, 255) # 黃色
 }
 
-# 預設模型路徑：batch 1 使用一般權重；batch N 使用 batch 匯出/訓練資料夾中的權重。
-POSE_MODEL_PATH = '/home/se_copilot/trashProject/modules_weight/yolo26x-pose.pt'
-STGCN_WEIGHT_PATH = '/home/se_copilot/trashProject/modules_weight/best_stgcn_0623.pth'
-STGCN_CONFIG_PATH = '/home/se_copilot/trashProject/mmaction2/configs/skeleton/stgcnpp/custom_trash_stgcnpp.py'
 
-MODEL_BBOX_PATH = '/home/se_copilot/trashProject/modules_weight/best-yolo-seg_v3.pt'
-MODEL_TRASH_PATH = '/home/se_copilot/trashProject/modules_weight/best-rtdetr-4c.pt'
-MODEL_BBOX_PATH_BATCH = '/home/se_copilot/trashProject/modules_weight/batch/best-yolo-seg_v3.pt'
-# best-rtdetr-4c.pt 無 batch/ 版本；batch engine 由 export_tensorrt.py 在同目錄產出 best-rtdetr-4c_b8.engine。
-MODEL_TRASH_PATH_BATCH = '/home/se_copilot/trashProject/modules_weight/best-rtdetr-4c.pt'
-
-
-def _default_model_paths_for_batch(batch_size):
-    # 使用者未手動指定模型時，依 batch 自動切換成對應權重。
-    if int(batch_size) > 1:
-        return MODEL_BBOX_PATH_BATCH, MODEL_TRASH_PATH_BATCH
-    return MODEL_BBOX_PATH, MODEL_TRASH_PATH
-
+def _safe_float_env(name, default):
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("file", nargs="?", help="video path or file name in resources/", default="TThrow.mp4")
     args = parser.parse_args()
-    _set_ffmpeg_bin(_select_ffmpeg_bin(None))
+    cfg = PipelineConfig.from_env()
+    _set_ffmpeg_bin(_select_ffmpeg_bin(cfg.ffmpeg_bin))
 
     # 資源句柄與計數器集中管理，finally 可安全釋放攝影機與輸出檔。
-    profiler = PipelineProfiler(enabled=True)
+    profiler = PipelineProfiler(enabled=cfg.profile_enabled)
     cap = None
     out = None
     frame_reader = None
@@ -104,18 +91,18 @@ if __name__ == "__main__":
 
     try:
         with profiler.time_block("pipeline.total_wall"):
-            # 執行參數集中於 PipelineConfig(預設 = 原固定值,可用環境變數覆寫);
-            # vehicle gate 永遠開啟(VEHICLE_GATE 預設 "1"),快速偵測路徑
-            # (actor_mode=predict, rtdetr_zero_repair=off)永遠啟用。
-            cfg = PipelineConfig.from_env()
+            # 執行參數集中於 root .env + PipelineConfig；未設定時保留原 production 預設。
+            # Vehicle gate、actor fast path 與 zero-repair 都可由 .env 明確覆寫。
             _BATCH_SIZE = cfg.batch_size
             _YOLO_SEG_FRAME_SKIP = cfg.yolo_seg_frame_skip
             _ACTOR_MODE = cfg.actor_mode
             _RTDETR_ZERO_REPAIR = cfg.rtdetr_zero_repair
-            _RTDETR_ENABLED = os.environ.get("RTDETR_ENABLED", "1") != "0"
+            _RTDETR_ENABLED = cfg.rtdetr_enabled
 
-            prefer_engine = True
-            default_bbox_model_path, default_trash_model_path = _default_model_paths_for_batch(_BATCH_SIZE)
+            prefer_engine = cfg.prefer_tensorrt
+            default_bbox_model_path, default_trash_model_path = cfg.model_paths_for_batch(
+                _BATCH_SIZE
+            )
             desired_actor_batch_size = _estimate_actor_batch_size(_BATCH_SIZE, _YOLO_SEG_FRAME_SKIP)
             bbox_candidate_batches = [desired_actor_batch_size]
             for candidate_batch in sorted(SUPPORTED_BATCH_SIZES, reverse=True):
@@ -132,8 +119,11 @@ if __name__ == "__main__":
                 bbox_candidate_batches,
             )
             trash_model_candidates = _model_path_candidates(default_trash_model_path, prefer_engine, _BATCH_SIZE)
-            pose_model_candidates = _model_path_candidates(POSE_MODEL_PATH, prefer_engine, 1)
+            pose_model_candidates = _model_path_candidates(
+                cfg.pose_model_path, prefer_engine, 1
+            )
 
+            print(f"Configuration file: {LOADED_ENV_PATH or 'built-in defaults'}")
             print("Preloading all configured models before video processing...")
             print(f"Pipeline batch size: {_BATCH_SIZE}")
             print(f"Actor mode: {_ACTOR_MODE}")
@@ -147,19 +137,19 @@ if __name__ == "__main__":
             print("Extreme speed: detector fast path enabled; STGCN/OCR keep their normal enable flags.")
             # STGCN 先載入 pose model 與 skeleton classifier，後續只在偵測到 person 時更新。
             print(f"Pose model candidates: {pose_model_candidates}")
-            print(f"STGCN weight: {STGCN_WEIGHT_PATH}")
+            print(f"STGCN weight: {cfg.stgcn_weight_path}")
             with profiler.time_block("model_load.action_module_total"):
                 action_module = STGCNActionModule(
                     pose_model_path=pose_model_candidates,
-                    stgcn_weight_path=STGCN_WEIGHT_PATH,
-                    stgcn_config_path=STGCN_CONFIG_PATH,
+                    stgcn_weight_path=cfg.stgcn_weight_path,
+                    stgcn_config_path=cfg.stgcn_config_path,
                     action_threshold=cfg.action_threshold,
                     urinate_conf_high=None,
                     urinate_conf_low=None,
                     window_size=cfg.action_window,
                     urination_window_sec=cfg.urination_window_sec,
                     urination_min_sec=cfg.urination_min_sec,
-                    device=os.environ.get("ACTION_DEVICE"),
+                    device=cfg.action_device,
                     profiler=profiler,
                 )
             action_module.warmup(profiler=profiler)
@@ -194,7 +184,11 @@ if __name__ == "__main__":
                         channels = int(engine_shape[1])
                     else:
                         channels = _get_model_input_channels(model)
-                        imgsz = _get_model_warmup_imgsz(model)
+                        imgsz = (
+                            max(int(cfg.rtdetr_imgsz), 32)
+                            if cfg.rtdetr_imgsz is not None
+                            else _get_model_warmup_imgsz(model)
+                        )
                         if imgsz != 640:
                             model.overrides["imgsz"] = imgsz
                         print(f"[trash_warmup] fallback: imgsz={imgsz}, channels={channels}")
@@ -229,22 +223,22 @@ if __name__ == "__main__":
             with profiler.time_block("setup.motion_masker"):
                 # motion mask 只用於判定 litter bbox 是否有動態像素；confirmed 規則仍由 tracker 控制。
                 motion_masker = MotionMaskBuilder(
-                    mode="temporal",
-                    scale_factor=DEFAULT_FG_MASK_SCALE,
-                    diff_threshold=DEFAULT_MOTION_DIFF_THRESHOLD,
-                    dilate_iterations=DEFAULT_MOTION_DILATE_ITERATIONS,
-                    blur_kernel_size=DEFAULT_MOTION_BLUR_KERNEL,
-                    open_kernel_size=DEFAULT_MOTION_OPEN_KERNEL,
-                    open_iterations=DEFAULT_MOTION_OPEN_ITERATIONS,
-                    close_kernel_size=DEFAULT_MOTION_CLOSE_KERNEL,
-                    close_iterations=DEFAULT_MOTION_CLOSE_ITERATIONS,
-                    mog2_detect_shadows=True,
+                    mode=cfg.motion_mask_mode,
+                    scale_factor=cfg.fg_mask_scale,
+                    diff_threshold=cfg.motion_diff_threshold,
+                    dilate_iterations=cfg.motion_dilate_iterations,
+                    blur_kernel_size=cfg.motion_blur_kernel,
+                    open_kernel_size=cfg.motion_open_kernel,
+                    open_iterations=cfg.motion_open_iterations,
+                    close_kernel_size=cfg.motion_close_kernel,
+                    close_iterations=cfg.motion_close_iterations,
+                    mog2_detect_shadows=cfg.motion_mog2_detect_shadows,
                 )
 
             # === 影片處理參數設定 ===
             video_path = _resolve_video_path(args.file)
             # 預設輸出到 CWD；iterate-new.py 透過 subprocess cwd= 控制落點。
-            output_dir = Path(os.environ.get("OUTPUT_ROOT", ".")).expanduser()
+            output_dir = Path(cfg.output_root).expanduser()
             with profiler.time_block("setup.output_dir"):
                 output_dir.mkdir(parents=True, exist_ok=True)
             final_output = str(output_dir / f"{Path(video_path).stem}_annotated.mp4")
@@ -253,24 +247,26 @@ if __name__ == "__main__":
                 # 讀取影片屬性；fps 無效時用 30 避免 writer 初始化失敗。
                 cap, capture_backend = _open_video_capture(
                     video_path,
-                    hw_accel="any",
-                    hw_device=None,
-                    buffer_size=DEFAULT_CAPTURE_BUFFER_SIZE,
-                    read_threads=0,
+                    hw_accel=cfg.video_hw_accel,
+                    hw_device=cfg.video_hw_device,
+                    buffer_size=cfg.video_capture_buffer_size,
+                    read_threads=cfg.video_read_threads,
                     profiler=profiler,
                 )
                 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
                 raw_fps = cap.get(cv2.CAP_PROP_FPS)
-                fps = round(raw_fps) if raw_fps > 0 else 30
+                fps = resolve_source_fps(raw_fps, fallback=30.0)
             if not cap.isOpened():
                 raise FileNotFoundError(f"Unable to open video: {video_path}")
             if width <= 0 or height <= 0:
                 raise RuntimeError(f"Invalid video size for {video_path}: {width}x{height}")
             print(
                 f"VideoCapture backend: {capture_backend}; "
-                f"hw_accel=any; async_reader=True; reader_queue={DEFAULT_READER_QUEUE_SIZE}"
+                f"hw_accel={cfg.video_hw_accel}; async_reader=True; "
+                f"reader_queue={cfg.pipeline_queue_size}; "
+                f"prepare_4c_in_reader={cfg.prepare_4c_in_reader and _RTDETR_ENABLED}"
             )
 
             with profiler.time_block("video.open_writer"):
@@ -301,8 +297,13 @@ if __name__ == "__main__":
             # 違規顯示快取：僅用於畫面標註持續時間
             violator_display_cache = {}
             detection_stats = {
+                'rtdetr_evaluated_frames': 0,
+                'rtdetr_litter_candidates': 0,
+                'rtdetr_litter_candidate_frames': [],
                 'raw_litter_candidates': 0,
+                'geometry_litter_candidate_frames': [],
                 'filtered_litter_candidates': 0,
+                'filtered_litter_candidate_frames': [],
                 'confirmed_litter_ids': set(),
                 'confirmed_litter_frame_hits': 0,
                 'confirmed_litter_thrower_ids': set(),
@@ -325,6 +326,8 @@ if __name__ == "__main__":
                 'stgcn_alerts': 0,
                 'stgcn_registered_violators': 0,
             }
+            if os.environ.get("LITTER_CANDIDATE_SIDECAR", "0") not in ("0", ""):
+                detection_stats['litter_candidate_records'] = []
             yolo_seg_cache = {}
             rtdetr_batch_context = {}
             frame_index = 0
@@ -334,7 +337,12 @@ if __name__ == "__main__":
                     cap,
                     motion_masker,
                     profiler,
-                    queue_size=DEFAULT_READER_QUEUE_SIZE,
+                    queue_size=cfg.pipeline_queue_size,
+                    litter_input_builder=(
+                        build_litter_model_input
+                        if cfg.prepare_4c_in_reader and _RTDETR_ENABLED
+                        else None
+                    ),
                 )
             cap = None
 
@@ -342,9 +350,27 @@ if __name__ == "__main__":
             with profiler.time_block("process.video_loop_total"):
                 with tqdm(total=total_frames, desc="Processing Video... ", unit="frame") as pbar:
                     while True:
-                        frames, fg_masks = frame_reader.read_batch(_BATCH_SIZE)
-                        if not frames:
+                        prepared_frames = frame_reader.read_prepared_batch(_BATCH_SIZE)
+                        if not prepared_frames:
                             break
+
+                        expected_indices = list(
+                            range(frame_index, frame_index + len(prepared_frames))
+                        )
+                        packet_indices = [packet.index for packet in prepared_frames]
+                        if packet_indices != expected_indices:
+                            raise RuntimeError(
+                                "Prepared frame order mismatch: "
+                                f"expected {expected_indices}, got {packet_indices}"
+                            )
+
+                        frames = [packet.source_bgr for packet in prepared_frames]
+                        fg_masks = [packet.foreground_mask for packet in prepared_frames]
+                        prepared_litter_inputs = (
+                            [packet.litter_model_input for packet in prepared_frames]
+                            if prepared_frames[0].litter_model_input is not None
+                            else None
+                        )
 
                         with profiler.time_block("detect.total"):
                             # Create prev_frames list: first frame's prev is last_frame from previous batch
@@ -365,18 +391,19 @@ if __name__ == "__main__":
                                 profiler=profiler,
                                 moving_threshold=cfg.moving_threshold,
                                 core_moving_threshold=cfg.core_moving_threshold,
-                                motion_min_component_area=DEFAULT_MOTION_MIN_COMPONENT_AREA,
-                                motion_min_largest_component_ratio=DEFAULT_MOTION_MIN_LARGEST_COMPONENT_RATIO,
+                                motion_min_component_area=cfg.motion_min_component_area,
+                                motion_min_largest_component_ratio=cfg.motion_min_largest_component_ratio,
                                 batch_size=_BATCH_SIZE,
                                 bbox_batch_size=bbox_runtime_batch_size,
                                 trash_batch_size=trash_runtime_batch_size,
-                                fg_mask_scale=DEFAULT_FG_MASK_SCALE,
+                                fg_mask_scale=cfg.fg_mask_scale,
                                 stats=detection_stats,
                                 rtdetr_zero_repair=_RTDETR_ZERO_REPAIR,
                                 rtdetr_batch_context=rtdetr_batch_context,
                                 actor_mode=_ACTOR_MODE,
                                 actor_track_iou=cfg.actor_track_iou,
                                 prev_frames=prev_frames,
+                                prepared_litter_inputs=prepared_litter_inputs,
                             )
                             # Update last_frame for next batch
                             if frames:
@@ -460,7 +487,8 @@ if __name__ == "__main__":
             stgcn_urinate_confirmed = int(detection_stats.get('stgcn_urinate_confirmed', 0))
             print(
                 "Litter detection summary: "
-                f"raw_candidates={detection_stats.get('raw_litter_candidates', 0)}, "
+                f"rtdetr_candidates={detection_stats.get('rtdetr_litter_candidates', 0)}, "
+                f"geometry_passed_candidates={detection_stats.get('raw_litter_candidates', 0)}, "
                 f"motion_filtered_candidates={detection_stats.get('filtered_litter_candidates', 0)}, "
                 f"confirmed_ids={len(confirmed_litter_ids)}, "
                 f"confirmed_frame_hits={detection_stats.get('confirmed_litter_frame_hits', 0)}, "
@@ -492,8 +520,25 @@ if __name__ == "__main__":
                 "rtdetr_enabled": _RTDETR_ENABLED,
                 "stgcn_pose_enabled": True,
                 "plate_enabled": _RTDETR_ENABLED,
+                "duration_sec": round(int(processed_frames) / float(fps), 3),
+                "rtdetr_confidence_threshold": float(cfg.trash_conf),
+                "rtdetr_evaluated_frames": int(
+                    detection_stats.get('rtdetr_evaluated_frames', 0)
+                ),
+                "rtdetr_litter_candidates": int(
+                    detection_stats.get('rtdetr_litter_candidates', 0)
+                ),
+                "rtdetr_litter_candidate_frames": list(
+                    detection_stats.get('rtdetr_litter_candidate_frames', [])
+                ),
                 "raw_litter_candidates": int(detection_stats.get('raw_litter_candidates', 0)),
+                "geometry_litter_candidate_frames": list(
+                    detection_stats.get('geometry_litter_candidate_frames', [])
+                ),
                 "filtered_litter_candidates": int(detection_stats.get('filtered_litter_candidates', 0)),
+                "filtered_litter_candidate_frames": list(
+                    detection_stats.get('filtered_litter_candidate_frames', [])
+                ),
                 "confirmed_litter_ids": len(confirmed_litter_ids),
                 "confirmed_litter_frame_hits": int(detection_stats.get('confirmed_litter_frame_hits', 0)),
                 "confirmed_litter_thrower_ids": len(confirmed_litter_thrower_ids),
@@ -531,6 +576,15 @@ if __name__ == "__main__":
             }
             if smart_backtrack_summary is not None:
                 run_summary["smart_backtrack"] = smart_backtrack_summary
+            if (
+                litter_tracker is not None
+                and hasattr(litter_tracker, "get_homography_calibration_summary")
+            ):
+                homography_summary = (
+                    litter_tracker.get_homography_calibration_summary()
+                )
+                if homography_summary.get("enabled"):
+                    run_summary["homography_calibration"] = homography_summary
             # Legacy-only Offline P↔V Hungarian。Smart mode 會回 None，避免
             # 1-to-1 結果覆蓋 many-to-many Min-Cost Flow attribution。
             if litter_tracker is not None and hasattr(litter_tracker, "finalize_associations"):
@@ -552,7 +606,7 @@ if __name__ == "__main__":
             if (
                 litter_tracker is not None
                 and hasattr(litter_tracker, "get_backtrack_candidate_records")
-                and os.environ.get("SMART_BACKTRACK_SIDECAR", "1")
+                and os.environ.get("SMART_BACKTRACK_SIDECAR", "0")
                 not in ("0", "")
             ):
                 sidecar_path = Path(final_output).with_name(
@@ -595,28 +649,131 @@ if __name__ == "__main__":
                     f"events={len(candidate_records)} -> {sidecar_path}"
                 )
 
-            # Summary JSON 固定寫在輸出影片同目錄：{stem}_summary.json
-            summary_path = Path(final_output).with_name(
-                Path(final_output).stem + "_summary.json"
-            )
-            summary_path.write_text(
-                json.dumps(run_summary, ensure_ascii=False, indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
+            # Opt-in calibration trace: one record per RT-DETR litter candidate,
+            # including the exact gate rejection reason and tracker ID when
+            # accepted. This is research evidence, not ground truth.
+            litter_candidate_records = detection_stats.get('litter_candidate_records')
+            if isinstance(litter_candidate_records, list):
+                containment_threshold = min(
+                    max(_safe_float_env("LITTER_FP_CONTAINMENT_THR", 0.999), 0.0),
+                    1.0,
+                )
+                dedup_iou_threshold = min(
+                    max(_safe_float_env("LITTER_CANDIDATE_DEDUP_IOU", 0.5), 0.0),
+                    1.0,
+                )
+                candidate_trace_path = Path(final_output).with_name(
+                    Path(final_output).stem + "_litter_candidates.jsonl"
+                )
+                candidate_trace_run = {
+                    "record_type": "run",
+                    "schema": "litter-candidate-gates/v1",
+                    "input_video": str(video_path),
+                    "output_video": str(final_output),
+                    "fps": float(fps),
+                    "frame_count": int(processed_frames),
+                    "confidence_threshold": float(cfg.trash_conf),
+                    "containment_threshold": containment_threshold,
+                    "dedup_enabled": os.environ.get(
+                        "LITTER_CANDIDATE_DEDUP", "0"
+                    ) not in ("0", ""),
+                    "dedup_iou_threshold": dedup_iou_threshold,
+                    # Tracker confirmation knobs are recorded alongside the
+                    # candidate trace so an A/B replay is reproducible from
+                    # its output directory rather than from shell history.
+                    "confirm_require_birth_actor": os.environ.get(
+                        "LITTER_CONFIRM_REQUIRE_BIRTH_ACTOR", "0"
+                    ) not in ("0", ""),
+                    "min_confirm_age_vehicle": _safe_float_env(
+                        "LITTER_MIN_CONFIRM_AGE_VEHICLE", 2
+                    ),
+                    "min_confirm_downward_vehicle": _safe_float_env(
+                        "LITTER_MIN_CONFIRM_DOWNWARD_VEHICLE", 7
+                    ),
+                    "min_confirm_horizontal_displacement": _safe_float_env(
+                        "LITTER_MIN_CONFIRM_HORIZONTAL_DISPLACEMENT", 1
+                    ),
+                    "max_horiz_to_down_ratio_vehicle": _safe_float_env(
+                        "LITTER_MAX_HORIZ_TO_DOWN_RATIO_VEHICLE", 10
+                    ),
+                    "min_vehicle_relative_separation": _safe_float_env(
+                        "LITTER_MIN_VEHICLE_RELATIVE_SEPARATION", 0
+                    ),
+                    "vehicle_quarantine_min_observations": int(
+                        _safe_float_env(
+                            "LITTER_VEHICLE_QUARANTINE_MIN_OBSERVATIONS", 3
+                        )
+                    ),
+                    "vehicle_quarantine_min_relative_displacement": _safe_float_env(
+                        "LITTER_VEHICLE_QUARANTINE_MIN_RELATIVE_DISPLACEMENT", 25
+                    ),
+                    "vehicle_quarantine_min_relative_downward": _safe_float_env(
+                        "LITTER_VEHICLE_QUARANTINE_MIN_RELATIVE_DOWNWARD", 15
+                    ),
+                    "vehicle_quarantine_min_scale_ratio": _safe_float_env(
+                        "LITTER_VEHICLE_QUARANTINE_MIN_SCALE_RATIO", 1
+                    ),
+                    "vehicle_quarantine_min_downward_steps": int(
+                        _safe_float_env(
+                            "LITTER_VEHICLE_QUARANTINE_MIN_DOWNWARD_STEPS", 2
+                        )
+                    ),
+                    "vehicle_quarantine_max_gap_sec": _safe_float_env(
+                        "LITTER_VEHICLE_QUARANTINE_MAX_GAP_SEC", 0.35
+                    ),
+                    "fp_streak_ratio": _safe_float_env(
+                        "LITTER_FP_STREAK_RATIO", 10
+                    ),
+                    "fp_streak_min_observations": int(
+                        _safe_float_env(
+                            "LITTER_FP_STREAK_MIN_OBSERVATIONS", 2
+                        )
+                    ),
+                    "fp_streak_defer_max_step_diagonals_per_frame": _safe_float_env(
+                        "LITTER_FP_STREAK_DEFER_MAX_STEP_DIAGONALS_PER_FRAME", 1.1
+                    ),
+                    "allow_shake_candidates": os.environ.get(
+                        "LITTER_ALLOW_SHAKE_CANDIDATES", "1"
+                    ) not in ("0", ""),
+                }
+                write_backtrack_jsonl(
+                    [candidate_trace_run, *litter_candidate_records],
+                    str(candidate_trace_path),
+                )
+                run_summary['litter_candidate_sidecar'] = str(candidate_trace_path)
+                run_summary['litter_candidate_records'] = len(litter_candidate_records)
+                print(
+                    "Litter candidate sidecar: "
+                    f"candidates={len(litter_candidate_records)} -> {candidate_trace_path}"
+                )
 
-            # events.jsonl:前端監測台資料來源(與 summary.json 分離,不改變其行為)。
-            events_path = Path(final_output).with_name(
-                Path(final_output).stem + "_events.jsonl"
+            # 每支影片只輸出一份前端 JSON；研究 sidecar 預設關閉，需明確啟用。
+            analysis_path = Path(final_output).with_name(
+                Path(final_output).stem + "_analysis.json"
             )
+            run_summary["analysis_json"] = str(analysis_path)
+
             run_events = build_run_events(
                 final_litter_events,
                 action_module.get_urinate_events() if action_module is not None else [],
                 vehicle_history,
                 run_summary,
                 fps,
+                action_vehicle_associations=(
+                    litter_tracker.get_action_vehicle_associations()
+                    if litter_tracker is not None
+                    and hasattr(litter_tracker, "get_action_vehicle_associations")
+                    else {}
+                ),
             )
-            n_events = write_events_jsonl(run_events, str(events_path))
-            print(f"Events written: {n_events} -> {events_path}")
+            analysis_report = build_analysis_report(
+                run_summary,
+                run_events,
+                vehicle_history,
+                fps=fps,
+            )
+            write_analysis_json(analysis_report, analysis_path)
+            print(f"Analysis written: {analysis_path}")
 
             if litter_tracker is not None:
                 litter_tracker.close()

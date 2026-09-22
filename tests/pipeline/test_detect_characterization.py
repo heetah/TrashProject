@@ -16,7 +16,13 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
 
-from pipeline.detect import detect
+from pipeline.detect import (
+    _deduplicate_litter_candidates,
+    _stage_filter_litter_candidates,
+    _stage_render_actors,
+    _stage_render_rtdetr_debug,
+    detect,
+)
 from pipeline.litter_tracker import GlobalLitterTracker
 
 COLORS = {
@@ -35,6 +41,7 @@ GOLDEN = {
             "person_detections": 1,
             "person_frame_hits": 1,
             "raw_litter_candidates": 0,
+            "rtdetr_litter_candidates": 0,
         },
         "veh10_centroids": [[110.0, 70.0]],
         "violator_keys": [],
@@ -44,10 +51,21 @@ GOLDEN = {
         "annotated_sha": "2c52bd94e768a828123a66d9f505eb45ae06ce4eaf36d480f042a654ecf662d4",
         "annotated_shape": [120, 160, 3],
         "stats": {
+            "filtered_litter_candidate_frames": [
+                {"candidate_count": 1, "frame_index": 0}
+            ],
             "filtered_litter_candidates": 1,
+            "geometry_litter_candidate_frames": [
+                {"candidate_count": 1, "frame_index": 0}
+            ],
             "person_detections": 1,
             "person_frame_hits": 1,
             "raw_litter_candidates": 1,
+            "rtdetr_evaluated_frames": 1,
+            "rtdetr_litter_candidate_frames": [
+                {"candidate_count": 1, "frame_index": 0}
+            ],
+            "rtdetr_litter_candidates": 1,
         },
         "veh10_centroids": [[110.0, 70.0]],
         "violator_keys": [],
@@ -132,3 +150,186 @@ def test_detect_scenario_a_actors_only():
 def test_detect_scenario_b_with_litter_candidate():
     trash = [_StubResult([_StubBox(0, 0.9, [40, 40, 60, 60])])]
     assert _run(model_trash=_StubTrash(), trash_results=trash, with_motion=True) == GOLDEN["B"]
+
+
+def test_rtdetr_frame_is_recorded_before_geometry_rejection():
+    # 2px 寬的 bbox 是 RT-DETR litter output，但會被基本 geometry gate 淘汰。
+    trash = [_StubResult([_StubBox(0, 0.9, [40, 40, 42, 60])])]
+    result = _run(model_trash=_StubTrash(), trash_results=trash, with_motion=True)
+
+    assert result["stats"]["rtdetr_litter_candidates"] == 1
+    assert result["stats"]["rtdetr_litter_candidate_frames"] == [
+        {"frame_index": 0, "candidate_count": 1}
+    ]
+    assert result["stats"]["raw_litter_candidates"] == 0
+    assert result["stats"]["filtered_litter_candidates"] == 0
+
+
+def test_debug_render_includes_actor_track_ids(monkeypatch):
+    labels = []
+    monkeypatch.setenv("LITTER_DEBUG", "1")
+    monkeypatch.setattr(
+        "pipeline.detect.cv2.putText",
+        lambda _frame, text, *_args, **_kwargs: labels.append(text),
+    )
+    frame = np.zeros((120, 160, 3), dtype=np.uint8)
+    _stage_render_actors(
+        frame,
+        [
+            {"box": [10, 10, 40, 80], "cls": "person", "track_id": 7},
+            {"box": [60, 20, 140, 100], "cls": "vehicle", "track_id": 12},
+        ],
+        {},
+        80.0,
+        COLORS,
+        {},
+        _fresh_vehicle_history(),
+        1,
+        0.5,
+        1,
+        None,
+    )
+    assert labels == ["person ID:7", "vehicle ID:12"]
+
+
+def test_debug_render_includes_rtdetr_box_before_geometry_rejection(monkeypatch):
+    rectangles, labels = [], []
+    monkeypatch.setenv("LITTER_DEBUG", "1")
+    monkeypatch.setattr(
+        "pipeline.detect.cv2.rectangle",
+        lambda _frame, p1, p2, color, thickness: rectangles.append(
+            (p1, p2, color, thickness)
+        ),
+    )
+    monkeypatch.setattr(
+        "pipeline.detect.cv2.putText",
+        lambda _frame, text, *_args, **_kwargs: labels.append(text),
+    )
+
+    _stage_render_rtdetr_debug(
+        np.zeros((120, 160, 3), dtype=np.uint8),
+        [[40, 40, 42, 60, 0.9]],  # 2px wide: later geometry gate rejects it.
+        None,
+    )
+
+    assert rectangles == [((40, 40), (42, 60), (255, 0, 255), 2)]
+    assert labels == ["RTDETR raw 0.90"]
+
+
+def test_rtdetr_debug_overlay_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("LITTER_DEBUG", raising=False)
+    frame = np.zeros((120, 160, 3), dtype=np.uint8)
+
+    _stage_render_rtdetr_debug(frame, [[40, 40, 60, 60, 0.9]], None)
+
+    assert not frame.any()
+
+
+def test_candidate_dedup_keeps_highest_confidence_and_detector_order():
+    first = [10, 10, 30, 30, 0.70]
+    distinct = [80, 80, 100, 100, 0.60]
+    duplicate = [11, 11, 31, 31, 0.90]
+
+    kept, suppressed = _deduplicate_litter_candidates(
+        [first, distinct, duplicate], iou_threshold=0.5
+    )
+
+    assert kept == [distinct, duplicate]
+    assert suppressed == [first]
+
+
+def test_containment_threshold_override_preserves_default(monkeypatch):
+    from pipeline.geometry import litter_candidate_is_vehicle_fp
+
+    near_contained_litter = [10, 10, 30, 30, 0.9]
+    near_contained_actor = [{"cls": "vehicle", "track_id": 3, "box": [0, 0, 40, 28]}]
+    fully_contained_litter = [10, 10, 30, 30, 0.9]
+    fully_contained_actor = [{"cls": "vehicle", "track_id": 3, "box": [0, 0, 40, 40]}]
+    monkeypatch.delenv("LITTER_FP_CONTAINMENT_THR", raising=False)
+    assert litter_candidate_is_vehicle_fp(near_contained_litter, near_contained_actor)[0] is False
+    assert litter_candidate_is_vehicle_fp(fully_contained_litter, fully_contained_actor)[0] is True
+
+    # Rollback to 0.85 reproduces the previous early rejection; subsequent
+    # motion/holding/tracker confirmation remains mandatory either way.
+    monkeypatch.setenv("LITTER_FP_CONTAINMENT_THR", "0.85")
+    assert litter_candidate_is_vehicle_fp(near_contained_litter, near_contained_actor)[0] is True
+
+
+def test_contained_candidate_is_submitted_only_as_quarantine(monkeypatch):
+    """The detect-stage gate preserves evidence without ordinary release."""
+    monkeypatch.setattr("pipeline.detect.motion_evidence", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        "pipeline.detect.litter_candidate_is_vehicle_fp",
+        lambda *_a, **_k: (True, "vehicle_contained"),
+    )
+
+    litter = [10, 10, 30, 30, 0.9]
+    record = {
+        "_box_object_id": id(litter),
+        "bbox": [10, 10, 30, 30],
+        "filter_outcome": None,
+        "filter_reason": None,
+        "tracker_outcome": "not_evaluated",
+    }
+    tracker = type(
+        "TrackerStub",
+        (),
+        {"active_litters": {}, "distance_threshold": 250, "_debug": False},
+    )()
+    stats = {}
+
+    accepted, quarantined = _stage_filter_litter_candidates(
+        [litter], False, 0.0, 10.0,
+        np.ones((40, 40), dtype=np.uint8), 1.0, 0.1, 0.1,
+        1, 0.1, tracker,
+        [{"cls": "vehicle", "track_id": 3, "box": [0, 0, 40, 40]}],
+        _fresh_vehicle_history(), 0, stats, None,
+        candidate_records=[record],
+    )
+
+    assert accepted == [litter]
+    assert quarantined == [litter]
+    assert record["filter_outcome"] == "passed"
+    assert record["filter_reason"] == "vehicle_contained_quarantine"
+    assert stats["quarantined_litter_candidates"] == 1
+
+
+def test_quarantine_history_cannot_reject_ordinary_candidate(monkeypatch):
+    """Tentative containment history is isolated from ordinary prefilters."""
+    observed_histories = []
+    monkeypatch.setattr("pipeline.detect.motion_evidence", lambda *_a, **_k: True)
+
+    def _capture_filter(*_args, **kwargs):
+        observed_histories.append(kwargs.get("prev_litter_history"))
+        return False, None
+
+    monkeypatch.setattr(
+        "pipeline.detect.litter_candidate_is_vehicle_fp", _capture_filter,
+    )
+    litter = [40, 40, 60, 60, 0.9]
+    tracker = type(
+        "TrackerStub",
+        (),
+        {
+            "active_litters": {
+                7: {
+                    "bbox": [42, 42, 62, 62, 0.8],
+                    "history": [(52, 52), (54, 54)],
+                    "missed": 0,
+                    "vehicle_quarantine_active": True,
+                }
+            },
+            "distance_threshold": 250,
+            "_debug": False,
+        },
+    )()
+
+    accepted, quarantined = _stage_filter_litter_candidates(
+        [litter], False, 0.0, 10.0,
+        np.ones((80, 80), dtype=np.uint8), 1.0, 0.1, 0.1,
+        1, 0.1, tracker, [], _fresh_vehicle_history(), 3, {}, None,
+    )
+
+    assert observed_histories == [None]
+    assert accepted == [litter]
+    assert quarantined == []

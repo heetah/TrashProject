@@ -2,7 +2,10 @@
 # 車牌辨識模組：只對已鎖定違規的 vehicle/scooter ROI 派工，背景執行 YOLO 車牌偵測與 PaddleOCR。
 import os
 import threading
+from pathlib import Path
+
 import numpy as np
+from pipeline.config import PROJECT_ROOT
 from pipeline.profiling import profile_block
 
 # 全域模型與背景執行狀態：避免每幀重複載入 OCR/plate detector。
@@ -16,6 +19,35 @@ try:
     import torch
 except Exception:
     torch = None
+
+
+def _float_env(name, default):
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _int_env(name, default):
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _confidence_env(name, default):
+    return min(1.0, max(0.0, _float_env(name, default)))
+
+
+def _plate_model_path():
+    value = os.environ.get(
+        "PLATE_MODEL_PATH",
+        str(PROJECT_ROOT / "modules_weight/best-licnese-plate.pt"),
+    )
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return str(path.resolve())
 
 
 def _get_plate_device():
@@ -42,14 +74,17 @@ def _get_plate_models(profiler=None):
     if _plate_model is None:
         from ultralytics import YOLO
         with profile_block(profiler, "model_load.plate_yolo"):
-            _plate_model = YOLO("test_ocr/license_plate_model/runs/detect/license_plate/yolo26n_v1/weights/best.pt")
+            _plate_model = YOLO(_plate_model_path())
 
     if _ocr_model is None:
         os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
         from paddlex import create_model
         ocr_device = os.environ.get("PLATE_OCR_DEVICE", "cpu")
+        ocr_model_name = os.environ.get(
+            "PLATE_OCR_MODEL_NAME", "en_PP-OCRv5_mobile_rec"
+        )
         with profile_block(profiler, "model_load.plate_ocr"):
-            _ocr_model = create_model(model_name="en_PP-OCRv5_mobile_rec", device=ocr_device)
+            _ocr_model = create_model(model_name=ocr_model_name, device=ocr_device)
 
     return _plate_model, _ocr_model
 
@@ -102,11 +137,12 @@ def _plate_worker(roi_items, vehicle_history, profiler=None):
             plate_device = _get_plate_device()
             # 一次對多個 vehicle ROI 做 plate detection，降低模型呼叫次數。
             with profile_block(profiler, "license_plate.yolo_plate_predict"):
+                plate_detect_conf = _confidence_env("PLATE_DETECT_CONF", 0.6)
                 plate_results = plate_model.predict(
                     [roi for _, roi in roi_items],
                     save=False,
                     max_det=1,
-                    conf=0.6,
+                    conf=plate_detect_conf,
                     verbose=False,
                     device=plate_device,
                     half=_can_use_half(plate_device),
@@ -116,6 +152,8 @@ def _plate_worker(roi_items, vehicle_history, profiler=None):
                 plate_results = [plate_results]
 
             with profile_block(profiler, "license_plate.parse_and_ocr"):
+                plate_ocr_conf = _confidence_env("PLATE_OCR_CONFIDENCE", 0.85)
+                plate_box_conf = _confidence_env("PLATE_ACCEPT_DETECT_CONF", 0.8)
                 # 對每台車最多取一張高信心車牌，OCR 成功後寫回 vehicle_history。
                 for (vehicle, vehicle_roi), plate_box_result in zip(roi_items, plate_results):
                     if not plate_box_result or plate_box_result.boxes is None:
@@ -141,8 +179,8 @@ def _plate_worker(roi_items, vehicle_history, profiler=None):
                             plate_ocr_results = list(ocr_model.predict(plate_img))[0]
                         print("OCR results:", plate_ocr_results['rec_text'], " rec_score:", plate_ocr_results['rec_score'], " box_conf:", box_conf)
                         if (
-                            plate_ocr_results['rec_score'] >= 0.85 and
-                            float(box_conf) >= 0.8
+                            plate_ocr_results['rec_score'] >= plate_ocr_conf and
+                            float(box_conf) >= plate_box_conf
                         ):
                             print(
                                 "[Plate]",
@@ -176,11 +214,14 @@ def wait_for_plate_jobs(profiler=None, timeout=None):
             thread.join(timeout=timeout)
 
 
-def detect_license_plates(frame, vehicles, vehicle_history, skip=10, profiler=None):
+def detect_license_plates(frame, vehicles, vehicle_history, skip=None, profiler=None):
     """呼叫端幾乎立即返回；車牌偵測與 OCR 會在背景 thread 執行。"""
     global _plate_thread
     if _plate_disabled:
         return
+
+    if skip is None:
+        skip = max(0, _int_env("PLATE_SCAN_SKIP", 10))
 
     vehicles = [
         vehicle for vehicle in vehicles

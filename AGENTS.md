@@ -44,8 +44,12 @@ trashProject/
 │   │   └── backtrack/
 │   ├── frontend/             # summary/events 靜態檢視介面
 │   └── *.py                  # 舊 import compatibility shims 或工具入口
+├── UI/                       # 獨立 Flask + React 人工複核應用
+│   ├── backend/              # job/review persistence、pipeline worker、JSON/media API
+│   └── frontend/             # 未審核/已審核與影片事件檢視
 ├── tests/
 │   ├── pipeline/             # production pipeline unit/integration tests
+│   ├── ui/                   # UI persistence/API tests
 │   └── test_litter_regression.py
 ├── modules_weight/           # 本機模型權重；不進一般 Git
 ├── resources/                # 本機影片；不進一般 Git，可不存在
@@ -65,6 +69,7 @@ trashProject/
 |---|---|---|
 | `scripts/` | 實作 production 功能、修 bug、更新相容 shim | 建立個人版本副本、混入測試影片或權重 |
 | `scripts/pipeline/` | 新增可重用模組、維持清楚 data flow | 把核心功能寫回頂層 shim、跨分支偷改責任 |
+| `UI/` | 維護獨立 Flask/React 控制與人工複核介面，只讀取 production JSON | 在 UI 重做或改寫事件確認、歸因、OCR，或把 confidence 當 accuracy |
 | `tests/` | 新增 unit/integration/regression test | 把測試重新塞回 `scripts/` |
 | `modules_weight/` | 讀取與驗證本機模型 metadata | 把大型 `.pt/.pth/.onnx/.engine` 加進一般 Git |
 | `resources/` | 執行明確指定的測試影片 | 把大量影片加入一般 Git |

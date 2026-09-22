@@ -4,21 +4,23 @@ import argparse
 import os
 from pathlib import Path
 
+from pipeline.config import PipelineConfig, PROJECT_ROOT, load_project_env
+
+# 與 production entrypoint 共用 root .env；真正執行匯出工具時須早於
+# Torch/Ultralytics import。作為 helper module 匯入時不得污染 process env，否則
+# 測試與其他長生命週期 caller 會意外繼承本機 .env。
+if __name__ == "__main__":
+    load_project_env()
+
 import cv2
-import numpy as np
 import torch
 from ultralytics import RTDETR, YOLO
 
+from pipeline.litter.input4c import build_litter_model_input
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 # 匯出預設需和 main.py 對齊：batch 1 用 root 權重，batch N 用 modules_weight/batch。
 SUPPORTED_BATCH_SIZES = (1, 2, 4, 8, 12, 16, 24)
-ROOT_BBOX_MODEL = PROJECT_ROOT / "modules_weight" / "best-yolo-seg_v3.pt"
-ROOT_TRASH_MODEL = PROJECT_ROOT / "modules_weight" / "best-rtdetr-4c.pt"
-ROOT_POSE_MODEL = PROJECT_ROOT / "modules_weight" / "yolo26x-pose.pt"
-BATCH_BBOX_MODEL = PROJECT_ROOT / "modules_weight" / "batch" / "best-yolo-seg_v3.pt"
-# best-rtdetr-4c.pt 沒有 batch/ 版本，使用 root 同一份權重做 batch engine export。
-BATCH_TRASH_MODEL = ROOT_TRASH_MODEL
 DEFAULT_SMOKE_VIDEO = PROJECT_ROOT / "resources" / "resize.mp4"
 
 
@@ -65,14 +67,15 @@ def _temporary_backup_path(path):
     return path.with_name(f"{path.name}.pre_batch_export_{os.getpid()}")
 
 
-def _resolve_default_model_paths(args):
+def _resolve_default_model_paths(args, config):
     # CLI 未指定模型時，依 batch 選擇 main.py 實際會載入的權重。
+    bbox_model, trash_model = config.model_paths_for_batch(args.batch)
     if args.bbox_model is None:
-        args.bbox_model = BATCH_BBOX_MODEL if int(args.batch) > 1 else ROOT_BBOX_MODEL
+        args.bbox_model = Path(bbox_model)
     if args.trash_model is None:
-        args.trash_model = BATCH_TRASH_MODEL if int(args.batch) > 1 else ROOT_TRASH_MODEL
+        args.trash_model = Path(trash_model)
     if args.pose_model is None:
-        args.pose_model = ROOT_POSE_MODEL
+        args.pose_model = Path(config.pose_model_path)
 
 
 def _parse_frame_indices(value):
@@ -129,22 +132,11 @@ def _keypoint_counts(results, keep_count):
 
 
 def _build_4ch_frames(frames: list) -> list:
-    """將連續 BGR frames 轉成 4-channel (BGR + pixel-change map) 格式。
-    用於 4c trash model 的 smoke test。change map 以相鄰幀 absdiff 計算。
-    """
-    import cv2
+    """將連續 BGR frames 轉成 reference-compatible RGB+change input。"""
     result = []
     for i, fr in enumerate(frames):
         prev = frames[i - 1] if i > 0 else None
-        if prev is None:
-            diff = cv2.cvtColor(
-                cv2.absdiff(np.zeros_like(fr), fr),
-                cv2.COLOR_BGR2GRAY,
-            )
-        else:
-            diff = cv2.cvtColor(cv2.absdiff(prev, fr), cv2.COLOR_BGR2GRAY)
-        diff = np.clip(diff.astype(np.float32) * 2.0, 0, 255).astype(np.uint8)
-        result.append(np.dstack((fr, diff)))
+        result.append(build_litter_model_input(prev, fr))
     return result
 
 
@@ -277,8 +269,9 @@ def _export_model(label, model_path, loader, task, args):
             backup_path.rename(default_engine_path)
 
 
-def parse_args():
+def parse_args(config=None):
     # CLI 參數：控制 device、batch、imgsz、FP16、dynamic shape 與是否重建既有 engine。
+    config = config or PipelineConfig.from_env()
     parser = argparse.ArgumentParser(description="Export project YOLO/RTDETR weights to TensorRT engines.")
     parser.add_argument("--device", default="1", help="CUDA device index, e.g. 0 or cuda:0")
     parser.add_argument("--batch", type=int, default=8, choices=SUPPORTED_BATCH_SIZES,
@@ -311,9 +304,9 @@ def parse_args():
                         help="Video used for post-export engine smoke test")
     parser.add_argument("--smoke-frames", default="70,75",
                         help="Comma/space separated frame indices for post-export smoke test")
-    parser.add_argument("--smoke-bbox-conf", type=float, default=0.45,
+    parser.add_argument("--smoke-bbox-conf", type=float, default=config.bbox_conf,
                         help="BBOX confidence threshold for smoke test")
-    parser.add_argument("--smoke-trash-conf", type=float, default=0.4,
+    parser.add_argument("--smoke-trash-conf", type=float, default=config.trash_conf,
                         help="RTDETR confidence threshold for smoke test")
     parser.add_argument("--smoke-pose-conf", type=float, default=0.3,
                         help="YOLO pose confidence threshold for smoke test")
@@ -325,8 +318,9 @@ def parse_args():
 
 def main():
     # 主流程：檢查 CUDA 後依參數匯出 bbox/trash/pose engine。
-    args = parse_args()
-    _resolve_default_model_paths(args)
+    config = PipelineConfig.from_env()
+    args = parse_args(config)
+    _resolve_default_model_paths(args, config)
     _check_cuda(args.device)
     outputs = []
     if not args.skip_bbox:

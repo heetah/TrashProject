@@ -5,8 +5,15 @@ import numpy as np
 import math
 import os
 from pipeline.plate import detect_license_plates, dispatch_license_plate_rois, get_plate_number
+from pipeline.actor_gate import (
+    batch_has_active_gate,
+    has_fresh_observation,
+    is_within_ttl,
+    refresh_last_observation_frame,
+)
 from pipeline.profiling import profile_block
 from pipeline.devices import BBOX_DEVICE, BBOX_HALF, TRASH_DEVICE, TRASH_HALF
+from pipeline.litter.input4c import build_litter_model_input, compute_pixel_change_map
 from pipeline.geometry import (
     SHAKE_COOLDOWN_SEC,
     SHAKE_SHIFT_FLOOR_PX,
@@ -21,36 +28,10 @@ from pipeline.geometry import (
 # 類別顏色與名稱正規化：避免不同模型 label-space 造成 actor 解析錯誤。
 BLACK = (0, 0, 0)
 WARN = (0, 0, 255)
+RTDETR_DEBUG = (255, 0, 255)
+LITTER_ALLOW_SHAKE_CANDIDATES_DEFAULT = True
 
 
-def compute_pixel_change_map(prev_frame, curr_frame):
-    """Return a grayscale image visualising per-pixel absolute difference.
-
-    4c model design principle: the change map must preserve magnitude.
-    Static scenes → near-zero output.  Moving objects → bright pixels.
-    cv2.normalize is intentionally avoided: it collapses a near-zero noise
-    range (e.g. 0-2) to 0-255, making the 4th channel indistinguishable
-    from a scene with heavy motion.  Direct scaling retains the magnitude
-    relationship the model was trained on.
-
-    Args:
-        prev_frame: Previous frame (H, W, 3) BGR uint8
-        curr_frame: Current frame (H, W, 3) BGR uint8
-
-    Returns:
-        diff_gray: Grayscale change map (H, W) uint8
-    """
-    if prev_frame is None:
-        # First frame: return zeros for change map
-        return np.zeros(curr_frame.shape[:2], dtype=np.uint8)
-
-    diff = cv2.absdiff(prev_frame, curr_frame)  # shape H×W×3, uint8
-    diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)  # collapse to 1 channel
-    # Scale up raw magnitude without normalising.
-    # Factor 2.0: a 30-pixel diff (clear motion) → 60, clipped at 255.
-    # A 1-2 pixel sensor noise → 2-4, stays near zero as intended.
-    diff_gray = np.clip(diff_gray.astype(np.float32) * 2.0, 0, 255).astype(np.uint8)
-    return diff_gray
 ACTOR_CLASSES = ('person', 'scooter', 'vehicle')
 VEHICLE_LIKE_CLASSES = ('scooter', 'vehicle')
 ACTION_WARNING_LABELS = {
@@ -80,6 +61,11 @@ def _float_env(name, default):
         return float(default)
 
 
+def _allow_shake_candidates():
+    default = "1" if LITTER_ALLOW_SHAKE_CANDIDATES_DEFAULT else "0"
+    return os.environ.get("LITTER_ALLOW_SHAKE_CANDIDATES", default) not in ("0", "")
+
+
 # 車牌開罰前提：只有畫面「最近一段時間內出現過 vehicle/scooter」才跑後續昂貴判斷
 # （YOLO-Pose + STGCN 動作、RTDETR litter 偵測/確認、車牌 OCR）。因為開罰需要追蹤到車牌，
 # 沒有車輛/機車時這些判斷都無法開罰，直接略過以省算力並避免行人場景的誤判。
@@ -100,13 +86,12 @@ def _vehicle_gate_any_active(actor_pairs, frame_indices, yolo_seg_cache, fps):
     if not _vehicle_gate_enabled():
         return True
     ttl = _vehicle_gate_ttl_frames(fps)
-    last_fi = yolo_seg_cache.get('last_vehicle_frame_index')
-    for (_persons, vehicles), frame_index in zip(actor_pairs, frame_indices):
-        if vehicles:
-            last_fi = frame_index
-        if last_fi is not None and (frame_index - int(last_fi)) <= ttl:
-            return True
-    return False
+    return batch_has_active_gate(
+        actor_pairs,
+        frame_indices,
+        yolo_seg_cache.get('last_vehicle_frame_index'),
+        ttl,
+    )
 
 
 def _model_class_name(model, cls_id):
@@ -407,15 +392,21 @@ def _stage_resolve_actor_sources(frame, model_bbox, precomputed_persons, precomp
 
 def _stage_vehicle_gate(vehicles, yolo_seg_cache, frame_index, fps, stats):
     # 車輛閘門:記錄最近看到 vehicle/scooter 的幀,判斷是否在 TTL 秒數窗內。
-    if vehicles:
-        yolo_seg_cache['last_vehicle_frame_index'] = frame_index
+    fresh_vehicle = has_fresh_observation(vehicles)
+    if fresh_vehicle:
+        yolo_seg_cache['last_vehicle_frame_index'] = refresh_last_observation_frame(
+            yolo_seg_cache.get('last_vehicle_frame_index'),
+            vehicles,
+            frame_index,
+        )
     if not _vehicle_gate_enabled():
         vehicle_active = True
     else:
         last_vehicle_fi = yolo_seg_cache.get('last_vehicle_frame_index')
-        vehicle_active = (
-            last_vehicle_fi is not None and
-            (frame_index - int(last_vehicle_fi)) <= _vehicle_gate_ttl_frames(fps)
+        vehicle_active = is_within_ttl(
+            frame_index,
+            last_vehicle_fi,
+            _vehicle_gate_ttl_frames(fps),
         )
     if stats is not None and not vehicle_active:
         stats['vehicle_gate_skipped_frames'] = stats.get('vehicle_gate_skipped_frames', 0) + 1
@@ -495,17 +486,102 @@ def _stage_detect_shake(prev_frame, frame, litter_tracker, frame_index, fps, sta
     return shake_active, shake_mag, shake_threshold
 
 
+def _record_litter_candidate_frame(stats, key, frame_index, candidate_count):
+    """記錄某一處理階段有 candidate 的幀；每幀只存幀號與 observation 數。"""
+    if stats is None or candidate_count <= 0:
+        return
+    stats.setdefault(key, []).append({
+        'frame_index': int(frame_index),
+        'candidate_count': int(candidate_count),
+    })
+
+
+def _litter_candidate_diagnostics_enabled(stats):
+    """Return whether the opt-in per-candidate calibration trace is active."""
+    return stats is not None and isinstance(stats.get('litter_candidate_records'), list)
+
+
+def _finalize_litter_candidate_diagnostics(candidate_records, tracked_litters):
+    """Attach tracker IDs to candidates accepted by the pre-tracker gates."""
+    if not candidate_records:
+        return
+    unmatched_ids = set(tracked_litters)
+    for record in candidate_records:
+        record.pop('_box_object_id', None)
+        if record.get('filter_outcome') != 'passed':
+            continue
+        bbox = tuple(record.get('bbox', ()))
+        matched_id = None
+        for litter_id in sorted(unmatched_ids):
+            tracked_bbox = tuple(tracked_litters[litter_id].get('bbox', ())[:4])
+            if tracked_bbox == bbox:
+                matched_id = litter_id
+                break
+        if matched_id is None:
+            record['tracker_outcome'] = 'unassigned'
+            continue
+        unmatched_ids.remove(matched_id)
+        litter_data = tracked_litters[matched_id]
+        record['tracker_outcome'] = 'assigned'
+        record['tracker_litter_id'] = int(matched_id)
+        record['tracker_state'] = str(litter_data.get('state', 'pending'))
+        record['tracker_age'] = int(litter_data.get('age', 0))
+
+
+def _bbox_iou_xyxy(first, second):
+    ax1, ay1, ax2, ay2 = map(float, first[:4])
+    bx1, by1, bx2, by2 = map(float, second[:4])
+    intersection = max(0.0, min(ax2, bx2) - max(ax1, bx1)) * max(
+        0.0, min(ay2, by2) - max(ay1, by1)
+    )
+    first_area = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    second_area = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = first_area + second_area - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def _deduplicate_litter_candidates(candidates, iou_threshold=0.5):
+    """Retain the highest-confidence box from each same-frame overlap cluster."""
+    ranked = sorted(
+        enumerate(candidates),
+        key=lambda item: (-float(item[1][4]), item[0]),
+    )
+    kept = []
+    suppressed = []
+    for _index, candidate in ranked:
+        if any(_bbox_iou_xyxy(candidate, other) >= iou_threshold for other in kept):
+            suppressed.append(candidate)
+        else:
+            kept.append(candidate)
+    kept_ids = {id(candidate) for candidate in kept}
+    return (
+        [candidate for candidate in candidates if id(candidate) in kept_ids],
+        suppressed,
+    )
+
+
 def _stage_collect_litter_candidates(vehicle_active, model_trash, precomputed_trash_results,
-                                     prev_frame, frame, trash_conf, stats, profiler):
-    # RTDETR 全圖偵測垃圾候選;車輛閘門關閉或無模型時回空。回傳 [[x1,y1,x2,y2,conf], ...]。
+                                     prev_frame, frame, trash_conf, stats, profiler,
+                                     frame_index,
+                                     prepared_litter_input=None):
+    # RTDETR 全圖偵測垃圾候選;車輛閘門關閉或無模型時回空。回傳
+    # (RTDETR confidence/class 篩選結果, 通過基本 geometry 的結果)。stats 另保留
+    # geometry 前的真正 RTDETR 輸出，才能區分
+    # 「模型未辨識」與「模型有框、但被後處理淘汰」。
+    rtdetr_frame_litters = []
     current_frame_litters = []
+    candidate_records = []
+    diagnostics_enabled = _litter_candidate_diagnostics_enabled(stats)
     if not vehicle_active or model_trash is None:
         chunk_results = []
     elif precomputed_trash_results is None:
         with profile_block(profiler, "detect.rtdetr_litter_predict"):
-            # 計算像素變化圖,並創建 4 通道輸入 (RGB + change map)。
-            change_map = compute_pixel_change_map(prev_frame, frame)
-            frame_4ch = np.dstack((frame, change_map))
+            # Reference-compatible 4-channel input: RGB + normalized change map。
+            frame_4ch = (
+                prepared_litter_input
+                if prepared_litter_input is not None
+                else build_litter_model_input(prev_frame, frame)
+            )
             chunk_results = model_trash.predict(
                 frame_4ch, conf=trash_conf, device=TRASH_DEVICE, half=TRASH_HALF, verbose=False,
             )
@@ -522,32 +598,103 @@ def _stage_collect_litter_candidates(vehicle_active, model_trash, precomputed_tr
                 r_conf = float(r_box.conf[0])
                 if r_class_name == 'litter':
                     lx1, ly1, lx2, ly2 = map(int, r_box.xyxy[0])
+                    litter_box = [lx1, ly1, lx2, ly2, r_conf]
+                    rtdetr_frame_litters.append(litter_box)
                     bbox_width = lx2 - lx1
                     bbox_height = ly2 - ly1
                     # 基礎 bbox 尺寸與長寬比過濾:去掉極端扁長或過小雜訊。
                     aspect_ratio = bbox_width / max(bbox_height, 1e-6)
+                    record = None
+                    if diagnostics_enabled:
+                        record = {
+                            'record_type': 'litter_candidate',
+                            'frame_index': int(frame_index),
+                            'candidate_index': len(rtdetr_frame_litters) - 1,
+                            'bbox': [lx1, ly1, lx2, ly2],
+                            'confidence': float(r_conf),
+                            'geometry_passed': True,
+                            'filter_outcome': None,
+                            'filter_reason': None,
+                            'tracker_outcome': 'not_evaluated',
+                            'tracker_litter_id': None,
+                            'tracker_state': None,
+                            '_box_object_id': id(litter_box),
+                        }
+                        candidate_records.append(record)
                     if aspect_ratio > 6.0 or aspect_ratio < 0.15 or bbox_width < 3 or bbox_height < 3:
+                        if record is not None:
+                            record['geometry_passed'] = False
+                            record['filter_outcome'] = 'rejected'
+                            record['filter_reason'] = 'geometry'
+                            record['tracker_outcome'] = 'not_submitted'
                         continue
-                    current_frame_litters.append([lx1, ly1, lx2, ly2, r_conf])
+                    current_frame_litters.append(litter_box)
 
     if stats is not None:
+        if vehicle_active and model_trash is not None:
+            stats['rtdetr_evaluated_frames'] = stats.get('rtdetr_evaluated_frames', 0) + 1
+        stats['rtdetr_litter_candidates'] = (
+            stats.get('rtdetr_litter_candidates', 0) + len(rtdetr_frame_litters)
+        )
         stats['raw_litter_candidates'] = stats.get('raw_litter_candidates', 0) + len(current_frame_litters)
-    return current_frame_litters
+        _record_litter_candidate_frame(
+            stats,
+            'rtdetr_litter_candidate_frames',
+            frame_index,
+            len(rtdetr_frame_litters),
+        )
+        _record_litter_candidate_frame(
+            stats,
+            'geometry_litter_candidate_frames',
+            frame_index,
+            len(current_frame_litters),
+        )
+    return rtdetr_frame_litters, current_frame_litters, candidate_records
 
 
 def _stage_filter_litter_candidates(current_frame_litters, shake_active, shake_mag, shake_threshold,
                                     fg_mask, fg_mask_scale, moving_threshold, core_moving_threshold,
                                     motion_min_component_area, motion_min_largest_component_ratio,
                                     litter_tracker, tracking_objects, vehicle_history,
-                                    frame_index, stats, profiler):
+                                    frame_index, stats, profiler, candidate_records=None):
     # motion + holding 前處理:只有真的在動、且不像仍被人車持有的 litter 才進 tracker。
     filtered_frame_litters = []
+    quarantined_frame_litters = []
+    record_by_object_id = {
+        record.get('_box_object_id'): record
+        for record in (candidate_records or [])
+    }
+    candidates_for_filter = current_frame_litters
+    if os.environ.get('LITTER_CANDIDATE_DEDUP', '0') not in ('0', ''):
+        dedup_iou = min(max(_float_env('LITTER_CANDIDATE_DEDUP_IOU', 0.5), 0.0), 1.0)
+        candidates_for_filter, duplicate_litters = _deduplicate_litter_candidates(
+            current_frame_litters, iou_threshold=dedup_iou,
+        )
+        for litter_box in duplicate_litters:
+            record = record_by_object_id.get(id(litter_box))
+            if record is not None:
+                record['filter_outcome'] = 'rejected'
+                record['filter_reason'] = 'duplicate_iou'
+                record['tracker_outcome'] = 'not_submitted'
     with profile_block(profiler, "detect.motion_holding_filter"):
-        # 晃動冷卻區間內:整幀都在位移,litter 偵測不可靠 → 全數丟棄,不餵 tracker。
-        shake_skip = shake_active
+        # 8/27 recovery profile 預設允許晃動幀候選繼續接受下游
+        # motion/holding/tracker gates；可設 LITTER_ALLOW_SHAKE_CANDIDATES=0
+        # 恢復整幀丟棄的保守策略。
+        shake_skip = (
+            shake_active and
+            not _allow_shake_candidates()
+        )
         if shake_skip and getattr(litter_tracker, '_debug', False):
             print(f"  [SHAKE_SKIP fi={frame_index} mag={shake_mag:.1f}px thr={shake_threshold:.1f} drop={len(current_frame_litters)}]")
-        for litter_box in ([] if shake_skip else current_frame_litters):
+        if shake_skip:
+            for litter_box in candidates_for_filter:
+                record = record_by_object_id.get(id(litter_box))
+                if record is not None:
+                    record['filter_outcome'] = 'rejected'
+                    record['filter_reason'] = 'camera_shake'
+                    record['tracker_outcome'] = 'not_submitted'
+        for litter_box in ([] if shake_skip else candidates_for_filter):
+            record = record_by_object_id.get(id(litter_box))
             lx1, ly1, lx2, ly2, _ = litter_box
             litter_w = max(int(lx2 - lx1), 1)
             litter_h = max(int(ly2 - ly1), 1)
@@ -559,6 +706,10 @@ def _stage_filter_litter_candidates(current_frame_litters, shake_active, shake_m
                 min_largest_component_ratio=motion_min_largest_component_ratio,
             )
             if not is_moving:
+                if record is not None:
+                    record['filter_outcome'] = 'rejected'
+                    record['filter_reason'] = 'motion'
+                    record['tracker_outcome'] = 'not_submitted'
                 continue
             # 在中心區域再做一次 motion 驗證,抑制「旁邊人車移動」造成的舊垃圾誤觸發。
             if litter_w >= 8 and litter_h >= 8:
@@ -573,6 +724,10 @@ def _stage_filter_litter_candidates(current_frame_litters, shake_active, shake_m
                     min_largest_component_ratio=motion_min_largest_component_ratio,
                 )
                 if not is_core_moving:
+                    if record is not None:
+                        record['filter_outcome'] = 'rejected'
+                        record['filter_reason'] = 'core_motion'
+                        record['tracker_outcome'] = 'not_submitted'
                     continue
             # 從 tracker 取最近上一幀中心,供 holding 判斷相對位移與釋放方向。
             prev_litter_center = None
@@ -581,6 +736,12 @@ def _stage_filter_litter_candidates(current_frame_litters, shake_active, shake_m
             min_prev_dist = float('inf')
             curr_center = ((lx1 + lx2) / 2.0, (ly1 + ly2) / 2.0)
             for l_data in litter_tracker.active_litters.values():
+                if l_data.get('vehicle_quarantine_active', False):
+                    # Quarantine evidence is intentionally not trusted as a
+                    # normal litter trajectory yet. Let the tracker associate
+                    # it, but do not let its tentative history trigger streak
+                    # or holding rejection on a later ordinary candidate.
+                    continue
                 prev_box = l_data['bbox']
                 prev_center = (
                     (float(prev_box[0]) + float(prev_box[2])) / 2.0,
@@ -596,8 +757,30 @@ def _stage_filter_litter_candidates(current_frame_litters, shake_active, shake_m
             is_fp_candidate, fp_reason = litter_candidate_is_vehicle_fp(
                 litter_box, tracking_objects, vehicle_history=vehicle_history,
                 prev_litter_history=prev_litter_history,
+                prev_litter_missed=prev_litter_missed,
             )
             if is_fp_candidate:
+                if fp_reason == 'vehicle_contained':
+                    # A detector box can remain inside the carrier vehicle for
+                    # the first few observations of a real release.  Preserve
+                    # it as tracker-only quarantine evidence; the tracker must
+                    # prove sustained litter-vs-carrier separation before the
+                    # track can participate in event confirmation.
+                    filtered_frame_litters.append(litter_box)
+                    quarantined_frame_litters.append(litter_box)
+                    if record is not None:
+                        record['filter_outcome'] = 'passed'
+                        record['filter_reason'] = 'vehicle_contained_quarantine'
+                    if getattr(litter_tracker, '_debug', False):
+                        print(
+                            f"  [FP_QUARANTINE fi={frame_index} "
+                            f"cx={curr_center[0]:.0f},{curr_center[1]:.0f}]"
+                        )
+                    continue
+                if record is not None:
+                    record['filter_outcome'] = 'rejected'
+                    record['filter_reason'] = str(fp_reason or 'vehicle_fp')
+                    record['tracker_outcome'] = 'not_submitted'
                 if getattr(litter_tracker, '_debug', False):
                     print(f"  [FP_DROP fi={frame_index} cx={curr_center[0]:.0f},{curr_center[1]:.0f} reason={fp_reason}]")
                 continue
@@ -608,6 +791,9 @@ def _stage_filter_litter_candidates(current_frame_litters, shake_active, shake_m
                     lc_y = (ly1 + ly2) / 2.0
                     print(f"  [BIRTH_PASS fi={frame_index} cx={lc_x:.0f},{lc_y:.0f}]")
                 filtered_frame_litters.append(litter_box)
+                if record is not None:
+                    record['filter_outcome'] = 'passed'
+                    record['filter_reason'] = 'birth_anchor'
                 continue
             is_holding_like, _hold_actor = litter_holding(
                 litter_box, tracking_objects,
@@ -617,20 +803,43 @@ def _stage_filter_litter_candidates(current_frame_litters, shake_active, shake_m
                 vehicle_history=vehicle_history,
             )
             if is_holding_like:
+                if record is not None:
+                    record['filter_outcome'] = 'rejected'
+                    record['filter_reason'] = 'holding'
+                    record['holding_actor'] = (
+                        list(_hold_actor) if _hold_actor is not None else None
+                    )
+                    record['tracker_outcome'] = 'not_submitted'
                 if getattr(litter_tracker, '_debug', False):
                     lc_x2 = (lx1 + lx2) / 2.0
                     lc_y2 = (ly1 + ly2) / 2.0
                     print(f"  [HOLDING fi={frame_index} cx={lc_x2:.0f},{lc_y2:.0f} actor={_hold_actor}]")
                 continue
             filtered_frame_litters.append(litter_box)
+            if record is not None:
+                record['filter_outcome'] = 'passed'
+                record['filter_reason'] = 'released_motion'
     if stats is not None:
         stats['filtered_litter_candidates'] = stats.get('filtered_litter_candidates', 0) + len(filtered_frame_litters)
-    return filtered_frame_litters
+        if quarantined_frame_litters:
+            stats['quarantined_litter_candidates'] = (
+                stats.get('quarantined_litter_candidates', 0)
+                + len(quarantined_frame_litters)
+            )
+        _record_litter_candidate_frame(
+            stats,
+            'filtered_litter_candidate_frames',
+            frame_index,
+            len(filtered_frame_litters),
+        )
+    return filtered_frame_litters, quarantined_frame_litters
 
 
-def _stage_update_litter_tracker(litter_tracker, filtered_frame_litters, tracking_objects,
+def _stage_update_litter_tracker(litter_tracker, filtered_frame_litters, raw_frame_litters,
+                                 tracking_objects,
                                  person_vehicle_map, frame_index, frame, vehicle_history,
-                                 stats, profiler):
+                                 stats, profiler, candidate_records=None,
+                                 quarantined_frame_litters=None):
     # 更新 GlobalLitterTracker,將 pending litter 依軌跡轉成 confirmed。
     # 回傳 (tracked_litters, active_violators)。
     with profile_block(profiler, "detect.litter_tracker_update"):
@@ -638,6 +847,8 @@ def _stage_update_litter_tracker(litter_tracker, filtered_frame_litters, trackin
             filtered_frame_litters, tracking_objects,
             person_vehicle_map=person_vehicle_map, frame_index=frame_index,
             frame=frame, vehicle_history=vehicle_history,
+            raw_detected_litters=raw_frame_litters,
+            quarantined_litters=quarantined_frame_litters,
         )
     if stats is not None:
         confirmed_ids = [
@@ -674,6 +885,18 @@ def _stage_update_litter_tracker(litter_tracker, filtered_frame_litters, trackin
             stats['backtracked_thrower_frame_hits'] = (
                 stats.get('backtracked_thrower_frame_hits', 0) + 1
             )
+    if candidate_records:
+        _finalize_litter_candidate_diagnostics(candidate_records, tracked_litters)
+        if stats is not None and isinstance(stats.get('litter_candidate_records'), list):
+            stats['litter_candidate_records'].extend(candidate_records)
+    if (
+        stats is not None and
+        isinstance(stats.get('litter_candidate_records'), list) and
+        hasattr(litter_tracker, 'consume_visual_bridge_records')
+    ):
+        stats['litter_candidate_records'].extend(
+            litter_tracker.consume_visual_bridge_records()
+        )
     return tracked_litters, active_violators
 
 
@@ -753,6 +976,7 @@ def _stage_render_actors(annotated_frame, render_objects, violator_display_cache
                          violator_display_max_jump, color_dict, person_action_map,
                          vehicle_history, box_thickness, font_scale, text_thickness, profiler):
     # 統一渲染 actor:違規者紅框,正常人車用各類別顏色。
+    show_track_ids = os.environ.get("LITTER_DEBUG", "0") not in ("0", "")
     with profile_block(profiler, "detect.render_actors"):
         for obj in render_objects:
             x1, y1, x2, y2 = map(int, obj['box'])
@@ -776,14 +1000,16 @@ def _stage_render_actors(annotated_frame, render_objects, violator_display_cache
                 cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), WARN, box_thickness + 2)
                 plate_str = get_plate_number(vehicle_history, track_id) if cls_name in VEHICLE_LIKE_CLASSES else ""
                 warning_label = _warning_label_for_action(cache_entry.get('action'))
-                label_text = f"{cls_name} -{warning_label}- {plate_str}".strip()
+                id_text = f" ID:{track_id}" if show_track_ids else ""
+                label_text = f"{cls_name}{id_text} -{warning_label}- {plate_str}".strip()
                 cv2.putText(annotated_frame, label_text, (x1, max(10, y1 - 35)),
                             cv2.FONT_HERSHEY_SIMPLEX, font_scale, WARN, text_thickness)
             else:
                 # 正常路人/車輛。
                 color = color_dict.get(cls_name, BLACK)
                 cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, box_thickness)
-                label_text = cls_name
+                id_text = f" ID:{track_id}" if show_track_ids else ""
+                label_text = f"{cls_name}{id_text}"
                 if cls_name == 'person' and track_id in person_action_map:
                     action_info = person_action_map[track_id]
                     stgcn_conf = action_info.get('stgcn_conf', action_info.get('conf', 0.0))
@@ -791,9 +1017,9 @@ def _stage_render_actors(annotated_frame, render_objects, violator_display_cache
                         action_name = _warning_label_for_action(action_info.get('action'))
                         color = WARN
                         cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, box_thickness + 2)
-                        label_text = f"person {action_name} STGCN {stgcn_conf:.2f}"
+                        label_text = f"person{id_text} {action_name} STGCN {stgcn_conf:.2f}"
                     else:
-                        label_text = f"person {action_info.get('action', 'normal')} STGCN {stgcn_conf:.2f}"
+                        label_text = f"person{id_text} {action_info.get('action', 'normal')} STGCN {stgcn_conf:.2f}"
                 cv2.putText(annotated_frame, label_text, (x1, max(10, y1 - 10)),
                             cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, text_thickness)
 
@@ -809,6 +1035,32 @@ def _stage_render_litters(annotated_frame, tracked_litters, color_dict, box_thic
                 cv2.rectangle(annotated_frame, (lx1, ly1), (lx2, ly2), l_color, box_thickness + 2)
                 cv2.putText(annotated_frame, f"Litter {l_id} ({l_data['state']})", (lx1, max(20, ly1-10)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, l_color, 2)
+
+
+def _stage_render_rtdetr_debug(annotated_frame, rtdetr_frame_litters, profiler):
+    """Debug-only overlay for litter boxes before geometry/motion/holding filters."""
+    if os.environ.get("LITTER_DEBUG", "0") in ("0", ""):
+        return
+    with profile_block(profiler, "detect.render_rtdetr_debug"):
+        for litter_box in rtdetr_frame_litters:
+            lx1, ly1, lx2, ly2 = map(int, litter_box[:4])
+            confidence = float(litter_box[4])
+            cv2.rectangle(
+                annotated_frame,
+                (lx1, ly1),
+                (lx2, ly2),
+                RTDETR_DEBUG,
+                2,
+            )
+            cv2.putText(
+                annotated_frame,
+                f"RTDETR raw {confidence:.2f}",
+                (lx1, max(15, ly1 - 5)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                RTDETR_DEBUG,
+                2,
+            )
 
 
 def detect(frame, model_bbox, model_trash,
@@ -834,7 +1086,8 @@ def detect(frame, model_bbox, model_trash,
            stats=None,
            actor_mode="track",
            actor_track_iou=0.3,
-           prev_frame=None):
+           prev_frame=None,
+           prepared_litter_input=None):
     # 單幀偵測入口：負責一幀內完整 actor、litter、違規者、渲染流程。
     if violator_display_cache is None:
         violator_display_cache = {}
@@ -886,21 +1139,27 @@ def detect(frame, model_bbox, model_trash,
         prev_frame, frame, litter_tracker, frame_index, fps, stats, profiler
     )
 
-    current_frame_litters = _stage_collect_litter_candidates(
+    rtdetr_frame_litters, current_frame_litters, candidate_records = _stage_collect_litter_candidates(
         vehicle_active, model_trash, precomputed_trash_results,
         prev_frame, frame, trash_conf, stats, profiler,
+        frame_index,
+        prepared_litter_input=prepared_litter_input,
     )
 
-    filtered_frame_litters = _stage_filter_litter_candidates(
+    filtered_frame_litters, quarantined_frame_litters = _stage_filter_litter_candidates(
         current_frame_litters, shake_active, shake_mag, shake_threshold,
         fg_mask, fg_mask_scale, moving_threshold, core_moving_threshold,
         motion_min_component_area, motion_min_largest_component_ratio,
         litter_tracker, tracking_objects, vehicle_history, frame_index, stats, profiler,
+        candidate_records=candidate_records,
     )
 
     tracked_litters, active_violators = _stage_update_litter_tracker(
-        litter_tracker, filtered_frame_litters, tracking_objects,
+        litter_tracker, filtered_frame_litters, rtdetr_frame_litters,
+        tracking_objects,
         person_vehicle_map, frame_index, frame, vehicle_history, stats, profiler,
+        candidate_records=candidate_records,
+        quarantined_frame_litters=quarantined_frame_litters,
     )
 
     active_violators = _stage_register_action_violators(
@@ -924,6 +1183,7 @@ def detect(frame, model_bbox, model_trash,
         text_thickness, profiler,
     )
 
+    _stage_render_rtdetr_debug(annotated_frame, rtdetr_frame_litters, profiler)
     _stage_render_litters(annotated_frame, tracked_litters, color_dict, box_thickness, profiler)
 
     return annotated_frame
@@ -1064,19 +1324,27 @@ def _select_zero_repair_positions(box_counts, mode, context=None):
 
 def _run_batched_trash_predict(model_trash, frames, trash_conf, export_batch_size,
                                profiler=None, zero_repair="adjacent",
-                               zero_repair_context=None, stats=None, prev_frames=None):
+                               zero_repair_context=None, stats=None, prev_frames=None,
+                               prepared_inputs=None):
     # 批次 RTDETR litter predict；尾端不足 batch 時用最後一幀 padding，輸出再裁回原長度。
-    # 創建 4 通道輸入：將每幀的 BGR 與變化圖 (change map) 堆疊成 (H, W, 4) 格式。
+    # 創建 reference-compatible 4-channel input：RGB + normalized change map。
     if model_trash is None:
         return [[] for _ in frames]
     if prev_frames is None:
         prev_frames = [None] * len(frames)
 
-    infer_frames = []
-    for frame, prev_frame in zip(frames, prev_frames):
-        change_map = compute_pixel_change_map(prev_frame, frame)
-        frame_4ch = np.dstack((frame, change_map))
-        infer_frames.append(frame_4ch)
+    if prepared_inputs is not None:
+        if len(prepared_inputs) != len(frames):
+            raise ValueError(
+                "prepared_inputs and frames length mismatch: "
+                f"{len(prepared_inputs)} != {len(frames)}"
+            )
+        infer_frames = list(prepared_inputs)
+    else:
+        infer_frames = [
+            build_litter_model_input(prev_frame, frame)
+            for frame, prev_frame in zip(frames, prev_frames)
+        ]
 
     if export_batch_size > len(infer_frames):
         infer_frames.extend([infer_frames[-1]] * (export_batch_size - len(infer_frames)))
@@ -1106,9 +1374,7 @@ def _run_batched_trash_predict(model_trash, frames, trash_conf, export_batch_siz
             f"Warning: batched RTDETR failed; repairing frame-by-frame with padded batch source: {exc}",
         )
         result_list = []
-        for frame, prev_frame in zip(frames, prev_frames):
-            change_map = compute_pixel_change_map(prev_frame, frame)
-            frame_4ch = np.dstack((frame, change_map))
+        for frame_4ch in infer_frames[:len(frames)]:
             repair_source = [frame_4ch] * export_batch_size if export_batch_size > 1 else frame_4ch
             with profile_block(profiler, "detect.rtdetr_litter_predict_batch_repair"):
                 repair_results = model_trash.predict(
@@ -1148,10 +1414,7 @@ def _run_batched_trash_predict(model_trash, frames, trash_conf, export_batch_siz
         )
         _add_stat(stats, "rtdetr_batch_zero_repaired_frames", len(repair_positions))
         for pos in repair_positions:
-            frame = frames[pos]
-            prev_frame = prev_frames[pos] if prev_frames and pos < len(prev_frames) else None
-            change_map = compute_pixel_change_map(prev_frame, frame)
-            frame_4ch = np.dstack((frame, change_map))
+            frame_4ch = infer_frames[pos]
             repair_source = [frame_4ch] * export_batch_size if export_batch_size > 1 else frame_4ch
             with profile_block(profiler, "detect.rtdetr_litter_predict_batch_repair"):
                 repair_results = model_trash.predict(
@@ -1271,12 +1534,18 @@ def detect_batch(frames, model_bbox, model_trash,
                  rtdetr_batch_context=None,
                  actor_mode="track",
                  actor_track_iou=0.3,
-                 prev_frames=None):
+                 prev_frames=None,
+                 prepared_litter_inputs=None):
     # 批次偵測入口：RTDETR 批次推理、actor 可跳幀快取，最後逐幀套用單幀後處理。
     if not frames:
         return []
     if len(frames) != len(fg_masks):
         raise ValueError(f"frames and fg_masks length mismatch: {len(frames)} != {len(fg_masks)}")
+    if prepared_litter_inputs is not None and len(prepared_litter_inputs) != len(frames):
+        raise ValueError(
+            "prepared_litter_inputs and frames length mismatch: "
+            f"{len(prepared_litter_inputs)} != {len(frames)}"
+        )
     if violator_display_cache is None:
         violator_display_cache = {}
     if yolo_seg_cache is None:
@@ -1314,8 +1583,15 @@ def detect_batch(frames, model_bbox, model_trash,
                 actor_mode=actor_mode,
                 actor_track_iou=actor_track_iou,
                 prev_frame=prev_frame,
+                prepared_litter_input=(
+                    prepared_litter_inputs[pos]
+                    if prepared_litter_inputs is not None
+                    else None
+                ),
             )
-            for frame, fg_mask, frame_index, prev_frame in zip(frames, fg_masks, frame_indices, prev_frames)
+            for pos, (frame, fg_mask, frame_index, prev_frame) in enumerate(
+                zip(frames, fg_masks, frame_indices, prev_frames)
+            )
         ]
 
     # 批次前處理：actor 結果可跳幀快取，litter 結果用 RTDETR 批次推理。
@@ -1348,6 +1624,7 @@ def detect_batch(frames, model_bbox, model_trash,
             zero_repair_context=rtdetr_batch_context,
             stats=stats,
             prev_frames=prev_frames,
+            prepared_inputs=prepared_litter_inputs,
         )
     else:
         _add_stat(stats, "vehicle_gate_skipped_trash_batches")

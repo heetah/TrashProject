@@ -205,6 +205,10 @@ class PipelineProfiler:
                 "其他重要",
                 [
                     (
+                        "主影片迴圈 wall",
+                        ["process.video_loop_total"],
+                    ),
+                    (
                         "影片讀取/解碼",
                         [
                             "video.open_capture",
@@ -216,6 +220,10 @@ class PipelineProfiler:
                     (
                         "前景遮罩",
                         ["frame.foreground_mask"],
+                    ),
+                    (
+                        "4-channel 背景前處理",
+                        ["frame.litter_input_prepare"],
                     ),
                     (
                         "追蹤/過濾/渲染",
@@ -259,6 +267,16 @@ class PipelineProfiler:
             rows_by_section.append((section_title, section_rows))
 
         total_avg_ms = (wall_total / frame_count * 1000.0) if frame_count else 0.0
+        video_loop_total = (
+            stats["process.video_loop_total"].total
+            if "process.video_loop_total" in stats
+            else 0.0
+        )
+        video_loop_fps = (
+            float(frame_count) / video_loop_total
+            if frame_count and video_loop_total > 0.0
+            else 0.0
+        )
         slowest_rows = sorted(flat_rows, key=lambda row: row[1], reverse=True)[:3]
 
         # CJK 對齊：中文寬字元需要 display width，不可只用 len()。
@@ -268,6 +286,12 @@ class PipelineProfiler:
         print(title)
         print("-" * line_width)
         print(f"Frames: {int(frame_count):>8d} | Wall: {wall_total:>8.3f}s | Avg: {total_avg_ms:>8.2f} ms/frame")
+        if video_loop_total > 0.0:
+            print(
+                f"Video loop: {video_loop_total:>8.3f}s | "
+                f"Throughput: {video_loop_fps:>8.2f} frame/s "
+                "(不含模型載入/收尾)"
+            )
         print("=" * line_width)
         print("註：下列為累積耗時；非同步 reader / writer / OCR 可能與主流程重疊，不能直接相加。")
 
