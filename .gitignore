@@ -15,6 +15,7 @@ scripts-fusion-stable/
 test_ocr/
 work_dirs/
 .codex
+.claude
 data-fusion.yaml
 data.yaml
 STGCN_GUIDE.MD
@@ -27,3 +28,5 @@ output.log
 rtmw_test_image.py
 artifacts/
 .env.example
+tests/
+bridge/
